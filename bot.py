@@ -13,8 +13,7 @@ RENDER_EXTERNAL_URL = os.environ.get(
     "RENDER_EXTERNAL_URL", "https://lukas-alarm-bot-1.onrender.com"
 )
 
-# Используем публичный RSS-мост для чтения канала без блокировок
-RSS_URL = "https://rsshub.app/telegram/channel/kpszsu"
+URL = "https://t.me/s/kpszsu"
 sent_messages = set()
 initialized = False
 init_lock = threading.Lock()
@@ -37,53 +36,44 @@ def check_updates():
       )
   }
   try:
-    response = requests.get(RSS_URL, headers=headers, timeout=15)
+    response = requests.get(URL, headers=headers, timeout=10)
     print(
-        f"Статус RSS-моста: {response.status_code}, длина: {len(response.text)}"
+        f"Статус ответа от Telegram: {response.status_code}, длина:"
+        f" {len(response.text)}"
     )
 
     if response.status_code != 200:
       return
 
-    # Парсим XML-ленту вместо HTML
-    soup = BeautifulSoup(response.content, "xml")
-    items = soup.find_all("item")
-    print(f"Найдено записей в RSS: {len(items)}")
+    soup = BeautifulSoup(response.text, "html.parser")
+    posts = soup.find_all("div", class_="tgme_widget_message")
+    print(f"Найдено постов на странице: {len(posts)}")
 
-    for item in items:
-      guid = item.find("guid")
-      post_id = guid.text if guid else None
-
-      title = item.find("title")
-      description = item.find("description")
-
-      post_text = ""
-      if title:
-        post_text += title.text + "\n"
-      if description:
-        post_text += description.text
-
-      if not post_text:
+    for post in posts:
+      post_id = post.get("data-post", "")
+      text_elem = post.find("div", class_="tgme_widget_message_text")
+      if not text_elem:
         continue
 
-      if "бпла" in post_text.lower():
+      post_text = text_elem.get_text()
+      # Надежный поиск по корню бпл (поймает любые варианты: БПЛА, БпЛА, бпла)
+      if "бпл" in post_text.lower():
         if post_id not in sent_messages:
-          alert_text = f"🚨 Внимание! Обнаружено слово БПЛА:\n\n{post_text}"
+          alert_text = f"🚨 Внимание! Обнаружено упоминание БПЛА:\n\n{post_text}"
           send_telegram_message(alert_text)
-          if post_id:
-            sent_messages.add(post_id)
+          sent_messages.add(post_id)
 
           if len(sent_messages) > 100:
             sent_messages.clear()
   except Exception as e:
-    print(f"Ошибка парсинга RSS: {e}")
+    print(f"Ошибка парсинга: {e}")
 
 
 def run_bot():
-  print("Фоновый поток RSS-парсера запущен...")
+  print("Фоновый поток парсера Telegram запущен...")
   while True:
     check_updates()
-    time.sleep(30)
+    time.sleep(15)
 
 
 def self_ping():
@@ -106,7 +96,7 @@ def home():
         threading.Thread(target=run_bot, daemon=True).start()
         threading.Thread(target=self_ping, daemon=True).start()
         initialized = True
-  return "Lukas_Alarm_bot is active via RSS!"
+  return "Lukas_Alarm_bot is active!"
 
 
 if __name__ == "__main__":
