@@ -15,18 +15,15 @@ RENDER_EXTERNAL_URL = os.environ.get(
 
 URL = "https://t.me/s/kpszsu"
 sent_messages = set()
-
-
-@app.route("/")
-def home():
-  return "Lukas_Alarm_bot is active!"
+initialized = False
+init_lock = threading.Lock()
 
 
 def send_telegram_message(message):
   url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
   payload = {"chat_id": CHAT_ID, "text": message}
   try:
-    requests.post(url, json=payload)
+    requests.post(url, json=payload, timeout=10)
   except Exception as e:
     print(f"Ошибка отправки: {e}")
 
@@ -39,7 +36,7 @@ def check_updates():
       )
   }
   try:
-    response = requests.get(URL, headers=headers)
+    response = requests.get(URL, headers=headers, timeout=10)
     if response.status_code != 200:
       return
 
@@ -73,20 +70,27 @@ def run_bot():
 
 
 def self_ping():
-  """Каждые 5 минут шлет запрос сама себе, чтобы контейнер не засыпал"""
   print("Фоновый поток самопинга запущен...")
   while True:
-    time.sleep(300)  # 5 минут
+    time.sleep(300)
     try:
-      requests.get(RENDER_EXTERNAL_URL)
+      requests.get(RENDER_EXTERNAL_URL, timeout=10)
       print("Самопинг выполнен успешно")
     except Exception as e:
       print(f"Ошибка самопинга: {e}")
 
 
-# Запускаем парсер и самопинг в отдельных фоновых потоках
-threading.Thread(target=run_bot, daemon=True).start()
-threading.Thread(target=self_ping, daemon=True).start()
+@app.route("/")
+def home():
+  global initialized
+  if not initialized:
+    with init_lock:
+      if not initialized:
+        threading.Thread(target=run_bot, daemon=True).start()
+        threading.Thread(target=self_ping, daemon=True).start()
+        initialized = True
+  return "Lukas_Alarm_bot is active!"
+
 
 if __name__ == "__main__":
   port = int(os.environ.get("PORT", 10000))
