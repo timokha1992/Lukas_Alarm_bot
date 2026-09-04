@@ -1,9 +1,9 @@
 import os
 import threading
 import time
+from bs4 import BeautifulSoup
 from flask import Flask
 import requests
-from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
@@ -53,16 +53,14 @@ def check_updates():
       post_text = text_elem.get_text()
       post_text_lower = post_text.lower()
 
-      # Тест по слову бпла
       if "бпла" in post_text_lower:
         if post_id not in sent_messages:
           alert_text = f"🚨 Тест: обнаружено слово БПЛА!\n\n{post_text}"
           send_telegram_message(alert_text)
           sent_messages.add(post_id)
 
-          # Безопасная очистка старых элементов, если сеет переполняется
           if len(sent_messages) > 100:
-            sent_messages.clear()  # либо сбрасываем, чтобы не забивать память
+            sent_messages.clear()
 
   except Exception as e:
     print(f"Ошибка запроса: {e}")
@@ -75,11 +73,10 @@ def run_bot():
     time.sleep(15)
 
 
-if __name__ == "__main__":
-  # Запускаем парсер в фоновом потоке
-  bot_thread = threading.Thread(target=run_bot, daemon=True)
-  bot_thread.start()
+# Запускаем парсер в фоновом потоке сразу при импорте модуля (нужно для Gunicorn)
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
 
-  # Главный поток держит Flask-сервер для Render
+if __name__ == "__main__":
   port = int(os.environ.get("PORT", 10000))
   app.run(host="0.0.0.0", port=port)
