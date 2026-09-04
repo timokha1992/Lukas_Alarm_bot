@@ -20,6 +20,8 @@ sent_messages = set()
 
 
 def send_telegram_message(message):
+    print("Пробую отправить уведомление в Telegram...")
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     payload = {
@@ -36,17 +38,48 @@ def send_telegram_message(message):
 
         print(
             f"Telegram sendMessage: "
-            f"{response.status_code} {response.text[:300]}"
+            f"{response.status_code} "
+            f"{response.text[:500]}"
         )
 
         if response.status_code == 200:
             print("Уведомление успешно отправлено")
             return True
 
+        print("Telegram НЕ принял сообщение")
         return False
 
     except Exception as e:
-        print(f"Ошибка отправки в Telegram: {e}")
+        print(f"ОШИБКА отправки в Telegram: {e}")
+        return False
+
+
+def test_telegram_api():
+    print("Проверяю доступ к Telegram Bot API...")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe"
+
+    try:
+        response = requests.get(
+            url,
+            timeout=5
+        )
+
+        print(
+            f"Telegram Bot API: "
+            f"{response.status_code} "
+            f"{response.text[:300]}"
+        )
+
+        if response.status_code == 200:
+            print("Telegram Bot API доступен")
+            return True
+
+        print("Telegram Bot API вернул ошибку")
+        return False
+
+    except Exception as e:
+        print(f"ОШИБКА доступа к Telegram Bot API: {e}")
         return False
 
 
@@ -67,12 +100,16 @@ def get_post_datetime(post):
         )
 
         if post_time.tzinfo is None:
-            post_time = post_time.replace(tzinfo=timezone.utc)
+            post_time = post_time.replace(
+                tzinfo=timezone.utc
+            )
 
         return post_time
 
     except Exception as e:
-        print(f"Ошибка определения времени поста: {e}")
+        print(
+            f"Ошибка определения времени поста: {e}"
+        )
         return None
 
 
@@ -86,7 +123,9 @@ def check_updates():
     }
 
     try:
-        print("Проверяю канал...")
+        print("----- НАЧАЛО ПРОВЕРКИ -----")
+
+        print("Отправляю запрос на t.me...")
 
         response = requests.get(
             URL,
@@ -95,13 +134,19 @@ def check_updates():
         )
 
         print(
-            f"Telegram channel: "
+            f"Ответ t.me: "
             f"{response.status_code}, "
             f"{len(response.text)} bytes"
         )
 
         if response.status_code != 200:
+            print(
+                f"Telegram channel вернул "
+                f"HTTP {response.status_code}"
+            )
             return
+
+        print("Разбираю HTML страницы...")
 
         soup = BeautifulSoup(
             response.text,
@@ -113,18 +158,26 @@ def check_updates():
             class_="tgme_widget_message"
         )
 
-        print(f"Найдено постов: {len(posts)}")
+        print(
+            f"Найдено постов на странице: "
+            f"{len(posts)}"
+        )
 
         now = datetime.now(timezone.utc)
 
         cutoff_time = (
             now -
-            timedelta(minutes=MAX_MESSAGE_AGE_MINUTES)
+            timedelta(
+                minutes=MAX_MESSAGE_AGE_MINUTES
+            )
         )
 
         for post in posts:
 
-            post_id = post.get("data-post", "")
+            post_id = post.get(
+                "data-post",
+                ""
+            )
 
             if not post_id:
                 continue
@@ -157,7 +210,8 @@ def check_updates():
                 continue
 
             print(
-                f"🚨 НАЙДЕНО БпЛА: {post_id}"
+                f"🚨 НАЙДЕНО УПОМИНАНИЕ БпЛА: "
+                f"{post_id}"
             )
 
             alert_text = (
@@ -168,18 +222,38 @@ def check_updates():
                 f"{post_text}"
             )
 
-            if send_telegram_message(alert_text):
+            if send_telegram_message(
+                alert_text
+            ):
                 sent_messages.add(post_id)
 
+        print("----- ПРОВЕРКА ЗАВЕРШЕНА -----")
+
+    except requests.exceptions.Timeout:
+        print(
+            "ОШИБКА: запрос к t.me "
+            "превысил 10 секунд"
+        )
+
+    except requests.exceptions.RequestException as e:
+        print(
+            f"ОШИБКА сетевого запроса: {e}"
+        )
+
     except Exception as e:
-        print(f"ОШИБКА ПАРСЕРА: {e}")
+        print(
+            f"ОШИБКА ПАРСЕРА: {e}"
+        )
 
 
 def run_bot():
-    print("================================")
+    print("==============================")
     print("ФОНОВЫЙ ПАРСЕР ЗАПУЩЕН")
+    print("Ключевое слово: БпЛА")
     print("Проверка каждые 15 секунд")
-    print("================================")
+    print("==============================")
+
+    test_telegram_api()
 
     while True:
         check_updates()
@@ -196,9 +270,8 @@ def health():
     return "OK"
 
 
-# ВАЖНО:
-# Запускаем парсер СРАЗУ при старте приложения,
-# а не после открытия страницы "/"
+print("Запускаю фоновый поток...")
+
 threading.Thread(
     target=run_bot,
     daemon=True
@@ -207,7 +280,10 @@ threading.Thread(
 
 if __name__ == "__main__":
     port = int(
-        os.environ.get("PORT", 10000)
+        os.environ.get(
+            "PORT",
+            10000
+        )
     )
 
     app.run(
