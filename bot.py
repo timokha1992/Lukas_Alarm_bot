@@ -1,35 +1,84 @@
-import os
+п»їimport os
+import threading
 import time
+from flask import Flask
 import requests
 from bs4 import BeautifulSoup
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "ТВОЙ_ТОКЕН")
-CHAT_ID = os.environ.get("CHAT_ID", "ТВОЙ_CHAT_ID")
+# --- Р’РµР±-СЃРµСЂРІРµСЂ РґР»СЏ СѓРґРµСЂР¶Р°РЅРёСЏ РїРѕСЂС‚Р° РЅР° Render ---
+app = Flask(__name__)
 
-URL = "ССЫЛКА_НА_ОТСЛЕЖИВАЕМУЮ_СТРАНИЦУ"
+
+@app.route("/")
+def home():
+  return "Lukas_Alarm_bot is active!"
+
+
+def run_web():
+  port = int(os.environ.get("PORT", 10000))
+  app.run(host="0.0.0.0", port=port)
+
+
+# Р—Р°РїСѓСЃРєР°РµРј СЃРµСЂРІРµСЂ РІ С„РѕРЅРѕРІРѕРј СЂРµР¶РёРјРµ
+threading.Thread(target=run_web, daemon=True).start()
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "РўР’РћР™_РўРћРљР•Рќ")
+CHAT_ID = os.environ.get("CHAT_ID", "РўР’РћР™_Р§РђРў_ID")
+
+URL = "https://t.me/s/kpszsu"
+sent_messages = set()
+
 
 def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
-    try:
-        requests.post(url, json=payload)
-    except Exception as e:
-        print(f"Ошибка отправки: {e}")
+  url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+  payload = {"chat_id": CHAT_ID, "text": message}
+  try:
+    requests.post(url, json=payload)
+  except Exception as e:
+    print(f"РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё: {e}")
+
 
 def check_updates():
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(URL, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        # Логика проверки страницы
-        # ...
-        
-    except Exception as e:
-        print(f"Ошибка запроса: {e}")
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+          " like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      )
+  }
+  try:
+    response = requests.get(URL, headers=headers)
+    if response.status_code != 200:
+      print(f"РћС€РёР±РєР° РґРѕСЃС‚СѓРїР° Рє РєР°РЅР°Р»Сѓ: СЃС‚Р°С‚СѓСЃ {response.status_code}")
+      return
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    posts = soup.find_all("div", class_="tgme_widget_message")
+
+    for post in posts:
+      post_id = post.get("data-post", "")
+      text_elem = post.find("div", class_="tgme_widget_message_text")
+      if not text_elem:
+        continue
+
+      post_text = text_elem.get_text()
+      post_text_lower = post_text.lower()
+
+      # РўРµСЃС‚ РїРѕ СЃР»РѕРІСѓ Р±РїР»Р°
+      if "Р±РїР»Р°" in post_text_lower:
+        if post_id not in sent_messages:
+          alert_text = f"рџљЁ РўРµСЃС‚: РѕР±РЅР°СЂСѓР¶РµРЅРѕ СЃР»РѕРІРѕ Р‘РџР›Рђ!\n\n{post_text}"
+          send_telegram_message(alert_text)
+          sent_messages.add(post_id)
+
+          if len(sent_messages) > 100:
+            sent_messages.pop()
+
+  except Exception as e:
+    print(f"РћС€РёР±РєР° Р·Р°РїСЂРѕСЃР°: {e}")
+
 
 if __name__ == "__main__":
-    print("Бот запущен и мониторит изменения...")
-    while True:
-        check_updates()
-        time.sleep(15)  # Проверка каждые 15 секунд
+  print("Р‘РѕС‚ Р·Р°РїСѓС‰РµРЅ РЅР° С‚РµСЃС‚ СЃР»РѕРІР° Р‘РџР›Рђ...")
+  while True:
+    check_updates()
+    time.sleep(15)
