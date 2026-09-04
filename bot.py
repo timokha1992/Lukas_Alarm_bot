@@ -32,16 +32,22 @@ def check_updates():
   headers = {
       "User-Agent": (
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-          " like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          " like Gecko) Chrome/122.0.0.0 Safari/537.36"
       )
   }
   try:
     response = requests.get(URL, headers=headers, timeout=10)
+    print(
+        f"Статус ответа от Telegram: {response.status_code}, длина:"
+        f" {len(response.text)}"
+    )
+
     if response.status_code != 200:
       return
 
     soup = BeautifulSoup(response.text, "html.parser")
     posts = soup.find_all("div", class_="tgme_widget_message")
+    print(f"Найдено постов на странице: {len(posts)}")
 
     for post in posts:
       post_id = post.get("data-post", "")
