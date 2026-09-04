@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from flask import Flask
 import requests
 
+
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -114,11 +115,15 @@ def get_post_datetime(post):
 
 
 def check_updates():
+
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/122.0.0.0 "
+            "Safari/537.36"
         )
     }
 
@@ -247,6 +252,7 @@ def check_updates():
 
 
 def run_bot():
+
     print("==============================")
     print("ФОНОВЫЙ ПАРСЕР ЗАПУЩЕН")
     print("Ключевое слово: БпЛА")
@@ -270,6 +276,28 @@ def health():
     return "OK"
 
 
+@app.route("/test")
+def test():
+
+    try:
+        response = requests.get(
+            "https://example.com",
+            timeout=5
+        )
+
+        return (
+            f"EXTERNAL OK: "
+            f"{response.status_code}"
+        )
+
+    except Exception as e:
+
+        return (
+            f"EXTERNAL ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
 print("Запускаю фоновый поток...")
 
 threading.Thread(
@@ -279,6 +307,7 @@ threading.Thread(
 
 
 if __name__ == "__main__":
+
     port = int(
         os.environ.get(
             "PORT",
