@@ -9,6 +9,9 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "ТВОЙ_ТОКЕН")
 CHAT_ID = os.environ.get("CHAT_ID", "ТВОЙ_ЧАТ_ID")
+RENDER_EXTERNAL_URL = os.environ.get(
+    "RENDER_EXTERNAL_URL", "https://lukas-alarm-bot-1.onrender.com"
+)
 
 URL = "https://t.me/s/kpszsu"
 sent_messages = set()
@@ -38,7 +41,6 @@ def check_updates():
   try:
     response = requests.get(URL, headers=headers)
     if response.status_code != 200:
-      print(f"Ошибка доступа к каналу: статус {response.status_code}")
       return
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -51,31 +53,40 @@ def check_updates():
         continue
 
       post_text = text_elem.get_text()
-      post_text_lower = post_text.lower()
-
-      if "бпла" in post_text_lower:
+      if "бпла" in post_text.lower():
         if post_id not in sent_messages:
-          alert_text = f"🚨 Тест: обнаружено слово БПЛА!\n\n{post_text}"
+          alert_text = f"🚨 Внимание! Обнаружено слово БПЛА:\n\n{post_text}"
           send_telegram_message(alert_text)
           sent_messages.add(post_id)
 
           if len(sent_messages) > 100:
             sent_messages.clear()
-
   except Exception as e:
-    print(f"Ошибка запроса: {e}")
+    print(f"Ошибка парсинга: {e}")
 
 
 def run_bot():
-  print("Бот запущен на тест слова БПЛА...")
+  print("Фоновый поток парсера Telegram запущен...")
   while True:
     check_updates()
     time.sleep(15)
 
 
-# Запускаем парсер в фоновом потоке сразу при импорте модуля (нужно для Gunicorn)
-bot_thread = threading.Thread(target=run_bot, daemon=True)
-bot_thread.start()
+def self_ping():
+  """Каждые 5 минут шлет запрос сама себе, чтобы контейнер не засыпал"""
+  print("Фоновый поток самопинга запущен...")
+  while True:
+    time.sleep(300)  # 5 минут
+    try:
+      requests.get(RENDER_EXTERNAL_URL)
+      print("Самопинг выполнен успешно")
+    except Exception as e:
+      print(f"Ошибка самопинга: {e}")
+
+
+# Запускаем парсер и самопинг в отдельных фоновых потоках
+threading.Thread(target=run_bot, daemon=True).start()
+threading.Thread(target=self_ping, daemon=True).start()
 
 if __name__ == "__main__":
   port = int(os.environ.get("PORT", 10000))
