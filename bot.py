@@ -1,32 +1,22 @@
-﻿import os
+import os
 import threading
 import time
 from flask import Flask
 import requests
 from bs4 import BeautifulSoup
 
-# --- Веб-сервер для удержания порта на Render ---
 app = Flask(__name__)
-
-
-@app.route("/")
-def home():
-  return "Lukas_Alarm_bot is active!"
-
-
-def run_web():
-  port = int(os.environ.get("PORT", 10000))
-  app.run(host="0.0.0.0", port=port)
-
-
-# Запускаем сервер в фоновом режиме
-threading.Thread(target=run_web, daemon=True).start()
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "ТВОЙ_ТОКЕН")
 CHAT_ID = os.environ.get("CHAT_ID", "ТВОЙ_ЧАТ_ID")
 
 URL = "https://t.me/s/kpszsu"
 sent_messages = set()
+
+
+@app.route("/")
+def home():
+  return "Lukas_Alarm_bot is active!"
 
 
 def send_telegram_message(message):
@@ -70,15 +60,26 @@ def check_updates():
           send_telegram_message(alert_text)
           sent_messages.add(post_id)
 
+          # Безопасная очистка старых элементов, если сеет переполняется
           if len(sent_messages) > 100:
-            sent_messages.pop()
+            sent_messages.clear()  # либо сбрасываем, чтобы не забивать память
 
   except Exception as e:
     print(f"Ошибка запроса: {e}")
 
 
-if __name__ == "__main__":
+def run_bot():
   print("Бот запущен на тест слова БПЛА...")
   while True:
     check_updates()
     time.sleep(15)
+
+
+if __name__ == "__main__":
+  # Запускаем парсер в фоновом потоке
+  bot_thread = threading.Thread(target=run_bot, daemon=True)
+  bot_thread.start()
+
+  # Главный поток держит Flask-сервер для Render
+  port = int(os.environ.get("PORT", 10000))
+  app.run(host="0.0.0.0", port=port)
