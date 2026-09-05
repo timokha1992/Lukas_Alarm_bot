@@ -280,13 +280,14 @@ def health():
 @app.route("/test")
 def test():
 
-    print("=== DNS TEST START ===")
+    results = []
 
+    # Проверяем DNS Telegram
     try:
         start = time.time()
 
-        ip = socket.gethostbyname(
-            "example.com"
+        telegram_ip = socket.gethostbyname(
+            "api.telegram.org"
         )
 
         elapsed = round(
@@ -294,25 +295,84 @@ def test():
             2
         )
 
-        result = (
-            f"DNS OK: example.com -> "
-            f"{ip}, time={elapsed}s"
+        results.append(
+            f"DNS Telegram OK: "
+            f"api.telegram.org -> "
+            f"{telegram_ip}, "
+            f"time={elapsed}s"
         )
-
-        print(result)
-
-        return result
 
     except Exception as e:
 
-        result = (
-            f"DNS ERROR: "
+        results.append(
+            f"DNS Telegram ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
-        print(result)
+        return "<br>".join(results)
 
-        return result
+
+    # Проверяем TCP-соединение с Telegram
+    try:
+        start = time.time()
+
+        connection = socket.create_connection(
+            ("api.telegram.org", 443),
+            timeout=5
+        )
+
+        connection.close()
+
+        elapsed = round(
+            time.time() - start,
+            2
+        )
+
+        results.append(
+            f"TCP Telegram OK: "
+            f"port 443, "
+            f"time={elapsed}s"
+        )
+
+    except Exception as e:
+
+        results.append(
+            f"TCP Telegram ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+    # Проверяем TCP-соединение с обычным сайтом
+    try:
+        start = time.time()
+
+        connection = socket.create_connection(
+            ("example.com", 443),
+            timeout=5
+        )
+
+        connection.close()
+
+        elapsed = round(
+            time.time() - start,
+            2
+        )
+
+        results.append(
+            f"TCP example.com OK: "
+            f"port 443, "
+            f"time={elapsed}s"
+        )
+
+    except Exception as e:
+
+        results.append(
+            f"TCP example.com ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+    return "<br>".join(results)
 
 
 print("Запускаю фоновый поток...")
