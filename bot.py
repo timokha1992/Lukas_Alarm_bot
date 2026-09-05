@@ -19,6 +19,16 @@ KEYWORD = "бпл"
 
 CHECK_INTERVAL_SECONDS = 15
 STATUS_UPDATE_INTERVAL_SECONDS = 60
+WATCHDOG_INTERVAL_SECONDS = 10
+
+# Если парсер не обновлял heartbeat дольше этого времени,
+# считаем его остановившимся.
+PARSER_STALE_AFTER_SECONDS = 60
+
+# Кратковременные ошибки источника/API не должны сразу
+# создавать тревогу в рабочей группе.
+FAILURE_NOTIFICATION_AFTER_SECONDS = 60
+
 MAX_MESSAGE_AGE_MINUTES = 5
 
 MAX_SENT_MESSAGES = 1000
@@ -64,7 +74,25 @@ def index():
 
 @app.route("/health")
 def health():
-    return "OK", 200
+    now = now_utc()
+
+    with state_lock:
+        parser_running = state["parser_running"]
+        parser_heartbeat = state["parser_heartbeat"]
+        telegram_api_ok = state["telegram_api_ok"]
+        source_ok = state["source_ok"]
+
+    parser_alive = (
+        parser_running
+        and parser_heartbeat is not None
+        and (now - parser_heartbeat).total_seconds()
+        <= PARSER_STALE_AFTER_SECONDS
+    )
+
+    if parser_alive and telegram_api_ok and source_ok:
+        return "OK", 200
+
+    return "NOT OK", 503
 
 
 # ============================================================
@@ -78,6 +106,18 @@ state = {
 
     "last_check": None,
     "last_alert": None,
+
+    # Время последнего живого шага основного парсера.
+    "parser_heartbeat": None,
+
+    # Состояния, по которым Watchdog уже отправил уведомление.
+    "parser_failure_since": None,
+    "source_failure_since": None,
+    "telegram_failure_since": None,
+
+    "parser_failure_notified": False,
+    "source_failure_notified": False,
+    "telegram_failure_notified": False,
 
     "status_message_id": None,
 
@@ -234,6 +274,263 @@ def test_telegram_api():
     )
 
     return result is not None
+
+
+# ============================================================
+# КОНТРОЛЬ СОСТОЯНИЯ
+# ============================================================
+
+def format_duration(seconds):
+    if seconds is None:
+        return "—"
+
+    seconds = max(0, int(seconds))
+
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours} ч {minutes} мин {sec} сек"
+
+    if minutes:
+        return f"{minutes} мин {sec} сек"
+
+    return f"{sec} сек"
+
+
+def set_failure_state(failure_type, reason):
+    """
+    Запоминает начало проблемы.
+    Возвращает True только в момент первого обнаружения.
+    """
+    key_since = f"{failure_type}_failure_since"
+    key_notified = f"{failure_type}_failure_notified"
+
+    now = now_utc()
+
+    with state_lock:
+        if state[key_since] is None:
+            state[key_since] = now
+            state[key_notified] = False
+
+            return True
+
+    return False
+
+
+def clear_failure_state(failure_type):
+    """
+    Завершает состояние проблемы.
+    Возвращает информацию о сбое, если он был.
+    """
+    key_since = f"{failure_type}_failure_since"
+    key_notified = f"{failure_type}_failure_notified"
+
+    now = now_utc()
+
+    with state_lock:
+        since = state[key_since]
+        notified = state[key_notified]
+
+        state[key_since] = None
+        state[key_notified] = False
+
+    if since is None:
+        return None
+
+    return {
+        "since": since,
+        "notified": notified,
+        "duration": (now - since).total_seconds(),
+    }
+
+
+def watchdog_send_failure(failure_type, reason):
+    """
+    Отправляет одно техническое сообщение после задержки,
+    чтобы кратковременный сбой не засорял группу.
+    """
+    key_since = f"{failure_type}_failure_since"
+    key_notified = f"{failure_type}_failure_notified"
+
+    with state_lock:
+        since = state[key_since]
+        already_notified = state[key_notified]
+
+    if since is None or already_notified:
+        return
+
+    duration = (now_utc() - since).total_seconds()
+
+    if duration < FAILURE_NOTIFICATION_AFTER_SECONDS:
+        return
+
+    titles = {
+        "parser": "🔴 ПРОБЛЕМА СИСТЕМЫ",
+        "source": "🔴 ПРОБЛЕМА ИСТОЧНИКА",
+        "telegram": "🔴 ПРОБЛЕМА TELEGRAM API",
+    }
+
+    messages = {
+        "parser": (
+            "Парсер не выполняет проверки.
+"
+            f"Последняя проверка: {format_time(state['last_check'])}"
+        ),
+        "source": (
+            "Официальный источник временно недоступен.
+"
+            f"Причина: {reason}"
+        ),
+        "telegram": (
+            "Бот не может нормально связаться с Telegram Bot API.
+"
+            f"Причина: {reason}"
+        ),
+    }
+
+    text = (
+        f"{titles.get(failure_type, '🔴 ПРОБЛЕМА СИСТЕМЫ')}
+"
+        "
+"
+        f"{messages.get(failure_type, reason)}
+"
+        "
+"
+        f"Проблема длится более "
+        f"{FAILURE_NOTIFICATION_AFTER_SECONDS} секунд."
+    )
+
+    message_id = send_telegram_message(text)
+
+    if message_id:
+        with state_lock:
+            state[key_notified] = True
+
+        print(
+            f"ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О СБОЕ: {failure_type}",
+            flush=True,
+        )
+
+
+def watchdog_check_recovery(failure_type, recovery_reason):
+    """
+    После восстановления отправляет сообщение только если
+    до этого уже было отправлено сообщение о сбое.
+    """
+    info = clear_failure_state(failure_type)
+
+    if not info or not info["notified"]:
+        return
+
+    text = (
+        "🟢 СИСТЕМА ВОССТАНОВЛЕНА
+"
+        "
+"
+        f"{recovery_reason}
+"
+        f"Длительность сбоя: "
+        f"{format_duration(info['duration'])}"
+    )
+
+    message_id = send_telegram_message(text)
+
+    if message_id:
+        print(
+            f"ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О ВОССТАНОВЛЕНИИ: "
+            f"{failure_type}",
+            flush=True,
+        )
+
+
+def watchdog_loop():
+    print(
+        "Запущен контроль состояния системы",
+        flush=True,
+    )
+
+    while True:
+        try:
+            now = now_utc()
+
+            with state_lock:
+                parser_running = state["parser_running"]
+                parser_heartbeat = state["parser_heartbeat"]
+                source_ok = state["source_ok"]
+                telegram_api_ok = state["telegram_api_ok"]
+
+            # ------------------------------------------------
+            # ПАРСЕР
+            # ------------------------------------------------
+            parser_alive = (
+                parser_running
+                and parser_heartbeat is not None
+                and (now - parser_heartbeat).total_seconds()
+                <= PARSER_STALE_AFTER_SECONDS
+            )
+
+            if parser_alive:
+                watchdog_check_recovery(
+                    "parser",
+                    "Парсер снова выполняет проверки.",
+                )
+            else:
+                set_failure_state(
+                    "parser",
+                    "Парсер не обновляет heartbeat.",
+                )
+                watchdog_send_failure(
+                    "parser",
+                    "Парсер не обновляет heartbeat.",
+                )
+
+            # ------------------------------------------------
+            # ИСТОЧНИК
+            # ------------------------------------------------
+            if source_ok:
+                watchdog_check_recovery(
+                    "source",
+                    "Официальный источник снова доступен.",
+                )
+            else:
+                set_failure_state(
+                    "source",
+                    "Источник не отвечает или произошла ошибка "
+                    "при его обработке.",
+                )
+                watchdog_send_failure(
+                    "source",
+                    "Источник не отвечает или произошла ошибка "
+                    "при его обработке.",
+                )
+
+            # ------------------------------------------------
+            # TELEGRAM API
+            # ------------------------------------------------
+            if telegram_api_ok:
+                watchdog_check_recovery(
+                    "telegram",
+                    "Telegram Bot API снова доступен.",
+                )
+            else:
+                set_failure_state(
+                    "telegram",
+                    "Telegram Bot API не отвечает или возвращает ошибку.",
+                )
+                watchdog_send_failure(
+                    "telegram",
+                    "Telegram Bot API не отвечает или возвращает ошибку.",
+                )
+
+        except Exception as e:
+            print(
+                f"Ошибка контроля состояния: {e}",
+                flush=True,
+            )
+
+        time.sleep(WATCHDOG_INTERVAL_SECONDS)
 
 
 # ============================================================
@@ -583,6 +880,7 @@ def check_updates():
 
     with state_lock:
         state["last_check"] = check_time
+        state["parser_heartbeat"] = check_time
 
     try:
         response = session.get(
@@ -808,6 +1106,15 @@ status_thread = threading.Thread(
 )
 
 status_thread.start()
+
+
+watchdog_thread = threading.Thread(
+    target=watchdog_loop,
+    name="system-watchdog",
+    daemon=True,
+)
+
+watchdog_thread.start()
 
 
 commands_thread = threading.Thread(
