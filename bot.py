@@ -23,7 +23,10 @@ MAX_MESSAGE_AGE_MINUTES = 5
 
 MAX_SENT_MESSAGES = 1000
 
-REQUEST_TIMEOUT = (5, 15)
+# ВАЖНО:
+# Telegram /test использует long polling до 20 секунд.
+# Поэтому HTTP timeout должен быть БОЛЬШЕ 20 секунд.
+REQUEST_TIMEOUT = (5, 35)
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -125,16 +128,6 @@ def format_time(dt):
         return "—"
 
 
-def format_datetime(dt):
-    if not dt:
-        return "—"
-
-    try:
-        return dt.astimezone(KYIV_TZ).strftime("%d.%m.%Y %H:%M:%S")
-    except Exception:
-        return "—"
-
-
 # ============================================================
 # TELEGRAM API
 # ============================================================
@@ -153,6 +146,7 @@ def telegram_request(method, data=None, retries=3):
                 timeout=REQUEST_TIMEOUT,
             )
 
+            # Telegram rate limit
             if response.status_code == 429:
                 try:
                     retry_after = response.json().get(
@@ -164,6 +158,7 @@ def telegram_request(method, data=None, retries=3):
                 time.sleep(min(int(retry_after) + 1, 30))
                 continue
 
+            # Временные ошибки сервера Telegram
             if response.status_code >= 500:
                 time.sleep(2 + attempt)
                 continue
@@ -289,16 +284,20 @@ def build_status_text():
         last_check = state["last_check"]
         last_alert = state["last_alert"]
 
-    parser_text = "🟢 РАБОТАЕТ" if parser_running else "🔴 ОСТАНОВЛЕН"
-    telegram_text = "🟢 OK" if telegram_api_ok else "🔴 ОШИБКА"
-    source_text = "🟢 OK" if source_ok else "🔴 ОШИБКА"
+    parser_text = "РАБОТАЕТ" if parser_running else "ОСТАНОВЛЕН"
+    telegram_text = "OK" if telegram_api_ok else "ОШИБКА"
+    source_text = "OK" if source_ok else "ОШИБКА"
+
+    parser_icon = "🟢" if parser_running else "🔴"
+    telegram_icon = "🟢" if telegram_api_ok else "🔴"
+    source_icon = "🟢" if source_ok else "🔴"
 
     return (
         f"{STATUS_TITLE}\n"
         f"\n"
-        f"🟢 Парсер: {parser_text}\n"
-        f"🟢 Telegram API: {telegram_text}\n"
-        f"🟢 Источник: {source_text}\n"
+        f"{parser_icon} Парсер: {parser_text}\n"
+        f"{telegram_icon} Telegram API: {telegram_text}\n"
+        f"{source_icon} Источник: {source_text}\n"
         f"\n"
         f"🔎 Ключевое слово: БПЛА\n"
         f"⏱ Проверка: каждые 15 сек.\n"
@@ -406,15 +405,18 @@ def handle_test_command(message):
     chat_id = chat.get("id")
     user_id = sender.get("id")
 
+    # Команда принимается только из нашей рабочей группы
     if chat_id != CHAT_ID:
         return
 
     if not user_id:
         return
 
+    # Только администратор может запускать тест
     if not is_group_admin(user_id):
         print(
-            f"Команда /test отклонена: пользователь {user_id} не администратор.",
+            f"Команда /test отклонена: "
+            f"пользователь {user_id} не администратор.",
             flush=True,
         )
         return
@@ -440,8 +442,7 @@ def telegram_command_listener():
         flush=True,
     )
 
-    # Если раньше был установлен webhook,
-    # переключаемся на long polling.
+    # Переключаем Telegram на long polling.
     telegram_request(
         "deleteWebhook",
         {
@@ -451,8 +452,8 @@ def telegram_command_listener():
 
     offset = None
 
-    # Убираем старые накопившиеся команды при запуске,
-    # чтобы после перезапуска старый /test не сработал неожиданно.
+    # Не даём старым командам после перезапуска
+    # внезапно выполнить /test.
     try:
         result = telegram_request(
             "getUpdates",
@@ -475,6 +476,7 @@ def telegram_command_listener():
     while True:
         try:
             data = {
+                # Long polling Telegram
                 "timeout": 20,
                 "allowed_updates": '["message"]',
             }
@@ -507,12 +509,10 @@ def telegram_command_listener():
                 if not text:
                     continue
 
-                # Обрабатываем /test и варианты вида /test@BotName
                 command = text.split()[0].lower()
 
-                if command.startswith("/test"):
-                    if command == "/test" or command.startswith("/test@"):
-                        handle_test_command(message)
+                if command == "/test" or command.startswith("/test@"):
+                    handle_test_command(message)
 
         except Exception as e:
             print(
@@ -617,7 +617,7 @@ def check_updates():
 
         current_time = now_utc()
 
-        # Сначала смотрим самые свежие сообщения.
+        # Сначала самые свежие сообщения.
         posts = list(reversed(posts))
 
         for post in posts:
@@ -630,15 +630,11 @@ def check_updates():
                 current_time - post_datetime
             ).total_seconds()
 
-            # Если сообщение ещё новее текущего времени
-            # из-за особенностей часов/парсинга — не отбрасываем.
             if age_seconds < 0:
                 age_seconds = 0
 
-            # Старше установленного окна — не рассматриваем.
+            # Не рассматриваем сообщения старше 5 минут.
             if age_seconds > MAX_MESSAGE_AGE_MINUTES * 60:
-                # Так как сообщения идут от новых к старым,
-                # дальше можно прекращать поиск.
                 break
 
             text_element = post.select_one(
@@ -656,10 +652,11 @@ def check_updates():
             if not text:
                 continue
 
+            # Ищем БПЛА без учёта регистра.
             if KEYWORD not in text.lower():
                 continue
 
-            # Уникальный ID сообщения канала.
+            # Получаем ID конкретного сообщения канала.
             post_id = None
 
             try:
@@ -670,6 +667,8 @@ def check_updates():
             if not post_id:
                 continue
 
+            # Защита от повторной отправки одного и того же
+            # сообщения в рамках текущего запуска.
             with sent_messages_lock:
                 if post_id in sent_messages:
                     continue
@@ -677,12 +676,19 @@ def check_updates():
                 sent_messages.add(post_id)
 
                 if len(sent_messages) > MAX_SENT_MESSAGES:
-                    # Удаляем произвольный старый элемент,
-                    # чтобы память не росла бесконечно.
                     sent_messages.pop()
 
+            # =================================================
+            # ВАЖНО:
+            # ВОЗВРАЩАЕМ ПРЕЖНИЙ ФОРМАТ ТРЕВОГИ
+            # =================================================
+
             alert_text = (
-                "🚨 ТРЕВОГА\n"
+                "🚨 ВНИМАНИЕ!\n"
+                "\n"
+                "Обнаружено упоминание БПЛА\n"
+                "в официальном Telegram-канале\n"
+                "Повітряних Сил України:\n"
                 "\n"
                 f"{text}"
             )
@@ -699,10 +705,6 @@ def check_updates():
                     f"ОТПРАВЛЕНА ТРЕВОГА: {post_id}",
                     flush=True,
                 )
-
-            # После найденного свежего сообщения с ключевым
-            # словом можно продолжать поиск остальных свежих
-            # сообщений, если они появились почти одновременно.
 
     except Exception as e:
         with state_lock:
@@ -773,8 +775,8 @@ def run_bot():
             check_updates()
 
         except Exception as e:
-            # Очень важно:
-            # ошибка одной проверки НЕ должна убить поток парсера.
+            # Ошибка одной проверки не должна остановить
+            # весь фоновый парсер.
             with state_lock:
                 state["source_ok"] = False
 
