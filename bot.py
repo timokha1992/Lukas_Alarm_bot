@@ -28,6 +28,7 @@ PARSER_STALE_AFTER_SECONDS = 60
 # Кратковременные ошибки источника/API не должны сразу
 # создавать тревогу в рабочей группе.
 FAILURE_NOTIFICATION_AFTER_SECONDS = 60
+STARTUP_GRACE_SECONDS = 90
 
 MAX_MESSAGE_AGE_MINUTES = 5
 
@@ -178,6 +179,8 @@ def telegram_request(method, data=None, retries=3):
     if data is None:
         data = {}
 
+    last_error = "неизвестная ошибка"
+
     for attempt in range(retries):
         try:
             response = session.post(
@@ -200,6 +203,15 @@ def telegram_request(method, data=None, retries=3):
 
             # Временные ошибки сервера Telegram
             if response.status_code >= 500:
+                last_error = f"Telegram Bot API вернул HTTP {response.status_code}"
+                if attempt == retries - 1:
+                    with state_lock:
+                        state["telegram_api_ok"] = False
+                    print(
+                        f"Telegram API ошибка после {retries} попыток: {last_error}",
+                        flush=True,
+                    )
+                    return None
                 time.sleep(2 + attempt)
                 continue
 
@@ -208,9 +220,8 @@ def telegram_request(method, data=None, retries=3):
             result = response.json()
 
             if not result.get("ok"):
-                raise RuntimeError(
-                    f"Telegram API error: {result}"
-                )
+                last_error = "Telegram Bot API вернул ошибку"
+                raise RuntimeError(last_error)
 
             with state_lock:
                 state["telegram_api_ok"] = True
@@ -356,6 +367,7 @@ def watchdog_send_failure(failure_type, reason):
     with state_lock:
         since = state[key_since]
         already_notified = state[key_notified]
+        last_check = state["last_check"]
 
     if since is None or already_notified:
         return
@@ -371,35 +383,31 @@ def watchdog_send_failure(failure_type, reason):
         "telegram": "🔴 ПРОБЛЕМА TELEGRAM API",
     }
 
-    messages = {
-        "parser": (
-            "Парсер не выполняет проверки.
-"
-            f"Последняя проверка: {format_time(state['last_check'])}"
-        ),
-        "source": (
-            "Официальный источник временно недоступен.
-"
+    if failure_type == "parser":
+        message = (
+            "Парсер не выполняет проверки.\n"
+            f"Последняя проверка: {format_time(last_check)}\n"
+            "Причина: причина не определена."
+        )
+    elif failure_type == "source":
+        message = (
+            "Официальный источник временно недоступен.\n"
             f"Причина: {reason}"
-        ),
-        "telegram": (
-            "Бот не может нормально связаться с Telegram Bot API.
-"
+        )
+    elif failure_type == "telegram":
+        message = (
+            "Бот не может нормально связаться с Telegram Bot API.\n"
             f"Причина: {reason}"
-        ),
-    }
+        )
+    else:
+        message = reason
 
     text = (
-        f"{titles.get(failure_type, '🔴 ПРОБЛЕМА СИСТЕМЫ')}
-"
-        "
-"
-        f"{messages.get(failure_type, reason)}
-"
-        "
-"
-        f"Проблема длится более "
-        f"{FAILURE_NOTIFICATION_AFTER_SECONDS} секунд."
+        f"{titles.get(failure_type, '🔴 ПРОБЛЕМА СИСТЕМЫ')}\n"
+        "\n"
+        f"{message}\n"
+        "\n"
+        f"Проблема длится более {FAILURE_NOTIFICATION_AFTER_SECONDS} секунд."
     )
 
     message_id = send_telegram_message(text)
@@ -425,14 +433,10 @@ def watchdog_check_recovery(failure_type, recovery_reason):
         return
 
     text = (
-        "🟢 СИСТЕМА ВОССТАНОВЛЕНА
-"
-        "
-"
-        f"{recovery_reason}
-"
-        f"Длительность сбоя: "
-        f"{format_duration(info['duration'])}"
+        "🟢 СИСТЕМА ВОССТАНОВЛЕНА\n"
+        "\n"
+        f"{recovery_reason}\n"
+        f"Длительность сбоя: {format_duration(info['duration'])}"
     )
 
     message_id = send_telegram_message(text)
@@ -460,6 +464,18 @@ def watchdog_loop():
                 parser_heartbeat = state["parser_heartbeat"]
                 source_ok = state["source_ok"]
                 telegram_api_ok = state["telegram_api_ok"]
+                started_at = state["started_at"]
+
+            # После запуска даём системе время спокойно инициализироваться.
+            # Это предотвращает ложные технические сообщения при деплое.
+            in_startup_grace = (
+                started_at is None
+                or (now - started_at).total_seconds() < STARTUP_GRACE_SECONDS
+            )
+
+            if in_startup_grace:
+                time.sleep(WATCHDOG_INTERVAL_SECONDS)
+                continue
 
             # ------------------------------------------------
             # ПАРСЕР
@@ -497,13 +513,11 @@ def watchdog_loop():
             else:
                 set_failure_state(
                     "source",
-                    "Источник не отвечает или произошла ошибка "
-                    "при его обработке.",
+                    "Источник не отвечает или произошла ошибка при его обработке.",
                 )
                 watchdog_send_failure(
                     "source",
-                    "Источник не отвечает или произошла ошибка "
-                    "при его обработке.",
+                    "Источник не отвечает или произошла ошибка при его обработке.",
                 )
 
             # ------------------------------------------------
@@ -971,11 +985,6 @@ def check_updates():
                 if post_id in sent_messages:
                     continue
 
-                sent_messages.add(post_id)
-
-                if len(sent_messages) > MAX_SENT_MESSAGES:
-                    sent_messages.pop()
-
             # =================================================
             # ВАЖНО:
             # ВОЗВРАЩАЕМ ПРЕЖНИЙ ФОРМАТ ТРЕВОГИ
@@ -996,6 +1005,12 @@ def check_updates():
             )
 
             if message_id:
+                with sent_messages_lock:
+                    sent_messages.add(post_id)
+
+                    if len(sent_messages) > MAX_SENT_MESSAGES:
+                        sent_messages.pop()
+
                 with state_lock:
                     state["last_alert"] = now_utc()
 
