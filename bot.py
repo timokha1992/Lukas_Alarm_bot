@@ -12,6 +12,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
+# ============================================================
+# FLASK
+# ============================================================
+
 app = Flask(__name__)
 
 
@@ -19,22 +23,38 @@ app = Flask(__name__)
 # НАСТРОЙКИ
 # ============================================================
 
-TELEGRAM_TOKEN = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
-CHAT_ID = (os.environ.get("CHAT_ID") or "").strip()
+TELEGRAM_TOKEN = (
+    os.environ.get("TELEGRAM_TOKEN") or ""
+).strip()
+
+CHAT_ID = (
+    os.environ.get("CHAT_ID") or ""
+).strip()
 
 URL = "https://t.me/s/kpszsu"
 
-# Пока тестируем БпЛА
+# Пока тестируем БпЛА.
+# Позже поменяем на нужное ключевое слово.
 KEYWORD = "бпл"
 
-# Максимальный возраст сообщения, которое можно отправить
+# Максимальный возраст сообщения,
+# которое разрешено отправлять.
 MAX_MESSAGE_AGE_MINUTES = 5
 
-# Интервал между проверками канала
+# Интервал проверки канала.
 CHECK_INTERVAL_SECONDS = 15
 
-# Сколько последних обработанных сообщений держим в памяти
+# Как часто обновлять закреплённый статус.
+STATUS_UPDATE_INTERVAL_SECONDS = 60
+
+# Сколько обработанных сообщений держим в памяти.
 MAX_SENT_MESSAGES = 1000
+
+# Специальный маркер нашего статусного сообщения.
+STATUS_MARKER = "LUKAS_ALARM_STATUS_V1"
+
+# Callback для кнопки теста.
+TEST_CALLBACK_DATA = "lukas_test_alert"
 
 
 # ============================================================
@@ -42,7 +62,9 @@ MAX_SENT_MESSAGES = 1000
 # ============================================================
 
 sent_messages = set()
-sent_messages_order = deque(maxlen=MAX_SENT_MESSAGES)
+sent_messages_order = deque(
+    maxlen=MAX_SENT_MESSAGES
+)
 
 state_lock = threading.Lock()
 
@@ -60,6 +82,44 @@ consecutive_errors = 0
 
 parser_running = False
 
+# ID статусного сообщения в Telegram.
+status_message_id = None
+
+# Последнее время обновления статусного сообщения.
+last_status_update_at = None
+
+# Offset для getUpdates.
+telegram_update_offset = None
+
+
+# ============================================================
+# ВРЕМЕННАЯ ЗОНА УКРАИНЫ
+# ============================================================
+
+# Для отображения времени пользователю.
+# В сентябре Украина находится в UTC+3.
+UKRAINE_TZ = timezone(
+    timedelta(hours=3)
+)
+
+
+def format_time(value):
+    """
+    Переводит UTC datetime в удобное украинское время.
+    """
+    if value is None:
+        return "нет данных"
+
+    try:
+        local_value = value.astimezone(
+            UKRAINE_TZ
+        )
+        return local_value.strftime(
+            "%d.%m.%Y %H:%M:%S"
+        )
+    except Exception:
+        return "ошибка времени"
+
 
 # ============================================================
 # HTTP SESSION
@@ -73,8 +133,16 @@ retry_strategy = Retry(
     read=2,
     status=2,
     backoff_factor=1,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET"]),
+    status_forcelist=(
+        429,
+        500,
+        502,
+        503,
+        504,
+    ),
+    allowed_methods=frozenset(
+        ["GET"]
+    ),
     respect_retry_after_header=True,
 )
 
@@ -82,40 +150,126 @@ adapter = HTTPAdapter(
     max_retries=retry_strategy
 )
 
-session.mount("https://", adapter)
-session.mount("http://", adapter)
+session.mount(
+    "https://",
+    adapter
+)
+
+session.mount(
+    "http://",
+    adapter
+)
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM API
+# ============================================================
+
+def telegram_api(
+    method,
+    payload=None,
+    timeout=(3, 10)
+):
+    """
+    Универсальный запрос к Telegram Bot API.
+    """
+    if not TELEGRAM_TOKEN:
+        print(
+            "ОШИБКА: TELEGRAM_TOKEN не задан"
+        )
+        return None
+
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/{method}"
+    )
+
+    try:
+        response = requests.post(
+            url,
+            json=payload or {},
+            timeout=timeout
+        )
+
+        print(
+            f"Telegram {method}: "
+            f"{response.status_code} "
+            f"{response.text[:500]}"
+        )
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+
+        if not data.get("ok"):
+            print(
+                f"Telegram API error: "
+                f"{data}"
+            )
+            return None
+
+        return data
+
+    except (
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectionError,
+    ) as e:
+        print(
+            f"Временная ошибка Telegram API "
+            f"({method}): {e}"
+        )
+        return None
+
+    except Exception as e:
+        print(
+            f"ОШИБКА Telegram API "
+            f"({method}): "
+            f"{type(e).__name__}: {e}"
+        )
+        return None
+
+
+# ============================================================
+# ОТПРАВКА СООБЩЕНИЯ В ОСНОВНОЙ ЧАТ
 # ============================================================
 
 def send_telegram_message(message):
-    print("Пробую отправить уведомление в Telegram...")
+    """
+    Отправляет обычное сообщение
+    непосредственно в основной чат.
+    """
+    print(
+        "Пробую отправить уведомление "
+        "в Telegram..."
+    )
 
     if not TELEGRAM_TOKEN:
-        print("ОШИБКА: TELEGRAM_TOKEN не задан")
+        print(
+            "ОШИБКА: TELEGRAM_TOKEN не задан"
+        )
         return False
 
     if not CHAT_ID:
-        print("ОШИБКА: CHAT_ID не задан")
+        print(
+            "ОШИБКА: CHAT_ID не задан"
+        )
         return False
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
     payload = {
         "chat_id": CHAT_ID,
-        "text": message
+        "text": message,
     }
 
-    # Делаем несколько попыток.
-    # Это особенно важно при кратковременном сбое сети.
     for attempt in range(1, 4):
 
         try:
+
             print(
                 f"Попытка отправки в Telegram "
                 f"{attempt}/3..."
@@ -128,7 +282,7 @@ def send_telegram_message(message):
             )
 
             print(
-                f"Telegram sendMessage: "
+                "Telegram sendMessage: "
                 f"{response.status_code} "
                 f"{response.text[:500]}"
             )
@@ -139,7 +293,7 @@ def send_telegram_message(message):
                 )
                 return True
 
-            # Telegram может попросить подождать
+            # Telegram попросил подождать.
             if response.status_code == 429:
 
                 try:
@@ -160,29 +314,33 @@ def send_telegram_message(message):
                 )
 
                 print(
-                    f"Telegram попросил повторить "
-                    f"через {retry_after} сек."
+                    "Telegram попросил "
+                    f"повторить через "
+                    f"{retry_after} сек."
                 )
 
                 if attempt < 3:
-                    time.sleep(retry_after)
+                    time.sleep(
+                        retry_after
+                    )
                     continue
 
                 return False
 
-            # Временная ошибка Telegram
+            # Временная ошибка Telegram.
             if response.status_code in (
                 500,
                 502,
                 503,
-                504
+                504,
             ):
 
                 if attempt < 3:
+
                     delay = attempt * 2
 
                     print(
-                        f"Временная ошибка Telegram. "
+                        "Временная ошибка Telegram. "
                         f"Повтор через {delay} сек."
                     )
 
@@ -197,19 +355,20 @@ def send_telegram_message(message):
 
         except (
             requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError
+            requests.exceptions.ConnectionError,
         ) as e:
 
             print(
-                f"Временная ошибка сети при "
-                f"отправке в Telegram: {e}"
+                "Временная ошибка сети "
+                f"при отправке в Telegram: {e}"
             )
 
             if attempt < 3:
+
                 delay = attempt * 2
 
                 print(
-                    f"Повтор отправки через "
+                    "Повтор отправки через "
                     f"{delay} сек."
                 )
 
@@ -225,7 +384,7 @@ def send_telegram_message(message):
         except Exception as e:
 
             print(
-                f"ОШИБКА отправки в Telegram: "
+                "ОШИБКА отправки в Telegram: "
                 f"{type(e).__name__}: {e}"
             )
 
@@ -245,19 +404,21 @@ def test_telegram_api():
     )
 
     if not TELEGRAM_TOKEN:
+
         print(
             "ОШИБКА: TELEGRAM_TOKEN не задан"
         )
-        return False
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/getMe"
-    )
+        return False
 
     for attempt in range(1, 3):
 
         try:
+
+            url = (
+                "https://api.telegram.org/"
+                f"bot{TELEGRAM_TOKEN}/getMe"
+            )
 
             response = requests.get(
                 url,
@@ -265,19 +426,22 @@ def test_telegram_api():
             )
 
             print(
-                f"Telegram Bot API: "
+                "Telegram Bot API: "
                 f"{response.status_code} "
                 f"{response.text[:500]}"
             )
 
             if response.status_code == 200:
+
                 print(
                     "Telegram Bot API доступен"
                 )
+
                 return True
 
             print(
-                "Telegram Bot API вернул ошибку"
+                "Telegram Bot API "
+                "вернул ошибку"
             )
 
             if attempt < 2:
@@ -286,7 +450,8 @@ def test_telegram_api():
         except Exception as e:
 
             print(
-                f"ОШИБКА доступа к Telegram Bot API: "
+                "ОШИБКА доступа к "
+                "Telegram Bot API: "
                 f"{type(e).__name__}: {e}"
             )
 
@@ -297,18 +462,776 @@ def test_telegram_api():
 
 
 # ============================================================
+# ПРОВЕРКА АДМИНИСТРАТОРА
+# ============================================================
+
+def is_chat_admin(user_id):
+    """
+    Проверяем, является ли пользователь
+    администратором основной группы.
+
+    Кнопка теста доступна только администраторам.
+    """
+
+    if not CHAT_ID:
+        return False
+
+    data = telegram_api(
+        "getChatMember",
+        {
+            "chat_id": CHAT_ID,
+            "user_id": user_id,
+        },
+        timeout=(3, 5)
+    )
+
+    if not data:
+        return False
+
+    member = data.get(
+        "result",
+        {}
+    )
+
+    status = member.get(
+        "status"
+    )
+
+    return status in (
+        "administrator",
+        "creator",
+    )
+
+
+# ============================================================
+# ОТВЕТ НА НАЖАТИЕ КНОПКИ
+# ============================================================
+
+def answer_callback_query(
+    callback_query_id,
+    text
+):
+
+    telegram_api(
+        "answerCallbackQuery",
+        {
+            "callback_query_id":
+                callback_query_id,
+            "text": text,
+            "show_alert": False,
+        },
+        timeout=(3, 5)
+    )
+
+
+# ============================================================
+# СОЗДАНИЕ / РЕДАКТИРОВАНИЕ СТАТУСА
+# ============================================================
+
+def build_status_text():
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    with state_lock:
+
+        uptime_seconds = int(
+            (
+                now -
+                bot_started_at
+            ).total_seconds()
+        )
+
+        current_parser_running = (
+            parser_running
+        )
+
+        current_total_checks = (
+            total_checks
+        )
+
+        current_successful_checks = (
+            successful_checks
+        )
+
+        current_failed_checks = (
+            failed_checks
+        )
+
+        current_consecutive_errors = (
+            consecutive_errors
+        )
+
+        current_last_check = (
+            last_check_at
+        )
+
+        current_last_successful = (
+            last_successful_check_at
+        )
+
+        current_last_alert = (
+            last_alert_at
+        )
+
+    if (
+        current_parser_running
+        and current_consecutive_errors == 0
+        and current_successful_checks > 0
+    ):
+        status_icon = "🟢"
+        status_title = (
+            "СИСТЕМА РАБОТАЕТ"
+        )
+
+    elif current_consecutive_errors > 0:
+        status_icon = "🟡"
+        status_title = (
+            "ЕСТЬ ОШИБКИ"
+        )
+
+    else:
+        status_icon = "🟡"
+        status_title = (
+            "СИСТЕМА ЗАПУСКАЕТСЯ"
+        )
+
+    text = (
+        f"{status_icon} "
+        f"<b>Lukas Alarm — "
+        f"{status_title}</b>\n\n"
+
+        f"Проверка канала: "
+        f"{CHECK_INTERVAL_SECONDS} сек.\n"
+
+        f"Последняя проверка: "
+        f"{format_time(current_last_check)}\n"
+
+        f"Последняя успешная проверка: "
+        f"{format_time(current_last_successful)}\n"
+
+        f"Последнее оповещение: "
+        f"{format_time(current_last_alert)}\n\n"
+
+        f"Проверок всего: "
+        f"{current_total_checks}\n"
+
+        f"Успешных: "
+        f"{current_successful_checks}\n"
+
+        f"Ошибок: "
+        f"{current_failed_checks}\n"
+
+        f"Ошибок подряд: "
+        f"{current_consecutive_errors}\n"
+
+        f"Время работы: "
+        f"{uptime_seconds // 3600} ч "
+        f"{(uptime_seconds % 3600) // 60} мин\n\n"
+
+        f"{STATUS_MARKER}"
+    )
+
+    return text
+
+
+def build_status_keyboard():
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text":
+                        "🧪 ПРОВЕРИТЬ ОПОВЕЩЕНИЕ",
+                    "callback_data":
+                        TEST_CALLBACK_DATA,
+                }
+            ]
+        ]
+    }
+
+
+def create_status_message():
+
+    global status_message_id
+
+    if not CHAT_ID:
+        print(
+            "Невозможно создать статус: "
+            "CHAT_ID не задан."
+        )
+        return False
+
+    print(
+        "Создаю статусное сообщение..."
+    )
+
+    data = telegram_api(
+        "sendMessage",
+        {
+            "chat_id": CHAT_ID,
+            "text": build_status_text(),
+            "parse_mode": "HTML",
+            "reply_markup":
+                build_status_keyboard(),
+        },
+        timeout=(3, 10)
+    )
+
+    if not data:
+        print(
+            "Не удалось создать "
+            "статусное сообщение."
+        )
+        return False
+
+    message = data.get(
+        "result",
+        {}
+    )
+
+    message_id = message.get(
+        "message_id"
+    )
+
+    if not message_id:
+        print(
+            "Telegram не вернул "
+            "message_id статуса."
+        )
+        return False
+
+    with state_lock:
+        status_message_id = message_id
+
+    print(
+        "Статусное сообщение создано. "
+        f"message_id={message_id}"
+    )
+
+    # Пытаемся закрепить.
+    pin_status_message(
+        message_id
+    )
+
+    return True
+
+
+def pin_status_message(message_id):
+
+    print(
+        "Пытаюсь закрепить "
+        "статусное сообщение..."
+    )
+
+    data = telegram_api(
+        "pinChatMessage",
+        {
+            "chat_id": CHAT_ID,
+            "message_id": message_id,
+            "disable_notification": True,
+        },
+        timeout=(3, 10)
+    )
+
+    if data:
+        print(
+            "Статусное сообщение "
+            "успешно закреплено."
+        )
+        return True
+
+    print(
+        "Не удалось закрепить "
+        "статусное сообщение."
+    )
+
+    print(
+        "Проверь, что бот является "
+        "администратором группы и имеет "
+        "право закреплять сообщения."
+    )
+
+    return False
+
+
+def find_existing_status_message():
+
+    global status_message_id
+
+    print(
+        "Проверяю, есть ли уже "
+        "закреплённый статус..."
+    )
+
+    data = telegram_api(
+        "getChat",
+        {
+            "chat_id": CHAT_ID
+        },
+        timeout=(3, 5)
+    )
+
+    if not data:
+        print(
+            "Не удалось получить "
+            "информацию о группе."
+        )
+        return False
+
+    chat = data.get(
+        "result",
+        {}
+    )
+
+    pinned_message = chat.get(
+        "pinned_message"
+    )
+
+    if not pinned_message:
+        print(
+            "Закреплённого сообщения "
+            "не найдено."
+        )
+        return False
+
+    pinned_text = (
+        pinned_message.get(
+            "text"
+        )
+        or ""
+    )
+
+    if STATUS_MARKER not in pinned_text:
+        print(
+            "Закреплённое сообщение "
+            "не является статусом Lukas Alarm."
+        )
+        return False
+
+    message_id = pinned_message.get(
+        "message_id"
+    )
+
+    if not message_id:
+        return False
+
+    with state_lock:
+        status_message_id = message_id
+
+    print(
+        "Нашёл существующий статус. "
+        f"message_id={message_id}"
+    )
+
+    return True
+
+
+def ensure_status_message():
+
+    if not TELEGRAM_TOKEN:
+        return False
+
+    if not CHAT_ID:
+        return False
+
+    # Сначала пытаемся найти уже существующий
+    # закреплённый статус.
+    if find_existing_status_message():
+        return True
+
+    # Если его нет — создаём новый.
+    return create_status_message()
+
+
+def update_status_message(
+    force=False
+):
+
+    global last_status_update_at
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    with state_lock:
+
+        message_id = (
+            status_message_id
+        )
+
+        previous_update = (
+            last_status_update_at
+        )
+
+    if not message_id:
+
+        ensure_status_message()
+
+        with state_lock:
+            message_id = (
+                status_message_id
+            )
+
+        if not message_id:
+            return False
+
+    if not force and previous_update:
+
+        elapsed = (
+            now -
+            previous_update
+        ).total_seconds()
+
+        if (
+            elapsed <
+            STATUS_UPDATE_INTERVAL_SECONDS
+        ):
+            return True
+
+    data = telegram_api(
+        "editMessageText",
+        {
+            "chat_id": CHAT_ID,
+            "message_id": message_id,
+            "text": build_status_text(),
+            "parse_mode": "HTML",
+            "reply_markup":
+                build_status_keyboard(),
+        },
+        timeout=(3, 10)
+    )
+
+    if data:
+
+        with state_lock:
+            last_status_update_at = now
+
+        return True
+
+    print(
+        "Не удалось обновить "
+        "статусное сообщение."
+    )
+
+    # Возможно, сообщение было удалено.
+    # Сбрасываем ID и попробуем создать новое.
+    with state_lock:
+        status_message_id = None
+
+    return False
+
+
+# ============================================================
+# ТЕСТОВОЕ ОПОВЕЩЕНИЕ
+# ============================================================
+
+def send_test_alert(user_id):
+
+    print(
+        "Получена команда тестирования "
+        f"от user_id={user_id}"
+    )
+
+    if not is_chat_admin(user_id):
+
+        print(
+            "Пользователь не является "
+            "администратором. Тест запрещён."
+        )
+
+        return False
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    test_text = (
+        "🧪 <b>ТЕСТОВОЕ ОПОВЕЩЕНИЕ</b>\n\n"
+        "Это проверка полного пути "
+        "оповещения Lukas Alarm.\n\n"
+        f"Время: {format_time(now)}\n\n"
+        "Это НЕ реальная тревога."
+    )
+
+    data = telegram_api(
+        "sendMessage",
+        {
+            "chat_id": CHAT_ID,
+            "text": test_text,
+            "parse_mode": "HTML",
+        },
+        timeout=(3, 10)
+    )
+
+    if data:
+
+        print(
+            "Тестовое оповещение "
+            "успешно отправлено."
+        )
+
+        return True
+
+    print(
+        "Не удалось отправить "
+        "тестовое оповещение."
+    )
+
+    return False
+
+
+# ============================================================
+# TELEGRAM CALLBACK POLLING
+# ============================================================
+
+def process_callback_query(
+    callback_query
+):
+
+    callback_id = (
+        callback_query.get(
+            "id"
+        )
+    )
+
+    data = (
+        callback_query.get(
+            "data"
+        )
+    )
+
+    from_user = (
+        callback_query.get(
+            "from",
+            {}
+        )
+    )
+
+    user_id = from_user.get(
+        "id"
+    )
+
+    if data != TEST_CALLBACK_DATA:
+
+        answer_callback_query(
+            callback_id,
+            "Неизвестная команда."
+        )
+
+        return
+
+    if not user_id:
+
+        answer_callback_query(
+            callback_id,
+            "Не удалось определить пользователя."
+        )
+
+        return
+
+    # Сразу подтверждаем нажатие,
+    # чтобы Telegram не показывал
+    # бесконечную загрузку кнопки.
+    if not is_chat_admin(user_id):
+
+        answer_callback_query(
+            callback_id,
+            "Тест доступен только администраторам группы."
+        )
+
+        return
+
+    answer_callback_query(
+        callback_id,
+        "Запускаю тест оповещения..."
+    )
+
+    success = send_test_alert(
+        user_id
+    )
+
+    if success:
+
+        # После теста обновляем статус.
+        update_status_message(
+            force=True
+        )
+
+    else:
+
+        print(
+            "Тестовое оповещение "
+            "завершилось ошибкой."
+        )
+
+
+def telegram_updates_loop():
+
+    global telegram_update_offset
+
+    print(
+        "=============================="
+    )
+    print(
+        "TELEGRAM CALLBACK POLLING ЗАПУЩЕН"
+    )
+    print(
+        "=============================="
+    )
+
+    # Получаем последние обновления,
+    # чтобы не проигрывать старые нажатия
+    # после перезапуска.
+    try:
+
+        initial_data = telegram_api(
+            "getUpdates",
+            {
+                "timeout": 0,
+                "limit": 100,
+            },
+            timeout=(3, 10)
+        )
+
+        if initial_data:
+
+            initial_updates = (
+                initial_data
+                .get("result", [])
+            )
+
+            if initial_updates:
+
+                last_update_id = (
+                    initial_updates[-1]
+                    .get("update_id")
+                )
+
+                if (
+                    last_update_id
+                    is not None
+                ):
+                    telegram_update_offset = (
+                        last_update_id + 1
+                    )
+
+                    print(
+                        "Пропущены старые "
+                        "обновления до offset="
+                        f"{telegram_update_offset}"
+                    )
+
+    except Exception as e:
+
+        print(
+            "Ошибка начальной инициализации "
+            "Telegram updates: "
+            f"{type(e).__name__}: {e}"
+        )
+
+    while True:
+
+        try:
+
+            payload = {
+                "timeout": 25,
+                "limit": 100,
+                "allowed_updates": [
+                    "callback_query"
+                ],
+            }
+
+            if (
+                telegram_update_offset
+                is not None
+            ):
+                payload["offset"] = (
+                    telegram_update_offset
+                )
+
+            data = telegram_api(
+                "getUpdates",
+                payload,
+                timeout=(5, 35)
+            )
+
+            if not data:
+
+                time.sleep(2)
+                continue
+
+            updates = (
+                data
+                .get("result", [])
+            )
+
+            for update in updates:
+
+                update_id = (
+                    update.get(
+                        "update_id"
+                    )
+                )
+
+                if (
+                    update_id
+                    is not None
+                ):
+                    telegram_update_offset = (
+                        update_id + 1
+                    )
+
+                callback_query = (
+                    update.get(
+                        "callback_query"
+                    )
+                )
+
+                if callback_query:
+
+                    try:
+                        process_callback_query(
+                            callback_query
+                        )
+
+                    except Exception as e:
+
+                        print(
+                            "ОШИБКА обработки "
+                            "callback_query: "
+                            f"{type(e).__name__}: {e}"
+                        )
+
+        except Exception as e:
+
+            print(
+                "КРИТИЧЕСКАЯ ОШИБКА "
+                "Telegram polling: "
+                f"{type(e).__name__}: {e}"
+            )
+
+            time.sleep(5)
+
+
+# ============================================================
 # ВРЕМЯ ПОСТА
 # ============================================================
 
 def get_post_datetime(post):
 
-    time_elem = post.find("time")
+    time_elem = post.find(
+        "time"
+    )
 
     if not time_elem:
         return None
 
-    datetime_value = time_elem.get(
-        "datetime"
+    datetime_value = (
+        time_elem.get(
+            "datetime"
+        )
     )
 
     if not datetime_value:
@@ -316,16 +1239,21 @@ def get_post_datetime(post):
 
     try:
 
-        post_time = datetime.fromisoformat(
-            datetime_value.replace(
-                "Z",
-                "+00:00"
+        post_time = (
+            datetime.fromisoformat(
+                datetime_value.replace(
+                    "Z",
+                    "+00:00"
+                )
             )
         )
 
         if post_time.tzinfo is None:
-            post_time = post_time.replace(
-                tzinfo=timezone.utc
+
+            post_time = (
+                post_time.replace(
+                    tzinfo=timezone.utc
+                )
             )
 
         return post_time
@@ -333,8 +1261,8 @@ def get_post_datetime(post):
     except Exception as e:
 
         print(
-            f"Ошибка определения времени поста: "
-            f"{e}"
+            "Ошибка определения времени "
+            f"поста: {e}"
         )
 
         return None
@@ -347,7 +1275,10 @@ def get_post_datetime(post):
 def is_message_sent(post_id):
 
     with state_lock:
-        return post_id in sent_messages
+
+        return (
+            post_id in sent_messages
+        )
 
 
 def remember_sent_message(post_id):
@@ -359,15 +1290,22 @@ def remember_sent_message(post_id):
 
         # deque с maxlen автоматически
         # удаляет старые элементы.
-        if len(sent_messages_order) >= MAX_SENT_MESSAGES:
+        if (
+            len(sent_messages_order)
+            >= MAX_SENT_MESSAGES
+        ):
 
-            oldest = sent_messages_order[0]
+            oldest = (
+                sent_messages_order[0]
+            )
 
             sent_messages.discard(
                 oldest
             )
 
-        sent_messages.add(post_id)
+        sent_messages.add(
+            post_id
+        )
 
         sent_messages_order.append(
             post_id
@@ -401,9 +1339,13 @@ def check_updates():
     }
 
     with state_lock:
-        last_check_at = datetime.now(
-            timezone.utc
+
+        last_check_at = (
+            datetime.now(
+                timezone.utc
+            )
         )
+
         total_checks += 1
 
     try:
@@ -431,12 +1373,14 @@ def check_updates():
         if response.status_code != 200:
 
             print(
-                f"Telegram channel вернул "
+                "Telegram channel вернул "
                 f"HTTP {response.status_code}"
             )
 
             with state_lock:
+
                 failed_checks += 1
+
                 consecutive_errors += 1
 
             return
@@ -456,7 +1400,7 @@ def check_updates():
         )
 
         print(
-            f"Найдено постов на странице: "
+            "Найдено постов на странице: "
             f"{len(posts)}"
         )
 
@@ -467,31 +1411,43 @@ def check_updates():
         cutoff_time = (
             now -
             timedelta(
-                minutes=MAX_MESSAGE_AGE_MINUTES
+                minutes=
+                MAX_MESSAGE_AGE_MINUTES
             )
         )
 
-        # Считаем проверку успешной.
+        # Проверка успешна.
         with state_lock:
+
             successful_checks += 1
+
             consecutive_errors = 0
-            last_successful_check_at = now
+
+            last_successful_check_at = (
+                now
+            )
 
         for post in posts:
 
-            post_id = post.get(
-                "data-post",
-                ""
+            post_id = (
+                post.get(
+                    "data-post",
+                    ""
+                )
             )
 
             if not post_id:
                 continue
 
-            if is_message_sent(post_id):
+            if is_message_sent(
+                post_id
+            ):
                 continue
 
-            post_time = get_post_datetime(
-                post
+            post_time = (
+                get_post_datetime(
+                    post
+                )
             )
 
             if post_time is None:
@@ -503,52 +1459,92 @@ def check_updates():
 
             text_elem = post.find(
                 "div",
-                class_="tgme_widget_message_text"
+                class_=
+                "tgme_widget_message_text"
             )
 
             if not text_elem:
                 continue
 
-            post_text = text_elem.get_text(
-                "\n",
-                strip=True
+            post_text = (
+                text_elem.get_text(
+                    "\n",
+                    strip=True
+                )
             )
 
-            if KEYWORD not in post_text.lower():
+            if (
+                KEYWORD
+                not in post_text.lower()
+            ):
                 continue
 
             print(
-                f"🚨 НАЙДЕНО УПОМИНАНИЕ БпЛА: "
+                "🚨 НАЙДЕНО УПОМИНАНИЕ БпЛА: "
                 f"{post_id}"
             )
 
             # Не допускаем слишком длинное
             # сообщение Telegram.
-            safe_text = post_text[:3500]
+            safe_text = (
+                post_text[:3500]
+            )
 
             alert_text = (
-                "🚨 ВНИМАНИЕ!\n\n"
+                "🚨 <b>ВНИМАНИЕ!</b>\n\n"
                 "Обнаружено упоминание БпЛА "
                 "в официальном Telegram-канале "
                 "Повітряних Сил України:\n\n"
                 f"{safe_text}"
             )
 
-            if send_telegram_message(
-                alert_text
-            ):
+            # Отправляем непосредственно
+            # в основной чат.
+            data = telegram_api(
+                "sendMessage",
+                {
+                    "chat_id": CHAT_ID,
+                    "text": alert_text,
+                    "parse_mode": "HTML",
+                },
+                timeout=(3, 10)
+            )
+
+            if data:
 
                 remember_sent_message(
                     post_id
                 )
 
                 with state_lock:
+
                     last_alert_at = now
-                    last_alert_id = post_id
+
+                    last_alert_id = (
+                        post_id
+                    )
 
                 print(
-                    f"Сообщение {post_id} "
-                    f"помечено как отправленное."
+                    "Сообщение "
+                    f"{post_id} "
+                    "помечено как отправленное."
+                )
+
+                # Обновляем статус сразу
+                # после реального оповещения.
+                update_status_message(
+                    force=True
+                )
+
+            else:
+
+                print(
+                    "Не удалось отправить "
+                    f"оповещение {post_id}. "
+                    "Сообщение НЕ помечаем "
+                    "как отправленное — "
+                    "следующая проверка попробует "
+                    "снова."
                 )
 
         print(
@@ -563,33 +1559,40 @@ def check_updates():
         )
 
         with state_lock:
+
             failed_checks += 1
+
             consecutive_errors += 1
 
     except requests.exceptions.RequestException as e:
 
         print(
-            f"ОШИБКА сетевого запроса: {e}"
+            "ОШИБКА сетевого запроса: "
+            f"{e}"
         )
 
         with state_lock:
+
             failed_checks += 1
+
             consecutive_errors += 1
 
     except Exception as e:
 
         print(
-            f"ОШИБКА ПАРСЕРА: "
+            "ОШИБКА ПАРСЕРА: "
             f"{type(e).__name__}: {e}"
         )
 
         with state_lock:
+
             failed_checks += 1
+
             consecutive_errors += 1
 
 
 # ============================================================
-# ОСНОВНОЙ ЦИКЛ
+# ОСНОВНОЙ ЦИКЛ ПАРСЕРА
 # ============================================================
 
 def run_bot():
@@ -609,12 +1612,12 @@ def run_bot():
     )
 
     print(
-        f"Проверка каждые "
+        "Проверка каждые "
         f"{CHECK_INTERVAL_SECONDS} секунд"
     )
 
     print(
-        f"Максимальный возраст сообщения: "
+        "Максимальный возраст сообщения: "
         f"{MAX_MESSAGE_AGE_MINUTES} минут"
     )
 
@@ -622,10 +1625,10 @@ def run_bot():
         "=============================="
     )
 
-    # Проверяем API, но НЕ останавливаем
-    # запуск парсера, если Telegram временно
-    # недоступен.
     test_telegram_api()
+
+    # Создаём/находим статус.
+    ensure_status_message()
 
     while True:
 
@@ -636,13 +1639,16 @@ def run_bot():
 
             check_updates()
 
+            # Обновляем статус не чаще,
+            # чем раз в минуту.
+            update_status_message()
+
             time.sleep(
                 CHECK_INTERVAL_SECONDS
             )
 
         except Exception as e:
 
-            # Дополнительная защита.
             print(
                 "КРИТИЧЕСКАЯ ОШИБКА "
                 "ОСНОВНОГО ЦИКЛА:"
@@ -653,9 +1659,23 @@ def run_bot():
             )
 
             with state_lock:
+
                 parser_running = False
+
                 failed_checks += 1
+
                 consecutive_errors += 1
+
+            # Пытаемся показать проблему
+            # в статусе.
+            try:
+
+                update_status_message(
+                    force=True
+                )
+
+            except Exception:
+                pass
 
             print(
                 "Парсер будет автоматически "
@@ -666,7 +1686,7 @@ def run_bot():
 
 
 # ============================================================
-# FLASK
+# FLASK ROUTES
 # ============================================================
 
 @app.route("/")
@@ -680,8 +1700,9 @@ def home():
 @app.route("/health")
 def health():
 
-    # Этот endpoint должен оставаться быстрым
-    # и возвращать 200 для UptimeRobot.
+    # Этот endpoint должен оставаться
+    # быстрым и возвращать 200
+    # для UptimeRobot.
     return "OK"
 
 
@@ -701,114 +1722,101 @@ def status():
             ).total_seconds()
         )
 
-        return (
-            "<h2>Lukas_Alarm status</h2>"
-
-            f"<p>Parser running: "
-            f"<b>{parser_running}</b></p>"
-
-            f"<p>Total checks: "
-            f"<b>{total_checks}</b></p>"
-
-            f"<p>Successful checks: "
-            f"<b>{successful_checks}</b></p>"
-
-            f"<p>Failed checks: "
-            f"<b>{failed_checks}</b></p>"
-
-            f"<p>Consecutive errors: "
-            f"<b>{consecutive_errors}</b></p>"
-
-            f"<p>Last check: "
-            f"<b>{last_check_at}</b></p>"
-
-            f"<p>Last successful check: "
-            f"<b>{last_successful_check_at}</b></p>"
-
-            f"<p>Last alert: "
-            f"<b>{last_alert_at}</b></p>"
-
-            f"<p>Last alert ID: "
-            f"<b>{last_alert_id}</b></p>"
-
-            f"<p>Uptime: "
-            f"<b>{uptime_seconds} sec</b></p>"
-
-            f"<p>Remembered messages: "
-            f"<b>{len(sent_messages)}</b></p>"
+        current_status_message_id = (
+            status_message_id
         )
 
-
-# ============================================================
-# ВРЕМЕННО: ПОЛУЧЕНИЕ ID ТЕМЫ
-# ============================================================
-
-@app.route("/thread")
-def thread():
-
-    try:
-
-        url = (
-            f"https://api.telegram.org/"
-            f"bot{TELEGRAM_TOKEN}/getUpdates"
+        current_parser_running = (
+            parser_running
         )
 
-        response = requests.get(
-            url,
-            timeout=(3, 10)
+        current_total_checks = (
+            total_checks
         )
 
-        if response.status_code != 200:
-            return f"ERROR: {response.text}"
-
-        data = response.json()
-
-        result = []
-
-        for update in data.get("result", []):
-
-            message = (
-                update.get("message")
-                or update.get("channel_post")
-            )
-
-            if not message:
-                continue
-
-            chat = message.get(
-                "chat",
-                {}
-            )
-
-            thread_id = message.get(
-                "message_thread_id"
-            )
-
-            result.append(
-                f"chat_id={chat.get('id')} | "
-                f"thread_id={thread_id} | "
-                f"text={message.get('text', '')}"
-            )
-
-        if not result:
-            return (
-                "Нет новых сообщений. "
-                "Сначала отправь сообщение "
-                "в нужную вкладку."
-            )
-
-        return "<br>".join(result)
-
-    except Exception as e:
-
-        return (
-            f"ERROR: "
-            f"{type(e).__name__}: {e}"
+        current_successful_checks = (
+            successful_checks
         )
+
+        current_failed_checks = (
+            failed_checks
+        )
+
+        current_consecutive_errors = (
+            consecutive_errors
+        )
+
+        current_last_check = (
+            last_check_at
+        )
+
+        current_last_successful = (
+            last_successful_check_at
+        )
+
+        current_last_alert = (
+            last_alert_at
+        )
+
+        current_last_alert_id = (
+            last_alert_id
+        )
+
+        remembered_count = (
+            len(sent_messages)
+        )
+
+    return (
+        "<h2>Lukas_Alarm status</h2>"
+
+        f"<p>Parser running: "
+        f"<b>{current_parser_running}</b></p>"
+
+        f"<p>Total checks: "
+        f"<b>{current_total_checks}</b></p>"
+
+        f"<p>Successful checks: "
+        f"<b>{current_successful_checks}</b></p>"
+
+        f"<p>Failed checks: "
+        f"<b>{current_failed_checks}</b></p>"
+
+        f"<p>Consecutive errors: "
+        f"<b>{current_consecutive_errors}</b></p>"
+
+        f"<p>Last check: "
+        f"<b>{current_last_check}</b></p>"
+
+        f"<p>Last successful check: "
+        f"<b>{current_last_successful}</b></p>"
+
+        f"<p>Last alert: "
+        f"<b>{current_last_alert}</b></p>"
+
+        f"<p>Last alert ID: "
+        f"<b>{current_last_alert_id}</b></p>"
+
+        f"<p>Status message ID: "
+        f"<b>{current_status_message_id}</b></p>"
+
+        f"<p>Uptime: "
+        f"<b>{uptime_seconds} sec</b></p>"
+
+        f"<p>Remembered messages: "
+        f"<b>{remembered_count}</b></p>"
+    )
 
 
 @app.route("/test")
-def test():
+def technical_test():
+
+    """
+    Технический HTTP-тест.
+    Оставляем его для диагностики Render,
+    DNS и Telegram API.
+
+    Это НЕ тест тревожного сообщения.
+    """
 
     results = []
 
@@ -830,18 +1838,21 @@ def test():
         )
 
         results.append(
-            f"DNS OK: api.telegram.org -> "
+            "DNS OK: "
+            "api.telegram.org -> "
             f"{ip}, time={elapsed}s"
         )
 
     except Exception as e:
 
         results.append(
-            f"DNS ERROR: "
+            "DNS ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
-        return "<br>".join(results)
+        return "<br>".join(
+            results
+        )
 
     # --------------------------------------------------------
     # TCP
@@ -851,9 +1862,14 @@ def test():
 
         start = time.time()
 
-        connection = socket.create_connection(
-            ("api.telegram.org", 443),
-            timeout=5
+        connection = (
+            socket.create_connection(
+                (
+                    "api.telegram.org",
+                    443
+                ),
+                timeout=5
+            )
         )
 
         connection.close()
@@ -864,18 +1880,21 @@ def test():
         )
 
         results.append(
-            f"TCP OK: api.telegram.org:443, "
+            "TCP OK: "
+            "api.telegram.org:443, "
             f"time={elapsed}s"
         )
 
     except Exception as e:
 
         results.append(
-            f"TCP ERROR: "
+            "TCP ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
-        return "<br>".join(results)
+        return "<br>".join(
+            results
+        )
 
     # --------------------------------------------------------
     # BOT API
@@ -897,13 +1916,13 @@ def test():
         )
 
         results.append(
-            f"BOT API: HTTP "
+            "BOT API: HTTP "
             f"{response.status_code}, "
             f"time={elapsed}s"
         )
 
         results.append(
-            f"BOT RESPONSE: "
+            "BOT RESPONSE: "
             f"{response.text[:500]}"
         )
 
@@ -915,26 +1934,39 @@ def test():
         )
 
         results.append(
-            f"BOT API ERROR: "
+            "BOT API ERROR: "
             f"{type(e).__name__}: {e}, "
             f"time={elapsed}s"
         )
 
-    return "<br>".join(results)
+    return "<br>".join(
+        results
+    )
 
 
 # ============================================================
-# ЗАПУСК ФОНОВОГО ПАРСЕРА
+# ЗАПУСК ФОНОВЫХ ПОТОКОВ
 # ============================================================
 
 print(
-    "Запускаю фоновый поток..."
+    "Запускаю фоновый поток парсера..."
 )
 
 threading.Thread(
     target=run_bot,
     daemon=True,
     name="telegram-monitor"
+).start()
+
+
+print(
+    "Запускаю Telegram callback polling..."
+)
+
+threading.Thread(
+    target=telegram_updates_loop,
+    daemon=True,
+    name="telegram-callbacks"
 ).start()
 
 
