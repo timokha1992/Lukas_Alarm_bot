@@ -81,24 +81,34 @@ def health():
     """
     Health для UptimeRobot / внешнего контроля.
 
+    Проверяем три независимых компонента:
+
+    1. основной parser действительно выполняет проверки;
+    2. официальный источник доступен;
+    3. Telegram Bot API действительно доступен.
+
     Важно:
-    - один кратковременный сбой Telegram/source не делает health
-      немедленно красным;
-    - остановившийся основной parser делает health 503;
-    - длительный сбой source/Telegram делает health 503;
-    - Flask остаётся живым даже если background thread сломан.
+    состояние Telegram API не хранится одной простой переменной,
+    которая может конфликтовать между несколькими потоками.
+    Вместо этого используется время последнего успешного запроса
+    и начало непрерывного сбоя.
     """
+
     now = now_utc()
 
     with state_lock:
         parser_running = state["parser_running"]
         parser_heartbeat = state["parser_heartbeat"]
 
-        telegram_api_ok = state["telegram_api_ok"]
         source_ok = state["source_ok"]
-
-        telegram_failure_since = state["telegram_failure_since"]
         source_failure_since = state["source_failure_since"]
+
+        telegram_last_success = state["telegram_last_success"]
+        telegram_failure_since = state["telegram_failure_since"]
+
+    # --------------------------------------------------------
+    # ПАРСЕР
+    # --------------------------------------------------------
 
     parser_alive = (
         parser_running
@@ -107,24 +117,84 @@ def health():
         <= PARSER_STALE_AFTER_SECONDS
     )
 
+    parser_stale_seconds = None
+
+    if parser_heartbeat is not None:
+        parser_stale_seconds = (
+            now - parser_heartbeat
+        ).total_seconds()
+
+    # --------------------------------------------------------
+    # TELEGRAM API
+    # --------------------------------------------------------
+
     telegram_failure_long = (
-        not telegram_api_ok
-        and telegram_failure_since is not None
-        and (now - telegram_failure_since).total_seconds()
+        telegram_failure_since is not None
+        and (
+            now - telegram_failure_since
+        ).total_seconds()
         >= FAILURE_NOTIFICATION_AFTER_SECONDS
     )
+
+    # --------------------------------------------------------
+    # ИСТОЧНИК
+    # --------------------------------------------------------
 
     source_failure_long = (
         not source_ok
         and source_failure_since is not None
-        and (now - source_failure_since).total_seconds()
+        and (
+            now - source_failure_since
+        ).total_seconds()
         >= FAILURE_NOTIFICATION_AFTER_SECONDS
     )
 
-    if parser_alive and not telegram_failure_long and not source_failure_long:
+    # --------------------------------------------------------
+    # HEALTH RESULT
+    # --------------------------------------------------------
+
+    problems = []
+
+    if not parser_alive:
+        if parser_heartbeat is None:
+            problems.append("parser heartbeat отсутствует")
+        elif parser_stale_seconds is not None:
+            problems.append(
+                f"parser heartbeat устарел "
+                f"({int(parser_stale_seconds)} сек.)"
+            )
+        else:
+            problems.append("parser не работает")
+
+    if source_failure_long:
+        problems.append("источник недоступен более 60 сек.")
+
+    if telegram_failure_long:
+        if telegram_last_success is None:
+            problems.append(
+                "Telegram Bot API недоступен более 60 сек."
+            )
+        else:
+            telegram_age = (
+                now - telegram_last_success
+            ).total_seconds()
+
+            problems.append(
+                "Telegram Bot API: "
+                f"нет успешного запроса {int(telegram_age)} сек."
+            )
+
+    if not problems:
         return "OK", 200
 
-    return "NOT OK", 503
+    reason = "; ".join(problems)
+
+    print(
+        f"HEALTH 503: {reason}",
+        flush=True,
+    )
+
+    return f"NOT OK: {reason}", 503
 
 
 # ============================================================
@@ -133,7 +203,7 @@ def health():
 
 state = {
     "parser_running": False,
-    "telegram_api_ok": False,
+
     "source_ok": False,
 
     "last_check": None,
@@ -142,10 +212,18 @@ state = {
     # Время последнего живого шага основного парсера.
     "parser_heartbeat": None,
 
+    # Telegram API:
+    # вместо одного telegram_api_ok используем:
+    # - время последнего успешного запроса;
+    # - начало непрерывного сбоя.
+    "telegram_last_success": None,
+    "telegram_failure_since": None,
+
+    # Состояние источника.
+    "source_failure_since": None,
+
     # Состояния инцидентов watchdog.
     "parser_failure_since": None,
-    "source_failure_since": None,
-    "telegram_failure_since": None,
 
     "parser_failure_notified": False,
     "source_failure_notified": False,
@@ -222,8 +300,42 @@ def format_duration(seconds):
 # TELEGRAM API
 # ============================================================
 
+def mark_telegram_success():
+    """
+    Фиксируем успешный контакт с Telegram Bot API.
+    """
+
+    now = now_utc()
+
+    with state_lock:
+        state["telegram_last_success"] = now
+        state["telegram_failure_since"] = None
+
+
+def mark_telegram_failure():
+    """
+    Фиксируем начало непрерывной проблемы Telegram API.
+
+    Повторные ошибки не меняют время начала инцидента.
+    """
+
+    now = now_utc()
+
+    with state_lock:
+        if state["telegram_failure_since"] is None:
+            state["telegram_failure_since"] = now
+
+            print(
+                "НАЧАЛО ПРОБЛЕМЫ TELEGRAM API",
+                flush=True,
+            )
+
+
 def telegram_request(method, data=None, retries=3):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/{method}"
+    )
 
     if data is None:
         data = {}
@@ -247,8 +359,19 @@ def telegram_request(method, data=None, retries=3):
                 except Exception:
                     retry_after = 5
 
-                time.sleep(min(int(retry_after) + 1, 30))
-                continue
+                last_error = (
+                    f"Telegram rate limit: "
+                    f"retry_after={retry_after}"
+                )
+
+                if attempt < retries - 1:
+                    time.sleep(
+                        min(int(retry_after) + 1, 30)
+                    )
+                    continue
+
+                mark_telegram_failure()
+                break
 
             # Временные ошибки сервера Telegram.
             if response.status_code >= 500:
@@ -261,6 +384,7 @@ def telegram_request(method, data=None, retries=3):
                     time.sleep(2 + attempt)
                     continue
 
+                mark_telegram_failure()
                 break
 
             response.raise_for_status()
@@ -268,35 +392,46 @@ def telegram_request(method, data=None, retries=3):
             result = response.json()
 
             if not result.get("ok"):
-                last_error = "Telegram Bot API вернул ошибку"
-                raise RuntimeError(last_error)
+                last_error = (
+                    "Telegram Bot API вернул ошибку"
+                )
 
-            with state_lock:
-                state["telegram_api_ok"] = True
+                if attempt < retries - 1:
+                    time.sleep(2 + attempt)
+                    continue
+
+                mark_telegram_failure()
+                break
+
+            # Любой успешный Telegram API запрос означает,
+            # что сам API доступен.
+            mark_telegram_success()
 
             return result
 
         except Exception as e:
             last_error = str(e)
 
-            if attempt == retries - 1:
-                with state_lock:
-                    state["telegram_api_ok"] = False
+            if attempt < retries - 1:
+                time.sleep(2 + attempt)
+                continue
 
-                print(
-                    f"Telegram API ошибка после {retries} попыток: "
-                    f"{type(e).__name__}: {e}",
-                    flush=True,
-                )
-                return None
+            mark_telegram_failure()
 
-            time.sleep(2 + attempt)
+            print(
+                "Telegram API ошибка после "
+                f"{retries} попыток: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
 
-    with state_lock:
-        state["telegram_api_ok"] = False
+            return None
+
+    mark_telegram_failure()
 
     print(
-        f"Telegram API ошибка после {retries} попыток: {last_error}",
+        "Telegram API ошибка после "
+        f"{retries} попыток: {last_error}",
         flush=True,
     )
 
@@ -353,8 +488,11 @@ def test_telegram_api():
 def set_failure_state(failure_type, reason):
     """
     Запоминает начало проблемы.
-    Повторные проверки того же инцидента состояние не сбрасывают.
+
+    Повторные проверки того же инцидента
+    состояние не сбрасывают.
     """
+
     key_since = f"{failure_type}_failure_since"
     key_notified = f"{failure_type}_failure_notified"
 
@@ -381,6 +519,7 @@ def clear_failure_state(failure_type):
     Завершает состояние проблемы.
     Возвращает информацию об инциденте.
     """
+
     key_since = f"{failure_type}_failure_since"
     key_notified = f"{failure_type}_failure_notified"
 
@@ -399,18 +538,21 @@ def clear_failure_state(failure_type):
     return {
         "since": since,
         "notified": notified,
-        "duration": (now - since).total_seconds(),
+        "duration": (
+            now - since
+        ).total_seconds(),
     }
 
 
 def watchdog_send_failure(failure_type, reason):
     """
-    Отправляет одно подробное служебное сообщение после 60 секунд
-    непрерывной проблемы.
+    Отправляет одно подробное служебное сообщение
+    после 60 секунд непрерывной проблемы.
 
-    В текущей beta/alpha стадии сохраняем техническую информацию
-    для диагностики.
+    В beta/alpha стадии сохраняем техническую
+    информацию для диагностики.
     """
+
     key_since = f"{failure_type}_failure_since"
     key_notified = f"{failure_type}_failure_notified"
 
@@ -422,7 +564,9 @@ def watchdog_send_failure(failure_type, reason):
     if since is None or already_notified:
         return
 
-    duration = (now_utc() - since).total_seconds()
+    duration = (
+        now_utc() - since
+    ).total_seconds()
 
     if duration < FAILURE_NOTIFICATION_AFTER_SECONDS:
         return
@@ -441,7 +585,8 @@ def watchdog_send_failure(failure_type, reason):
             "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
             "\n"
             "Парсер не выполняет проверки.\n"
-            f"Последняя проверка: {format_time(last_check)}\n"
+            f"Последняя проверка: "
+            f"{format_time(last_check)}\n"
             "Причина: причина не определена."
         )
 
@@ -452,7 +597,8 @@ def watchdog_send_failure(failure_type, reason):
             "БОТ НЕ РАБОТАЕТ.\n"
             "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
             "\n"
-            "Официальный источник временно недоступен.\n"
+            "Официальный источник временно "
+            "недоступен.\n"
             f"Причина: {reason}"
         )
 
@@ -494,16 +640,22 @@ def watchdog_send_failure(failure_type, reason):
             state[key_notified] = True
 
         print(
-            f"ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О СБОЕ: {failure_type}",
+            f"ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О СБОЕ: "
+            f"{failure_type}",
             flush=True,
         )
 
 
-def watchdog_check_recovery(failure_type, recovery_reason):
+def watchdog_check_recovery(
+    failure_type,
+    recovery_reason,
+):
     """
-    После восстановления отправляет сообщение только если
-    ранее по этому инциденту уже было отправлено сообщение о сбое.
+    После восстановления отправляет сообщение
+    только если ранее по этому инциденту уже было
+    отправлено сообщение о сбое.
     """
+
     info = clear_failure_state(failure_type)
 
     if not info or not info["notified"]:
@@ -516,14 +668,16 @@ def watchdog_check_recovery(failure_type, recovery_reason):
         "НА ЕГО УВЕДОМЛЕНИЯ СНОВА МОЖНО РАССЧИТЫВАТЬ.\n"
         "\n"
         f"{recovery_reason}\n"
-        f"Длительность сбоя: {format_duration(info['duration'])}"
+        f"Длительность сбоя: "
+        f"{format_duration(info['duration'])}"
     )
 
     message_id = send_telegram_message(text)
 
     if message_id:
         print(
-            f"ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О ВОССТАНОВЛЕНИИ: "
+            "ОТПРАВЛЕНО УВЕДОМЛЕНИЕ "
+            "О ВОССТАНОВЛЕНИИ: "
             f"{failure_type}",
             flush=True,
         )
@@ -542,17 +696,27 @@ def watchdog_loop():
             with state_lock:
                 parser_running = state["parser_running"]
                 parser_heartbeat = state["parser_heartbeat"]
+
                 source_ok = state["source_ok"]
-                telegram_api_ok = state["telegram_api_ok"]
+
+                telegram_last_success = (
+                    state["telegram_last_success"]
+                )
+
                 started_at = state["started_at"]
 
-            # После запуска даём системе спокойно инициализироваться.
+            # После запуска даём системе спокойно
+            # инициализироваться.
             if (
                 started_at is None
-                or (now - started_at).total_seconds()
+                or (
+                    now - started_at
+                ).total_seconds()
                 < STARTUP_GRACE_SECONDS
             ):
-                time.sleep(WATCHDOG_INTERVAL_SECONDS)
+                time.sleep(
+                    WATCHDOG_INTERVAL_SECONDS
+                )
                 continue
 
             # ------------------------------------------------
@@ -562,7 +726,9 @@ def watchdog_loop():
             parser_alive = (
                 parser_running
                 and parser_heartbeat is not None
-                and (now - parser_heartbeat).total_seconds()
+                and (
+                    now - parser_heartbeat
+                ).total_seconds()
                 <= PARSER_STALE_AFTER_SECONDS
             )
 
@@ -608,28 +774,51 @@ def watchdog_loop():
             # TELEGRAM API
             # ------------------------------------------------
 
-            if telegram_api_ok:
+            telegram_problem = False
+
+            if telegram_last_success is None:
+                telegram_problem = True
+                telegram_reason = (
+                    "Telegram Bot API ещё не подтвердил "
+                    "успешный запрос."
+                )
+            else:
+                telegram_age = (
+                    now - telegram_last_success
+                ).total_seconds()
+
+                if telegram_age >= FAILURE_NOTIFICATION_AFTER_SECONDS:
+                    telegram_problem = True
+                    telegram_reason = (
+                        "Telegram Bot API не подтверждал "
+                        f"успешный запрос {int(telegram_age)} сек."
+                    )
+                else:
+                    telegram_reason = (
+                        "Telegram Bot API снова доступен."
+                    )
+
+            if not telegram_problem:
                 watchdog_check_recovery(
                     "telegram",
-                    "Telegram Bot API снова доступен.",
+                    telegram_reason,
                 )
             else:
                 set_failure_state(
                     "telegram",
-                    "Telegram Bot API не отвечает или "
-                    "возвращает ошибку.",
+                    telegram_reason,
                 )
 
                 watchdog_send_failure(
                     "telegram",
-                    "Telegram Bot API не отвечает или "
-                    "возвращает ошибку.",
+                    telegram_reason,
                 )
 
         except Exception as e:
-            # Watchdog сам не должен умирать из-за своей ошибки.
+            # Watchdog сам не должен умирать
+            # из-за своей ошибки.
             print(
-                f"Ошибка контроля состояния: "
+                "Ошибка контроля состояния: "
                 f"{type(e).__name__}: {e}",
                 flush=True,
             )
@@ -656,7 +845,9 @@ def get_pinned_message_id():
         return None
 
     try:
-        pinned = result["result"].get("pinned_message")
+        pinned = result["result"].get(
+            "pinned_message"
+        )
 
         if not pinned:
             return None
@@ -665,17 +856,13 @@ def get_pinned_message_id():
         text = pinned.get("text", "")
 
         # Ищем именно наше сообщение состояния.
-        # Три индикатора могут быть зелёными или красными,
-        # поэтому проверяем фиксированную часть заголовка.
-        if (
-            "🛠️ СОСТОЯНИЕ СИСТЕМЫ" in text
-            and text.find("🛠️ СОСТОЯНИЕ СИСТЕМЫ") >= 0
-        ):
+        if "🛠️ СОСТОЯНИЕ СИСТЕМЫ" in text:
             return message_id
 
     except Exception as e:
         print(
-            f"Ошибка определения закреплённого сообщения: {e}",
+            "Ошибка определения закреплённого "
+            f"сообщения: {e}",
             flush=True,
         )
 
@@ -689,16 +876,25 @@ def build_status_text():
         parser_running = state["parser_running"]
         parser_heartbeat = state["parser_heartbeat"]
 
-        telegram_api_ok = state["telegram_api_ok"]
+        telegram_last_success = (
+            state["telegram_last_success"]
+        )
+
         source_ok = state["source_ok"]
 
         last_check = state["last_check"]
         last_alert = state["last_alert"]
 
+    # --------------------------------------------------------
+    # ПАРСЕР
+    # --------------------------------------------------------
+
     parser_alive = (
         parser_running
         and parser_heartbeat is not None
-        and (now - parser_heartbeat).total_seconds()
+        and (
+            now - parser_heartbeat
+        ).total_seconds()
         <= PARSER_STALE_AFTER_SECONDS
     )
 
@@ -709,14 +905,58 @@ def build_status_text():
         parser_icon = "🔴"
         parser_text = "НЕТ ПРОВЕРКИ"
 
-    telegram_icon = "🟢" if telegram_api_ok else "🔴"
-    telegram_text = "OK" if telegram_api_ok else "ОШИБКА"
+    # --------------------------------------------------------
+    # TELEGRAM API
+    # --------------------------------------------------------
 
-    source_icon = "🟢" if source_ok else "🔴"
-    source_text = "OK" if source_ok else "ОШИБКА"
+    telegram_alive = False
+
+    if telegram_last_success is not None:
+        telegram_age = (
+            now - telegram_last_success
+        ).total_seconds()
+
+        telegram_alive = (
+            telegram_age
+            < FAILURE_NOTIFICATION_AFTER_SECONDS
+        )
+
+    telegram_icon = (
+        "🟢"
+        if telegram_alive
+        else "🔴"
+    )
+
+    telegram_text = (
+        "OK"
+        if telegram_alive
+        else "ОШИБКА"
+    )
+
+    # --------------------------------------------------------
+    # SOURCE
+    # --------------------------------------------------------
+
+    source_icon = (
+        "🟢"
+        if source_ok
+        else "🔴"
+    )
+
+    source_text = (
+        "OK"
+        if source_ok
+        else "ОШИБКА"
+    )
+
+    # --------------------------------------------------------
+    # TITLE
+    # --------------------------------------------------------
 
     title = (
-        f"{parser_icon}{telegram_icon}{source_icon} "
+        f"{parser_icon}"
+        f"{telegram_icon}"
+        f"{source_icon} "
         "🛠️ СОСТОЯНИЕ СИСТЕМЫ"
     )
 
@@ -724,14 +964,18 @@ def build_status_text():
         f"{title}\n"
         "\n"
         f"{parser_icon} Парсер: {parser_text}\n"
-        f"{telegram_icon} Telegram API: {telegram_text}\n"
+        f"{telegram_icon} Telegram API: "
+        f"{telegram_text}\n"
         f"{source_icon} Источник: {source_text}\n"
         "\n"
         f"🔎 Ключевое слово: {KEYWORD}\n"
-        f"⏱ Проверка: каждые {CHECK_INTERVAL_SECONDS} сек.\n"
+        f"⏱ Проверка: каждые "
+        f"{CHECK_INTERVAL_SECONDS} сек.\n"
         "\n"
-        f"🕐 Последняя проверка: {format_time(last_check)}\n"
-        f"🚨 Последняя тревога: {format_time(last_alert)}"
+        f"🕐 Последняя проверка: "
+        f"{format_time(last_check)}\n"
+        f"🚨 Последняя тревога: "
+        f"{format_time(last_alert)}"
     )
 
 
@@ -770,7 +1014,8 @@ def ensure_status_message():
 
     if not pin_result:
         print(
-            "Сообщение состояния создано, но закрепить его не удалось.",
+            "Сообщение состояния создано, "
+            "но закрепить его не удалось.",
             flush=True,
         )
 
@@ -843,14 +1088,15 @@ def handle_test_command(message):
     # Только администратор может запускать /test.
     if not is_group_admin(user_id):
         print(
-            f"Команда /test отклонена: "
+            "Команда /test отклонена: "
             f"пользователь {user_id} не администратор.",
             flush=True,
         )
         return
 
     print(
-        f"Получена команда /test от администратора {user_id}.",
+        "Получена команда /test от "
+        f"администратора {user_id}.",
         flush=True,
     )
 
@@ -897,7 +1143,8 @@ def telegram_command_listener():
 
     except Exception as e:
         print(
-            f"Ошибка очистки старых Telegram-команд: {e}",
+            "Ошибка очистки старых "
+            f"Telegram-команд: {e}",
             flush=True,
         )
 
@@ -925,19 +1172,26 @@ def telegram_command_listener():
             updates = result.get("result", [])
 
             for update in updates:
-                offset = update["update_id"] + 1
+                offset = (
+                    update["update_id"] + 1
+                )
 
                 message = update.get("message")
 
                 if not message:
                     continue
 
-                text = message.get("text", "").strip()
+                text = message.get(
+                    "text",
+                    "",
+                ).strip()
 
                 if not text:
                     continue
 
-                command = text.split()[0].lower()
+                command = (
+                    text.split()[0].lower()
+                )
 
                 if (
                     command == "/test"
@@ -947,7 +1201,8 @@ def telegram_command_listener():
 
         except Exception as e:
             print(
-                f"Ошибка обработчика Telegram-команд: "
+                "Ошибка обработчика "
+                "Telegram-команд: "
                 f"{type(e).__name__}: {e}",
                 flush=True,
             )
@@ -961,7 +1216,8 @@ def telegram_command_listener():
 
 def status_loop():
     print(
-        "Запущено обновление статуса каждые 60 секунд",
+        "Запущено обновление статуса "
+        "каждые 60 секунд",
         flush=True,
     )
 
@@ -971,12 +1227,14 @@ def status_loop():
 
         except Exception as e:
             print(
-                f"Ошибка обновления статуса: "
+                "Ошибка обновления статуса: "
                 f"{type(e).__name__}: {e}",
                 flush=True,
             )
 
-        time.sleep(STATUS_UPDATE_INTERVAL_SECONDS)
+        time.sleep(
+            STATUS_UPDATE_INTERVAL_SECONDS
+        )
 
 
 # ============================================================
@@ -1000,7 +1258,9 @@ def get_post_datetime(element):
         )
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
 
         return dt.astimezone(timezone.utc)
 
@@ -1012,11 +1272,32 @@ def get_post_datetime(element):
 # ПРОВЕРКА ИСТОЧНИКА
 # ============================================================
 
+def mark_source_success():
+    with state_lock:
+        state["source_ok"] = True
+        state["source_failure_since"] = None
+
+
+def mark_source_failure(reason):
+    now = now_utc()
+
+    with state_lock:
+        state["source_ok"] = False
+
+        if state["source_failure_since"] is None:
+            state["source_failure_since"] = now
+
+    print(
+        f"Источник: проблема — {reason}",
+        flush=True,
+    )
+
+
 def check_updates():
     check_time = now_utc()
 
     # Heartbeat обновляется в начале каждой проверки.
-    # Поэтому watchdog видит, что основной parser жив.
+    # Watchdog видит, что основной parser жив.
     with state_lock:
         state["last_check"] = check_time
         state["parser_heartbeat"] = check_time
@@ -1028,17 +1309,12 @@ def check_updates():
         )
 
         if response.status_code != 200:
-            with state_lock:
-                state["source_ok"] = False
-
-            print(
-                f"Источник вернул HTTP {response.status_code}",
-                flush=True,
+            mark_source_failure(
+                f"HTTP {response.status_code}"
             )
             return
 
-        with state_lock:
-            state["source_ok"] = True
+        mark_source_success()
 
         soup = BeautifulSoup(
             response.text,
@@ -1067,13 +1343,16 @@ def check_updates():
                 current_time - post_datetime
             ).total_seconds()
 
-            # Если дата сообщения немного опережает наше время,
-            # не считаем его старым.
+            # Если дата сообщения немного опережает
+            # наше время, не считаем его старым.
             if age_seconds < 0:
                 age_seconds = 0
 
             # Не рассматриваем сообщения старше 5 минут.
-            if age_seconds > MAX_MESSAGE_AGE_MINUTES * 60:
+            if (
+                age_seconds
+                > MAX_MESSAGE_AGE_MINUTES * 60
+            ):
                 break
 
             text_element = post.select_one(
@@ -1091,7 +1370,8 @@ def check_updates():
             if not text:
                 continue
 
-            # Ищем корень "кременч" без учёта регистра.
+            # Ищем корень "кременч"
+            # без учёта регистра.
             if KEYWORD not in text.lower():
                 continue
 
@@ -1099,21 +1379,22 @@ def check_updates():
             post_id = None
 
             try:
-                post_id = post.get("data-post")
+                post_id = post.get(
+                    "data-post"
+                )
             except Exception:
                 pass
 
             if not post_id:
                 continue
 
-            # Не отправляем один и тот же пост повторно
-            # в рамках текущего запуска.
+            # Не отправляем один и тот же пост
+            # повторно в рамках текущего запуска.
             with sent_messages_lock:
                 if post_id in sent_messages:
                     continue
 
-            # В Telegram ограничение на размер обычного сообщения
-            # значительно больше этого значения, но оставляем запас.
+            # Ограничение размера сообщения.
             safe_text = text[:3500]
 
             alert_text = (
@@ -1123,9 +1404,8 @@ def check_updates():
             )
 
             # ВАЖНО:
-            # post_id добавляем в dedup ТОЛЬКО после успешной
-            # отправки. Если Telegram временно не принял сообщение,
-            # следующая проверка сможет повторить попытку.
+            # post_id добавляем в dedup ТОЛЬКО
+            # после успешной отправки.
             message_id = send_telegram_message(
                 alert_text
             )
@@ -1134,24 +1414,28 @@ def check_updates():
                 with sent_messages_lock:
                     sent_messages.add(post_id)
 
-                    if len(sent_messages) > MAX_SENT_MESSAGES:
-                        # Удаляем произвольный старый элемент.
+                    if (
+                        len(sent_messages)
+                        > MAX_SENT_MESSAGES
+                    ):
                         sent_messages.pop()
 
                 with state_lock:
                     state["last_alert"] = now_utc()
 
                 print(
-                    f"ОТПРАВЛЕНА ТРЕВОГА: {post_id}",
+                    f"ОТПРАВЛЕНА ТРЕВОГА: "
+                    f"{post_id}",
                     flush=True,
                 )
 
     except Exception as e:
-        with state_lock:
-            state["source_ok"] = False
+        mark_source_failure(
+            f"{type(e).__name__}: {e}"
+        )
 
         print(
-            f"Ошибка проверки источника: "
+            "Ошибка проверки источника: "
             f"{type(e).__name__}: {e}",
             flush=True,
         )
@@ -1178,12 +1462,13 @@ def run_bot():
     )
 
     print(
-        f"Проверка каждые {CHECK_INTERVAL_SECONDS} секунд",
+        f"Проверка каждые "
+        f"{CHECK_INTERVAL_SECONDS} секунд",
         flush=True,
     )
 
     print(
-        f"Максимальный возраст сообщения: "
+        "Максимальный возраст сообщения: "
         f"{MAX_MESSAGE_AGE_MINUTES} минут",
         flush=True,
     )
@@ -1227,18 +1512,21 @@ def run_bot():
             check_updates()
 
         except Exception as e:
-            # Ошибка одной проверки не должна остановить
-            # весь фоновый parser.
-            with state_lock:
-                state["source_ok"] = False
+            # Ошибка одной проверки не должна
+            # остановить весь фоновый parser.
+            mark_source_failure(
+                f"{type(e).__name__}: {e}"
+            )
 
             print(
-                f"Ошибка цикла парсера: "
+                "Ошибка цикла парсера: "
                 f"{type(e).__name__}: {e}",
                 flush=True,
             )
 
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        time.sleep(
+            CHECK_INTERVAL_SECONDS
+        )
 
 
 # ============================================================
@@ -1288,5 +1576,7 @@ commands_thread.start()
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
+        port=int(
+            os.getenv("PORT", "10000")
+        ),
     )
