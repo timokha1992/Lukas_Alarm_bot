@@ -1396,9 +1396,20 @@ def run_bot():
         flush=True,
     )
 
+    startup_time = now_utc()
+
     with state_lock:
         state["parser_running"] = True
-        state["started_at"] = now_utc()
+        state["started_at"] = startup_time
+        # Фиксируем heartbeat ДО любых сетевых операций.
+        # Это позволяет /health видеть, что поток parser действительно стартовал.
+        state["parser_heartbeat"] = startup_time
+        state["last_check"] = startup_time
+
+    print(
+        "Heartbeat парсера зафиксирован, начинаю сетевые проверки.",
+        flush=True,
+    )
 
     print(
         "Проверяю доступ к Telegram Bot API...",
@@ -1433,6 +1444,16 @@ def run_bot():
 
     while True:
         try:
+            # Heartbeat фиксируем непосредственно перед каждой проверкой.
+            with state_lock:
+                state["parser_running"] = True
+                state["parser_heartbeat"] = now_utc()
+
+            print(
+                "Начинаю проверку источника...",
+                flush=True,
+            )
+
             check_updates()
 
         except Exception as e:
