@@ -35,7 +35,7 @@ def send_telegram_message(message):
         response = requests.post(
             url,
             json=payload,
-            timeout=10
+            timeout=(3, 10)
         )
 
         print(
@@ -64,13 +64,13 @@ def test_telegram_api():
     try:
         response = requests.get(
             url,
-            timeout=5
+            timeout=(3, 5)
         )
 
         print(
             f"Telegram Bot API: "
             f"{response.status_code} "
-            f"{response.text[:300]}"
+            f"{response.text[:500]}"
         )
 
         if response.status_code == 200:
@@ -81,7 +81,10 @@ def test_telegram_api():
         return False
 
     except Exception as e:
-        print(f"ОШИБКА доступа к Telegram Bot API: {e}")
+        print(
+            f"ОШИБКА доступа к Telegram Bot API: "
+            f"{type(e).__name__}: {e}"
+        )
         return False
 
 
@@ -136,7 +139,7 @@ def check_updates():
         response = requests.get(
             URL,
             headers=headers,
-            timeout=10
+            timeout=(3, 10)
         )
 
         print(
@@ -238,7 +241,7 @@ def check_updates():
     except requests.exceptions.Timeout:
         print(
             "ОШИБКА: запрос к t.me "
-            "превысил 10 секунд"
+            "превысил лимит времени"
         )
 
     except requests.exceptions.RequestException as e:
@@ -282,7 +285,7 @@ def test():
 
     results = []
 
-    # 1. DNS
+    # Проверка DNS Telegram
     try:
         start = time.time()
 
@@ -310,7 +313,7 @@ def test():
         return "<br>".join(results)
 
 
-    # 2. TCP
+    # Проверка TCP Telegram
     try:
         start = time.time()
 
@@ -341,12 +344,12 @@ def test():
         return "<br>".join(results)
 
 
-    # 3. HTTPS через requests
+    # Проверка именно твоего Bot API токена
     try:
         start = time.time()
 
         response = requests.get(
-            "https://api.telegram.org",
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
             timeout=(3, 5)
         )
 
@@ -356,14 +359,14 @@ def test():
         )
 
         results.append(
-            f"HTTPS OK: "
-            f"HTTP {response.status_code}, "
+            f"BOT API: HTTP "
+            f"{response.status_code}, "
             f"time={elapsed}s"
         )
 
         results.append(
-            f"Response: "
-            f"{response.text[:200]}"
+            f"BOT RESPONSE: "
+            f"{response.text[:500]}"
         )
 
     except Exception as e:
@@ -374,7 +377,7 @@ def test():
         )
 
         results.append(
-            f"HTTPS ERROR: "
+            f"BOT API ERROR: "
             f"{type(e).__name__}: {e}, "
             f"time={elapsed}s"
         )
