@@ -219,6 +219,7 @@ def send_telegram_message(message):
             print(
                 "Все попытки отправки исчерпаны"
             )
+
             return False
 
         except Exception as e:
@@ -367,6 +368,7 @@ def remember_sent_message(post_id):
             )
 
         sent_messages.add(post_id)
+
         sent_messages_order.append(
             post_id
         )
@@ -469,7 +471,7 @@ def check_updates():
             )
         )
 
-        # Сначала считаем проверку успешной.
+        # Считаем проверку успешной.
         with state_lock:
             successful_checks += 1
             consecutive_errors = 0
@@ -640,10 +642,7 @@ def run_bot():
 
         except Exception as e:
 
-            # Это дополнительная защита.
-            # Даже если что-то неожиданно
-            # выскочит за пределами check_updates(),
-            # основной поток не погибнет.
+            # Дополнительная защита.
             print(
                 "КРИТИЧЕСКАЯ ОШИБКА "
                 "ОСНОВНОГО ЦИКЛА:"
@@ -681,8 +680,7 @@ def home():
 @app.route("/health")
 def health():
 
-    # ВАЖНО:
-    # этот endpoint должен оставаться быстрым
+    # Этот endpoint должен оставаться быстрым
     # и возвращать 200 для UptimeRobot.
     return "OK"
 
@@ -705,28 +703,107 @@ def status():
 
         return (
             "<h2>Lukas_Alarm status</h2>"
+
             f"<p>Parser running: "
             f"<b>{parser_running}</b></p>"
+
             f"<p>Total checks: "
             f"<b>{total_checks}</b></p>"
+
             f"<p>Successful checks: "
             f"<b>{successful_checks}</b></p>"
+
             f"<p>Failed checks: "
             f"<b>{failed_checks}</b></p>"
+
             f"<p>Consecutive errors: "
             f"<b>{consecutive_errors}</b></p>"
+
             f"<p>Last check: "
             f"<b>{last_check_at}</b></p>"
+
             f"<p>Last successful check: "
             f"<b>{last_successful_check_at}</b></p>"
+
             f"<p>Last alert: "
             f"<b>{last_alert_at}</b></p>"
+
             f"<p>Last alert ID: "
             f"<b>{last_alert_id}</b></p>"
+
             f"<p>Uptime: "
             f"<b>{uptime_seconds} sec</b></p>"
+
             f"<p>Remembered messages: "
             f"<b>{len(sent_messages)}</b></p>"
+        )
+
+
+# ============================================================
+# ВРЕМЕННО: ПОЛУЧЕНИЕ ID ТЕМЫ
+# ============================================================
+
+@app.route("/thread")
+def thread():
+
+    try:
+
+        url = (
+            f"https://api.telegram.org/"
+            f"bot{TELEGRAM_TOKEN}/getUpdates"
+        )
+
+        response = requests.get(
+            url,
+            timeout=(3, 10)
+        )
+
+        if response.status_code != 200:
+            return f"ERROR: {response.text}"
+
+        data = response.json()
+
+        result = []
+
+        for update in data.get("result", []):
+
+            message = (
+                update.get("message")
+                or update.get("channel_post")
+            )
+
+            if not message:
+                continue
+
+            chat = message.get(
+                "chat",
+                {}
+            )
+
+            thread_id = message.get(
+                "message_thread_id"
+            )
+
+            result.append(
+                f"chat_id={chat.get('id')} | "
+                f"thread_id={thread_id} | "
+                f"text={message.get('text', '')}"
+            )
+
+        if not result:
+            return (
+                "Нет новых сообщений. "
+                "Сначала отправь сообщение "
+                "в нужную вкладку."
+            )
+
+        return "<br>".join(result)
+
+    except Exception as e:
+
+        return (
+            f"ERROR: "
+            f"{type(e).__name__}: {e}"
         )
 
 
@@ -766,7 +843,6 @@ def test():
 
         return "<br>".join(results)
 
-
     # --------------------------------------------------------
     # TCP
     # --------------------------------------------------------
@@ -800,7 +876,6 @@ def test():
         )
 
         return "<br>".join(results)
-
 
     # --------------------------------------------------------
     # BOT API
@@ -844,7 +919,6 @@ def test():
             f"{type(e).__name__}: {e}, "
             f"time={elapsed}s"
         )
-
 
     return "<br>".join(results)
 
