@@ -282,11 +282,11 @@ def test():
 
     results = []
 
-    # Проверяем DNS Telegram
+    # 1. DNS
     try:
         start = time.time()
 
-        telegram_ip = socket.gethostbyname(
+        ip = socket.gethostbyname(
             "api.telegram.org"
         )
 
@@ -296,23 +296,21 @@ def test():
         )
 
         results.append(
-            f"DNS Telegram OK: "
-            f"api.telegram.org -> "
-            f"{telegram_ip}, "
-            f"time={elapsed}s"
+            f"DNS OK: api.telegram.org -> "
+            f"{ip}, time={elapsed}s"
         )
 
     except Exception as e:
 
         results.append(
-            f"DNS Telegram ERROR: "
+            f"DNS ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
         return "<br>".join(results)
 
 
-    # Проверяем TCP-соединение с Telegram
+    # 2. TCP
     try:
         start = time.time()
 
@@ -329,29 +327,28 @@ def test():
         )
 
         results.append(
-            f"TCP Telegram OK: "
-            f"port 443, "
+            f"TCP OK: api.telegram.org:443, "
             f"time={elapsed}s"
         )
 
     except Exception as e:
 
         results.append(
-            f"TCP Telegram ERROR: "
+            f"TCP ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
+        return "<br>".join(results)
 
-    # Проверяем TCP-соединение с обычным сайтом
+
+    # 3. HTTPS через requests
     try:
         start = time.time()
 
-        connection = socket.create_connection(
-            ("example.com", 443),
-            timeout=5
+        response = requests.get(
+            "https://api.telegram.org",
+            timeout=(3, 5)
         )
-
-        connection.close()
 
         elapsed = round(
             time.time() - start,
@@ -359,16 +356,27 @@ def test():
         )
 
         results.append(
-            f"TCP example.com OK: "
-            f"port 443, "
+            f"HTTPS OK: "
+            f"HTTP {response.status_code}, "
             f"time={elapsed}s"
+        )
+
+        results.append(
+            f"Response: "
+            f"{response.text[:200]}"
         )
 
     except Exception as e:
 
+        elapsed = round(
+            time.time() - start,
+            2
+        )
+
         results.append(
-            f"TCP example.com ERROR: "
-            f"{type(e).__name__}: {e}"
+            f"HTTPS ERROR: "
+            f"{type(e).__name__}: {e}, "
+            f"time={elapsed}s"
         )
 
 
