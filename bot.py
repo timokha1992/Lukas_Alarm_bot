@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import socket
 from datetime import datetime, timezone, timedelta
 
 from bs4 import BeautifulSoup
@@ -279,23 +280,39 @@ def health():
 @app.route("/test")
 def test():
 
+    print("=== DNS TEST START ===")
+
     try:
-        response = requests.get(
-            "https://example.com",
-            timeout=5
+        start = time.time()
+
+        ip = socket.gethostbyname(
+            "example.com"
         )
 
-        return (
-            f"EXTERNAL OK: "
-            f"{response.status_code}"
+        elapsed = round(
+            time.time() - start,
+            2
         )
+
+        result = (
+            f"DNS OK: example.com -> "
+            f"{ip}, time={elapsed}s"
+        )
+
+        print(result)
+
+        return result
 
     except Exception as e:
 
-        return (
-            f"EXTERNAL ERROR: "
+        result = (
+            f"DNS ERROR: "
             f"{type(e).__name__}: {e}"
         )
+
+        print(result)
+
+        return result
 
 
 print("Запускаю фоновый поток...")
