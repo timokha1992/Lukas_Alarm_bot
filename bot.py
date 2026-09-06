@@ -192,46 +192,103 @@ def get_parser_heartbeat_age():
 
 @app.route("/health")
 def health():
+    now = now_utc()
+
     heartbeat_age = get_parser_heartbeat_age()
 
-    if heartbeat_age is not None:
-        if heartbeat_age <= PARSER_STALE_AFTER_SECONDS:
-            return "OK", 200
+    with state_lock:
+        started_at = state["started_at"]
+        last_pszsu_check = state["last_pszsu_check"]
+        last_monitor_check = state["last_monitor_check"]
 
+    # Во время запуска даём парсеру время выполнить первый полный
+    # цикл по обоим источникам.
+    if started_at is None:
+        return "OK", 200
+
+    startup_age = (
+        now - started_at
+    ).total_seconds()
+
+    if startup_age < STARTUP_GRACE_SECONDS:
+        return "OK", 200
+
+    # Health считается нормальным только если heartbeat обновлён
+    # после завершения цикла и оба источника действительно были
+    # проверены в свежем цикле.
+    if heartbeat_age is None:
         print(
-            "HEALTH 503: parser heartbeat устарел "
-            f"({int(heartbeat_age)} сек.)",
+            "HEALTH 503: heartbeat отсутствует.",
             flush=True,
         )
+        return (
+            "NOT OK: parser heartbeat отсутствует",
+            503,
+        )
 
+    if heartbeat_age > PARSER_STALE_AFTER_SECONDS:
+        print(
+            "HEALTH 503: parser heartbeat устарел "
+            f"({int(heartbeat_age)} сек.).",
+            flush=True,
+        )
         return (
             "NOT OK: parser heartbeat устарел "
             f"({int(heartbeat_age)} сек.)",
             503,
         )
 
-    with state_lock:
-        started_at = state["started_at"]
+    if last_pszsu_check is None:
+        print(
+            "HEALTH 503: PSZSU ещё не был проверен.",
+            flush=True,
+        )
+        return (
+            "NOT OK: PSZSU ещё не проверен",
+            503,
+        )
 
-    if started_at is None:
-        return "OK", 200
+    if last_monitor_check is None:
+        print(
+            "HEALTH 503: monitor ещё не был проверен.",
+            flush=True,
+        )
+        return (
+            "NOT OK: monitor ещё не проверен",
+            503,
+        )
 
-    startup_age = (
-        now_utc() - started_at
+    pszsu_age = (
+        now - last_pszsu_check
     ).total_seconds()
 
-    if startup_age < STARTUP_GRACE_SECONDS:
-        return "OK", 200
+    monitor_age = (
+        now - last_monitor_check
+    ).total_seconds()
 
-    print(
-        "HEALTH 503: parser heartbeat отсутствует",
-        flush=True,
-    )
+    if pszsu_age > PARSER_STALE_AFTER_SECONDS:
+        print(
+            "HEALTH 503: последняя проверка PSZSU устарела "
+            f"({int(pszsu_age)} сек.).",
+            flush=True,
+        )
+        return (
+            "NOT OK: последняя проверка PSZSU устарела",
+            503,
+        )
 
-    return (
-        "NOT OK: parser heartbeat отсутствует",
-        503,
-    )
+    if monitor_age > PARSER_STALE_AFTER_SECONDS:
+        print(
+            "HEALTH 503: последняя проверка monitor устарела "
+            f"({int(monitor_age)} сек.).",
+            flush=True,
+        )
+        return (
+            "NOT OK: последняя проверка monitor устарела",
+            503,
+        )
+
+    return "OK", 200
 
 
 # ============================================================
@@ -246,6 +303,8 @@ state = {
     "monitor_ok": False,
 
     "last_check": None,
+    "last_pszsu_check": None,
+    "last_monitor_check": None,
     "last_alert": None,
 
     "parser_heartbeat": None,
@@ -1448,13 +1507,9 @@ def check_source(
 def check_updates():
     check_time = now_utc()
 
-    # Heartbeat ДО сетевых запросов.
-    write_parser_heartbeat()
-
-    with state_lock:
-        state["last_check"] = check_time
-
-    # Каждый источник имеет собственный статус.
+    # ВАЖНО:
+    # heartbeat и "Последняя проверка" обновляются только ПОСЛЕ
+    # завершения проверки обоих источников.
     pszsu_ok = check_source(
         source_url=PSZSU_URL,
         source_name=PSZSU_NAME,
@@ -1464,6 +1519,7 @@ def check_updates():
 
     with state_lock:
         state["pszsu_ok"] = pszsu_ok
+        state["last_pszsu_check"] = now_utc()
 
     monitor_ok = check_source(
         source_url=MONITOR_URL,
@@ -1474,6 +1530,15 @@ def check_updates():
 
     with state_lock:
         state["monitor_ok"] = monitor_ok
+        state["last_monitor_check"] = now_utc()
+
+    # Только теперь цикл считается полностью завершённым.
+    completed_at = now_utc()
+
+    with state_lock:
+        state["last_check"] = completed_at
+
+    write_parser_heartbeat()
 
 
 # ============================================================
