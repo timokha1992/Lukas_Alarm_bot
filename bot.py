@@ -1200,13 +1200,13 @@ def check_updates():
             )
 
             alert_text = (
-                "🚨 <i>ВНИМАНИЕ!</i>\n"
+                "🚨 внимание 🚨\n"
                 "\n"
                 "<b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>\n"
                 "\n"
-                '<a href="https://t.me/kpszsu">📡 Повітряні Сили ЗС України</a>\n'
+                '<a href="https://t.me/kpszsu">📡 Повітряные Силы ЗС Украины</a>\n'
                 "\n"
-                f"<blockquote>{escaped_text}</blockquote>"
+                f"<blockquote><b>{escaped_text}</b></blockquote>"
             )
 
             # ВАЖНО:
