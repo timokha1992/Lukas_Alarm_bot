@@ -1,3 +1,4 @@
+import html
 import os
 import time
 import threading
@@ -17,7 +18,7 @@ SOURCE_URL = "https://t.me/s/kpszsu"
 
 # Ищем корень "кременч" без учёта регистра.
 # Это покрывает Кременчук, Кременчуга, Кременчуку, Кременчуці и т.д.
-KEYWORD = "кременч"
+KEYWORD = "бпла"
 
 CHECK_INTERVAL_SECONDS = 15
 STATUS_UPDATE_INTERVAL_SECONDS = 60
@@ -359,13 +360,17 @@ def telegram_request(method, data=None, retries=3):
     return None
 
 
-def send_telegram_message(text):
+def send_telegram_message(text, parse_mode=None):
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text,
+    }
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+
     result = telegram_request(
         "sendMessage",
-        {
-            "chat_id": CHAT_ID,
-            "text": text,
-        },
+        data,
     )
 
     if not result:
@@ -1174,11 +1179,14 @@ def check_updates():
             # В Telegram ограничение на размер обычного сообщения
             # значительно больше этого значения, но оставляем запас.
             safe_text = text[:3500]
+            escaped_text = html.escape(safe_text, quote=False)
 
             alert_text = (
-                "🔴🚨 УГРОЗА ДЛЯ КРЕМЕНЧУГА\n"
+                "🔴🚨 <b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>\n"
                 "\n"
-                f"{safe_text}"
+                '<a href="https://t.me/kpszsu">📡 Повітряні Сили ЗС України</a>\n'
+                "\n"
+                f"<blockquote>{escaped_text}</blockquote>"
             )
 
             # ВАЖНО:
@@ -1186,7 +1194,8 @@ def check_updates():
             # отправки. Если Telegram временно не принял сообщение,
             # следующая проверка сможет повторить попытку.
             message_id = send_telegram_message(
-                alert_text
+                alert_text,
+                parse_mode="HTML",
             )
 
             if message_id:
