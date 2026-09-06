@@ -20,7 +20,7 @@ SOURCE_URL = "https://t.me/s/kpszsu"
 # ТЕСТОВОЕ ключевое слово.
 # Ищем "БПЛА" без учёта регистра.
 # После теста вернём KEYWORD обратно на "кременч".
-KEYWORD = "бпла"
+KEYWORD = "кременч"
 
 CHECK_INTERVAL_SECONDS = 15
 STATUS_UPDATE_INTERVAL_SECONDS = 60
@@ -1204,7 +1204,7 @@ def check_updates():
                 "\n"
                 "<b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>\n"
                 "\n"
-                '<a href="https://t.me/kpszsu">📡 Повітряные Силы ЗС Украины</a>\n'
+                '<a href="https://t.me/kpszsu">📡 Повітряні Сили ЗС України</a>\n'
                 "\n"
                 f"<blockquote><b>{escaped_text}</b></blockquote>"
             )
