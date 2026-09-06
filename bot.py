@@ -2,6 +2,7 @@ import os
 import time
 import html
 import json
+import re
 import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -15,43 +16,110 @@ from flask import Flask
 # НАСТРОЙКИ
 # ============================================================
 
-SOURCE_URL = "https://t.me/s/kpszsu"
+PSZSU_URL = "https://t.me/s/kpszsu"
+MONITOR_URL = "https://t.me/s/war_monitor"
 
-# ТЕСТОВОЕ ключевое слово.
-# Ищем "БПЛА" без учёта регистра.
-# После теста вернём KEYWORD обратно на "кременч".
+PSZSU_NAME = "Повітряні Сили ЗС України"
+PSZSU_LINK = "https://t.me/kpszsu"
+
+MONITOR_NAME = "monitor"
+MONITOR_LINK = "https://t.me/war_monitor"
+
+# Корень для всех форм Кременчуга:
+# Кременчук, Кременчука, Кременчуці, Кременчуцький район и т.д.
 KEYWORD = "кременч"
 
 CHECK_INTERVAL_SECONDS = 15
 STATUS_UPDATE_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 10
 
-# Если основной парсер не обновлял heartbeat дольше этого времени,
-# считаем его фактически остановившимся.
 PARSER_STALE_AFTER_SECONDS = 60
-
-# Кратковременные сбои не должны сразу засорять рабочую группу.
 FAILURE_NOTIFICATION_AFTER_SECONDS = 60
-
-# После запуска даём потокам время спокойно инициализироваться.
 STARTUP_GRACE_SECONDS = 90
 
 MAX_MESSAGE_AGE_MINUTES = 5
-
-# Дедупликация только в рамках текущего запуска.
 MAX_SENT_MESSAGES = 1000
 
 # Telegram /test использует long polling до 20 секунд.
-# HTTP timeout должен быть больше этого значения.
 REQUEST_TIMEOUT = (5, 35)
+SOURCE_REQUEST_TIMEOUT = (5, 15)
 
-# Общий heartbeat-файл parser.
-# Нужен для /health и watchdog, чтобы они видели heartbeat
-# независимо от того, каким потоком/process обслужен HTTP-запрос.
-# Файл живёт только в рамках текущего запуска Render.
 PARSER_HEARTBEAT_FILE = "/tmp/lukas_alarm_parser_heartbeat"
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+# ============================================================
+# ФИЛЬТР MONITOR
+# ============================================================
+
+# Высокоскоростная угроза.
+# Все эти варианты относятся к одному классу HIGH_SPEED_THREAT.
+HIGH_SPEED_PATTERNS = (
+    "балістик",
+    "балістична ракета",
+    "балістичні ракети",
+    "балістичне озброєння",
+    "аеробалістик",
+    "аеробалістична",
+    "аеробалістичні",
+    "кинжал",
+    "кинджал",
+    "циркон",
+    "3м22",
+    "х-47м2",
+    "швидкісна ціль",
+    "швидкісні цілі",
+)
+
+# Для аббревиатуры БР используем отдельную проверку границ слова.
+# Это не обычный substring-поиск.
+BR_PATTERN = "бр"
+
+# Сообщения о продолжении угрозы сами по себе не отправляем.
+# Они рассматриваются как информационное сопровождение.
+CONTINUING_PATTERNS = (
+    "загроза балістики триває",
+    "триває загроза балістики",
+    "загроза балістична триває",
+    "триває загроза",
+)
+
+# Явные признаки итоговых сводок / постфактумной статистики.
+# ВАЖНО: эти признаки применяем к HIGH_SPEED_THREAT.
+# IMPACT_CONFIRMED проверяется раньше, поэтому оперативное
+# сообщение о взрыве не теряется только из-за фразы
+# "було застосовано ...".
+POST_EVENT_PATTERNS = (
+    "#зведення",
+    "зведення",
+    "у ніч на",
+    "в ніч на",
+    "за ніч",
+    "за останню ніч",
+    "згідно зі звітом",
+    "згідно зі звітом повітряних сил",
+    "підсумки",
+    "після атаки",
+    "загалом було запущено",
+    "загалом було застосовано",
+    "всього було застосовано",
+    "всього знищено",
+    "знешкоджено",
+)
+
+# Признаки события / взрыва.
+# Если есть такая формулировка + Кременчугская география,
+# отправляем отдельное подтверждение независимо от причины.
+IMPACT_PATTERNS = (
+    "вибух",
+    "вибухи",
+    "вибух пролунав",
+    "вибухи пролунали",
+    "пролунав вибух",
+    "пролунали вибухи",
+    "лунали вибухи",
+)
 
 
 # ============================================================
@@ -86,9 +154,6 @@ def index():
 
 
 def write_parser_heartbeat():
-    """
-    Атомарно записывает heartbeat parser в общий файл.
-    """
     now = now_utc()
 
     try:
@@ -99,10 +164,7 @@ def write_parser_heartbeat():
             f.flush()
             os.fsync(f.fileno())
 
-        os.replace(
-            tmp_file,
-            PARSER_HEARTBEAT_FILE,
-        )
+        os.replace(tmp_file, PARSER_HEARTBEAT_FILE)
 
     except Exception as e:
         print(
@@ -116,13 +178,8 @@ def write_parser_heartbeat():
 
 
 def get_parser_heartbeat_age():
-    """
-    Возвращает возраст heartbeat-файла в секундах.
-    """
     try:
-        mtime = os.path.getmtime(
-            PARSER_HEARTBEAT_FILE
-        )
+        mtime = os.path.getmtime(PARSER_HEARTBEAT_FILE)
 
         return max(
             0,
@@ -135,13 +192,6 @@ def get_parser_heartbeat_age():
 
 @app.route("/health")
 def health():
-    """
-    Дешёвый health-check только для проверки живости parser.
-
-    Здесь НЕТ сетевых запросов к Telegram или источнику.
-    Это важно: Render рекомендует держать health endpoint быстрым
-    и не делать его зависимым от внешних сервисов.
-    """
     heartbeat_age = get_parser_heartbeat_age()
 
     if heartbeat_age is not None:
@@ -160,8 +210,6 @@ def health():
             503,
         )
 
-    # Даём parser небольшой стартовый запас, чтобы heartbeat-файл
-    # успел появиться сразу после запуска процесса.
     with state_lock:
         started_at = state["started_at"]
 
@@ -193,25 +241,29 @@ def health():
 state = {
     "parser_running": False,
     "telegram_api_ok": False,
-    "source_ok": False,
+
+    "pszsu_ok": False,
+    "monitor_ok": False,
 
     "last_check": None,
     "last_alert": None,
 
-    # Время последнего живого шага основного парсера.
     "parser_heartbeat": None,
 
-    # Состояния инцидентов watchdog.
+    # Инциденты watchdog.
     "parser_failure_since": None,
-    "source_failure_since": None,
-    "telegram_failure_since": None,
-
     "parser_failure_notified": False,
-    "source_failure_notified": False,
+
+    "pszsu_failure_since": None,
+    "pszsu_failure_notified": False,
+
+    "monitor_failure_since": None,
+    "monitor_failure_notified": False,
+
+    "telegram_failure_since": None,
     "telegram_failure_notified": False,
 
     "status_message_id": None,
-
     "started_at": None,
 }
 
@@ -297,7 +349,6 @@ def telegram_request(method, data=None, retries=3):
                 timeout=REQUEST_TIMEOUT,
             )
 
-            # Telegram rate limit.
             if response.status_code == 429:
                 try:
                     retry_after = response.json().get(
@@ -309,7 +360,6 @@ def telegram_request(method, data=None, retries=3):
                 time.sleep(min(int(retry_after) + 1, 30))
                 continue
 
-            # Временные ошибки сервера Telegram.
             if response.status_code >= 500:
                 last_error = (
                     f"Telegram Bot API вернул HTTP "
@@ -362,7 +412,11 @@ def telegram_request(method, data=None, retries=3):
     return None
 
 
-def send_telegram_message(text, parse_mode=None, disable_link_preview=False):
+def send_telegram_message(
+    text,
+    parse_mode=None,
+    disable_link_preview=False,
+):
     data = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -372,8 +426,6 @@ def send_telegram_message(text, parse_mode=None, disable_link_preview=False):
         data["parse_mode"] = parse_mode
 
     if disable_link_preview:
-        # Отключаем автоматическое превью ссылки, но сама ссылка
-        # остаётся кликабельной.
         data["link_preview_options"] = json.dumps({
             "is_disabled": True,
         })
@@ -418,14 +470,10 @@ def test_telegram_api():
 
 
 # ============================================================
-# КОНТРОЛЬ СОСТОЯНИЯ / WATCHDOG
+# WATCHDOG
 # ============================================================
 
 def set_failure_state(failure_type, reason):
-    """
-    Запоминает начало проблемы.
-    Повторные проверки того же инцидента состояние не сбрасывают.
-    """
     key_since = f"{failure_type}_failure_since"
     key_notified = f"{failure_type}_failure_notified"
 
@@ -448,10 +496,6 @@ def set_failure_state(failure_type, reason):
 
 
 def clear_failure_state(failure_type):
-    """
-    Завершает состояние проблемы.
-    Возвращает информацию об инциденте.
-    """
     key_since = f"{failure_type}_failure_since"
     key_notified = f"{failure_type}_failure_notified"
 
@@ -475,13 +519,6 @@ def clear_failure_state(failure_type):
 
 
 def watchdog_send_failure(failure_type, reason):
-    """
-    Отправляет одно подробное служебное сообщение после 60 секунд
-    непрерывной проблемы.
-
-    В текущей beta/alpha стадии сохраняем техническую информацию
-    для диагностики.
-    """
     key_since = f"{failure_type}_failure_since"
     key_notified = f"{failure_type}_failure_notified"
 
@@ -500,59 +537,51 @@ def watchdog_send_failure(failure_type, reason):
 
     titles = {
         "parser": "🔴 ПРОБЛЕМА СИСТЕМЫ",
-        "source": "🔴 ПРОБЛЕМА ИСТОЧНИКА",
+        "pszsu": "🔴 ПРОБЛЕМА ИСТОЧНИКА PSZSU",
+        "monitor": "🔴 ПРОБЛЕМА ИСТОЧНИКА MONITOR",
         "telegram": "🔴 ПРОБЛЕМА TELEGRAM API",
     }
 
     if failure_type == "parser":
-        message = (
-            "⚠️ ВНИМАНИЕ!\n"
-            "\n"
-            "БОТ НЕ РАБОТАЕТ.\n"
-            "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
-            "\n"
+        details = (
             "Парсер не выполняет проверки.\n"
             f"Последняя проверка: {format_time(last_check)}\n"
             "Причина: причина не определена."
         )
 
-    elif failure_type == "source":
-        message = (
-            "⚠️ ВНИМАНИЕ!\n"
-            "\n"
-            "БОТ НЕ РАБОТАЕТ.\n"
-            "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
-            "\n"
-            "Официальный источник временно недоступен.\n"
+    elif failure_type == "pszsu":
+        details = (
+            "Источник PSZSU временно недоступен "
+            "или произошла ошибка при его обработке.\n"
+            f"Причина: {reason}"
+        )
+
+    elif failure_type == "monitor":
+        details = (
+            "Источник monitor временно недоступен "
+            "или произошла ошибка при его обработке.\n"
             f"Причина: {reason}"
         )
 
     elif failure_type == "telegram":
-        message = (
-            "⚠️ ВНИМАНИЕ!\n"
-            "\n"
-            "БОТ НЕ РАБОТАЕТ.\n"
-            "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
-            "\n"
+        details = (
             "Бот не может нормально связаться "
             "с Telegram Bot API.\n"
             f"Причина: {reason}"
         )
 
     else:
-        message = (
-            "⚠️ ВНИМАНИЕ!\n"
-            "\n"
-            "БОТ НЕ РАБОТАЕТ.\n"
-            "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
-            "\n"
-            f"{reason}"
-        )
+        details = reason
 
     text = (
         f"{titles.get(failure_type, '🔴 ПРОБЛЕМА СИСТЕМЫ')}\n"
         "\n"
-        f"{message}\n"
+        "⚠️ ВНИМАНИЕ!\n"
+        "\n"
+        "БОТ НЕ РАБОТАЕТ.\n"
+        "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
+        "\n"
+        f"{details}\n"
         "\n"
         f"Проблема длится более "
         f"{FAILURE_NOTIFICATION_AFTER_SECONDS} секунд."
@@ -571,13 +600,18 @@ def watchdog_send_failure(failure_type, reason):
 
 
 def watchdog_check_recovery(failure_type, recovery_reason):
-    """
-    После восстановления отправляет сообщение только если
-    ранее по этому инциденту уже было отправлено сообщение о сбое.
-    """
-    info = clear_failure_state(failure_type)
+    key_since = f"{failure_type}_failure_since"
+    key_notified = f"{failure_type}_failure_notified"
 
-    if not info or not info["notified"]:
+    with state_lock:
+        since = state[key_since]
+        notified = state[key_notified]
+
+    if since is None or not notified:
+        # Если инцидент был кратким и уведомление о сбое
+        # не отправлялось, просто закрываем его.
+        if since is not None:
+            clear_failure_state(failure_type)
         return
 
     text = (
@@ -593,6 +627,11 @@ def watchdog_check_recovery(failure_type, recovery_reason):
     message_id = send_telegram_message(text)
 
     if message_id:
+        # Закрываем инцидент только после успешной доставки
+        # сообщения о восстановлении. Если Telegram временно
+        # недоступен, watchdog попробует отправить recovery снова.
+        clear_failure_state(failure_type)
+
         print(
             f"ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О ВОССТАНОВЛЕНИИ: "
             f"{failure_type}",
@@ -612,12 +651,11 @@ def watchdog_loop():
 
             with state_lock:
                 parser_running = state["parser_running"]
-                parser_heartbeat = state["parser_heartbeat"]
-                source_ok = state["source_ok"]
                 telegram_api_ok = state["telegram_api_ok"]
+                pszsu_ok = state["pszsu_ok"]
+                monitor_ok = state["monitor_ok"]
                 started_at = state["started_at"]
 
-            # После запуска даём системе спокойно инициализироваться.
             if (
                 started_at is None
                 or (now - started_at).total_seconds()
@@ -655,24 +693,46 @@ def watchdog_loop():
                 )
 
             # ------------------------------------------------
-            # ИСТОЧНИК
+            # PSZSU
             # ------------------------------------------------
 
-            if source_ok:
+            if pszsu_ok:
                 watchdog_check_recovery(
-                    "source",
-                    "Официальный источник снова доступен.",
+                    "pszsu",
+                    "Источник PSZSU снова доступен.",
                 )
             else:
                 set_failure_state(
-                    "source",
-                    "Источник не отвечает или произошла "
+                    "pszsu",
+                    "Источник PSZSU не отвечает или произошла "
                     "ошибка при его обработке.",
                 )
 
                 watchdog_send_failure(
-                    "source",
-                    "Источник не отвечает или произошла "
+                    "pszsu",
+                    "Источник PSZSU не отвечает или произошла "
+                    "ошибка при его обработке.",
+                )
+
+            # ------------------------------------------------
+            # MONITOR
+            # ------------------------------------------------
+
+            if monitor_ok:
+                watchdog_check_recovery(
+                    "monitor",
+                    "Источник monitor снова доступен.",
+                )
+            else:
+                set_failure_state(
+                    "monitor",
+                    "Источник monitor не отвечает или произошла "
+                    "ошибка при его обработке.",
+                )
+
+                watchdog_send_failure(
+                    "monitor",
+                    "Источник monitor не отвечает или произошла "
                     "ошибка при его обработке.",
                 )
 
@@ -699,7 +759,6 @@ def watchdog_loop():
                 )
 
         except Exception as e:
-            # Watchdog сам не должен умирать из-за своей ошибки.
             print(
                 f"Ошибка контроля состояния: "
                 f"{type(e).__name__}: {e}",
@@ -713,7 +772,7 @@ def watchdog_loop():
 # PINNED STATUS
 # ============================================================
 
-STATUS_TITLE = "🟢🟢🟢 🛠️ СОСТОЯНИЕ СИСТЕМЫ"
+STATUS_TITLE_MARKER = "🛠️ СОСТОЯНИЕ СИСТЕМЫ"
 
 
 def get_pinned_message_id():
@@ -736,13 +795,7 @@ def get_pinned_message_id():
         message_id = pinned.get("message_id")
         text = pinned.get("text", "")
 
-        # Ищем именно наше сообщение состояния.
-        # Три индикатора могут быть зелёными или красными,
-        # поэтому проверяем фиксированную часть заголовка.
-        if (
-            "🛠️ СОСТОЯНИЕ СИСТЕМЫ" in text
-            and text.find("🛠️ СОСТОЯНИЕ СИСТЕМЫ") >= 0
-        ):
+        if STATUS_TITLE_MARKER in text:
             return message_id
 
     except Exception as e:
@@ -755,14 +808,11 @@ def get_pinned_message_id():
 
 
 def build_status_text():
-    now = now_utc()
-
     with state_lock:
         parser_running = state["parser_running"]
-        parser_heartbeat = state["parser_heartbeat"]
-
         telegram_api_ok = state["telegram_api_ok"]
-        source_ok = state["source_ok"]
+        pszsu_ok = state["pszsu_ok"]
+        monitor_ok = state["monitor_ok"]
 
         last_check = state["last_check"]
         last_alert = state["last_alert"]
@@ -775,22 +825,21 @@ def build_status_text():
         and heartbeat_age <= PARSER_STALE_AFTER_SECONDS
     )
 
-    if parser_alive:
-        parser_icon = "🟢"
-        parser_text = "РАБОТАЕТ"
-    else:
-        parser_icon = "🔴"
-        parser_text = "НЕТ ПРОВЕРКИ"
+    parser_icon = "🟢" if parser_alive else "🔴"
+    parser_text = "РАБОТАЕТ" if parser_alive else "НЕТ ПРОВЕРКИ"
 
     telegram_icon = "🟢" if telegram_api_ok else "🔴"
     telegram_text = "OK" if telegram_api_ok else "ОШИБКА"
 
-    source_icon = "🟢" if source_ok else "🔴"
-    source_text = "OK" if source_ok else "ОШИБКА"
+    pszsu_icon = "🟢" if pszsu_ok else "🔴"
+    pszsu_text = "OK" if pszsu_ok else "ОШИБКА"
+
+    monitor_icon = "🟢" if monitor_ok else "🔴"
+    monitor_text = "OK" if monitor_ok else "ОШИБКА"
 
     title = (
-        f"{parser_icon}{telegram_icon}{source_icon} "
-        "🛠️ СОСТОЯНИЕ СИСТЕМЫ"
+        f"{parser_icon}{telegram_icon}{pszsu_icon}{monitor_icon} "
+        f"🛠️ СОСТОЯНИЕ СИСТЕМЫ"
     )
 
     return (
@@ -798,7 +847,8 @@ def build_status_text():
         "\n"
         f"{parser_icon} Парсер: {parser_text}\n"
         f"{telegram_icon} Telegram API: {telegram_text}\n"
-        f"{source_icon} Источник: {source_text}\n"
+        f"{pszsu_icon} Источник PSZSU: {pszsu_text}\n"
+        f"{monitor_icon} Источник monitor: {monitor_text}\n"
         "\n"
         f"🔎 Ключевое слово: {KEYWORD}\n"
         f"⏱ Проверка: каждые {CHECK_INTERVAL_SECONDS} сек.\n"
@@ -906,14 +956,12 @@ def handle_test_command(message):
     chat_id = chat.get("id")
     user_id = sender.get("id")
 
-    # Команда принимается только из нашей рабочей группы.
     if chat_id != CHAT_ID:
         return
 
     if not user_id:
         return
 
-    # Только администратор может запускать /test.
     if not is_group_admin(user_id):
         print(
             f"Команда /test отклонена: "
@@ -943,7 +991,6 @@ def telegram_command_listener():
         flush=True,
     )
 
-    # Переключаем Telegram на long polling.
     telegram_request(
         "deleteWebhook",
         {
@@ -953,8 +1000,6 @@ def telegram_command_listener():
 
     offset = None
 
-    # Не даём старым командам после перезапуска
-    # внезапно выполнить /test.
     try:
         result = telegram_request(
             "getUpdates",
@@ -977,7 +1022,6 @@ def telegram_command_listener():
     while True:
         try:
             data = {
-                # Long polling Telegram.
                 "timeout": 20,
                 "allowed_updates": '["message"]',
             }
@@ -1082,37 +1126,207 @@ def get_post_datetime(element):
 
 
 # ============================================================
-# ПРОВЕРКА ИСТОЧНИКА
+# ФИЛЬТРЫ
 # ============================================================
 
-def check_updates():
-    check_time = now_utc()
+def normalize_text(text):
+    return " ".join(
+        text.lower().replace("ё", "е").split()
+    )
 
-    # Heartbeat записываем ДО сетевого запроса к источнику.
-    # Это главный сигнал для /health.
-    write_parser_heartbeat()
+
+def has_kremenchuk(text):
+    return KEYWORD in normalize_text(text)
+
+
+def has_impact(text):
+    normalized = normalize_text(text)
+
+    return any(
+        pattern in normalized
+        for pattern in IMPACT_PATTERNS
+    )
+
+
+def has_high_speed_threat(text):
+    normalized = normalize_text(text)
+
+    if any(
+        pattern in normalized
+        for pattern in HIGH_SPEED_PATTERNS
+    ):
+        return True
+
+    # Отдельная проверка БР как отдельного слова.
+    return re.search(r"\b" + re.escape(BR_PATTERN) + r"\b", normalized) is not None
+
+
+def is_continuing_threat(text):
+    normalized = normalize_text(text)
+
+    return any(
+        pattern in normalized
+        for pattern in CONTINUING_PATTERNS
+    )
+
+
+def is_post_event_report(text):
+    normalized = normalize_text(text)
+
+    return any(
+        pattern in normalized
+        for pattern in POST_EVENT_PATTERNS
+    )
+
+
+def classify_monitor_message(text):
+    """
+    Возвращает:
+      IMPACT_CONFIRMED
+      HIGH_SPEED_THREAT
+      IGNORE
+
+    Приоритет:
+      1. Взрыв + Кременчугская география.
+      2. Высокоскоростная угроза + география.
+      3. Всё остальное игнорируем.
+
+    Continuing threat и post-event сообщения не создают тревогу.
+    """
+
+    if not has_kremenchuk(text):
+        return "IGNORE"
+
+    # Подтверждение события имеет приоритет над остальными
+    # признаками. Поэтому оперативный пост:
+    # "Вибух ... Було застосовано ..."
+    # не потеряется из-за слова "було застосовано".
+    if has_impact(text):
+        return "IMPACT_CONFIRMED"
+
+    if is_continuing_threat(text):
+        return "IGNORE"
+
+    if has_high_speed_threat(text):
+        if is_post_event_report(text):
+            return "IGNORE"
+
+        return "HIGH_SPEED_THREAT"
+
+    return "IGNORE"
+
+
+# ============================================================
+# ОТПРАВКА ОПЕРАТИВНОГО СООБЩЕНИЯ
+# ============================================================
+
+def build_alert_text(
+    source_name,
+    source_link,
+    original_text,
+    classification,
+):
+    safe_text = original_text[:3500]
+
+    escaped_text = html.escape(
+        safe_text,
+        quote=False,
+    )
+
+    if classification == "IMPACT_CONFIRMED":
+        title = (
+            "🟡 внимание 🟡\n"
+            "\n"
+            "<b>ПОДТВЕРЖДЕНИЕ АТАКИ "
+            "НА КРЕМЕНЧУГ / РАЙОН</b>"
+        )
+    else:
+        title = (
+            "🚨 внимание 🚨\n"
+            "\n"
+            "<b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>"
+        )
+
+    return (
+        f"{title}\n"
+        "\n"
+        f'<a href="{source_link}">📡 {source_name}</a>\n'
+        "\n"
+        f"<blockquote><b>{escaped_text}</b></blockquote>"
+    )
+
+
+def send_alert(
+    source_name,
+    source_link,
+    post_id,
+    original_text,
+    classification,
+):
+    dedup_key = f"{source_name}:{post_id}"
+
+    with sent_messages_lock:
+        if dedup_key in sent_messages:
+            return False
+
+    alert_text = build_alert_text(
+        source_name=source_name,
+        source_link=source_link,
+        original_text=original_text,
+        classification=classification,
+    )
+
+    message_id = send_telegram_message(
+        alert_text,
+        parse_mode="HTML",
+        disable_link_preview=True,
+    )
+
+    # Только после успешной отправки считаем сообщение доставленным.
+    if not message_id:
+        return False
+
+    with sent_messages_lock:
+        sent_messages.add(dedup_key)
+
+        if len(sent_messages) > MAX_SENT_MESSAGES:
+            sent_messages.pop()
 
     with state_lock:
-        state["last_check"] = check_time
+        state["last_alert"] = now_utc()
 
+    print(
+        f"ОТПРАВЛЕНО: {source_name}; "
+        f"{classification}; {post_id}",
+        flush=True,
+    )
+
+    return True
+
+
+# ============================================================
+# ПРОВЕРКА ОДНОГО ИСТОЧНИКА
+# ============================================================
+
+def check_source(
+    source_url,
+    source_name,
+    source_link,
+    is_monitor=False,
+):
     try:
         response = session.get(
-            SOURCE_URL,
-            timeout=REQUEST_TIMEOUT,
+            source_url,
+            timeout=SOURCE_REQUEST_TIMEOUT,
         )
 
         if response.status_code != 200:
-            with state_lock:
-                state["source_ok"] = False
-
             print(
-                f"Источник вернул HTTP {response.status_code}",
+                f"{source_name}: HTTP {response.status_code}",
                 flush=True,
             )
-            return
 
-        with state_lock:
-            state["source_ok"] = True
+            return False
 
         soup = BeautifulSoup(
             response.text,
@@ -1124,11 +1338,12 @@ def check_updates():
         )
 
         if not posts:
-            return
+            # Сам источник ответил, страница разобрана.
+            return True
 
         current_time = now_utc()
 
-        # Сначала самые свежие сообщения.
+        # Сначала самые свежие.
         posts = list(reversed(posts))
 
         for post in posts:
@@ -1141,12 +1356,9 @@ def check_updates():
                 current_time - post_datetime
             ).total_seconds()
 
-            # Если дата сообщения немного опережает наше время,
-            # не считаем его старым.
             if age_seconds < 0:
                 age_seconds = 0
 
-            # Не рассматриваем сообщения старше 5 минут.
             if age_seconds > MAX_MESSAGE_AGE_MINUTES * 60:
                 break
 
@@ -1165,85 +1377,103 @@ def check_updates():
             if not text:
                 continue
 
-            # Ищем корень "кременч" без учёта регистра.
-            if KEYWORD not in text.lower():
+            # ------------------------------------------------
+            # PSZSU
+            # ------------------------------------------------
+
+            if not is_monitor:
+                if not has_kremenchuk(text):
+                    continue
+
+                # PSZSU: рабочую логику Кременчуга сохраняем,
+                # но постфактумные сводки/итоги не отправляем.
+                if is_post_event_report(text):
+                    continue
+
+                post_id = post.get("data-post")
+
+                if not post_id:
+                    continue
+
+                classification = "HIGH_SPEED_THREAT"
+
+                send_alert(
+                    source_name=source_name,
+                    source_link=source_link,
+                    post_id=post_id,
+                    original_text=text,
+                    classification=classification,
+                )
+
                 continue
 
-            # Получаем ID конкретного сообщения канала.
-            post_id = None
+            # ------------------------------------------------
+            # MONITOR
+            # ------------------------------------------------
 
-            try:
-                post_id = post.get("data-post")
-            except Exception:
-                pass
+            classification = classify_monitor_message(text)
+
+            if classification == "IGNORE":
+                continue
+
+            post_id = post.get("data-post")
 
             if not post_id:
                 continue
 
-            # Не отправляем один и тот же пост повторно
-            # в рамках текущего запуска.
-            with sent_messages_lock:
-                if post_id in sent_messages:
-                    continue
-
-            # В Telegram ограничение на размер обычного сообщения
-            # значительно больше этого значения, но оставляем запас.
-            safe_text = text[:3500]
-
-            # Оригинал сообщения не изменяем по смыслу и визуально
-            # отделяем нативным Telegram blockquote.
-            # HTML-спецсимволы экранируем, чтобы исходный текст
-            # не мог сломать Telegram-разметку.
-            escaped_text = html.escape(
-                safe_text,
-                quote=False,
+            send_alert(
+                source_name=source_name,
+                source_link=source_link,
+                post_id=post_id,
+                original_text=text,
+                classification=classification,
             )
 
-            alert_text = (
-                "🚨 внимание 🚨\n"
-                "\n"
-                "<b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>\n"
-                "\n"
-                '<a href="https://t.me/kpszsu">📡 Повітряні Сили ЗС України</a>\n'
-                "\n"
-                f"<blockquote><b>{escaped_text}</b></blockquote>"
-            )
-
-            # ВАЖНО:
-            # post_id добавляем в dedup ТОЛЬКО после успешной
-            # отправки. Если Telegram временно не принял сообщение,
-            # следующая проверка сможет повторить попытку.
-            message_id = send_telegram_message(
-                alert_text,
-                parse_mode="HTML",
-                disable_link_preview=True,
-            )
-
-            if message_id:
-                with sent_messages_lock:
-                    sent_messages.add(post_id)
-
-                    if len(sent_messages) > MAX_SENT_MESSAGES:
-                        # Удаляем произвольный старый элемент.
-                        sent_messages.pop()
-
-                with state_lock:
-                    state["last_alert"] = now_utc()
-
-                print(
-                    f"ОТПРАВЛЕНА ТРЕВОГА: {post_id}",
-                    flush=True,
-                )
+        return True
 
     except Exception as e:
-        with state_lock:
-            state["source_ok"] = False
-
         print(
-            f"Ошибка проверки источника: "
+            f"Ошибка проверки {source_name}: "
             f"{type(e).__name__}: {e}",
             flush=True,
         )
+
+        return False
+
+
+# ============================================================
+# ОСНОВНАЯ ПРОВЕРКА
+# ============================================================
+
+def check_updates():
+    check_time = now_utc()
+
+    # Heartbeat ДО сетевых запросов.
+    write_parser_heartbeat()
+
+    with state_lock:
+        state["last_check"] = check_time
+
+    # Каждый источник имеет собственный статус.
+    pszsu_ok = check_source(
+        source_url=PSZSU_URL,
+        source_name=PSZSU_NAME,
+        source_link=PSZSU_LINK,
+        is_monitor=False,
+    )
+
+    with state_lock:
+        state["pszsu_ok"] = pszsu_ok
+
+    monitor_ok = check_source(
+        source_url=MONITOR_URL,
+        source_name=MONITOR_NAME,
+        source_link=MONITOR_LINK,
+        is_monitor=True,
+    )
+
+    with state_lock:
+        state["monitor_ok"] = monitor_ok
 
 
 # ============================================================
@@ -1258,6 +1488,16 @@ def run_bot():
 
     print(
         "ФОНОВЫЙ ПАРСЕР ЗАПУЩЕН",
+        flush=True,
+    )
+
+    print(
+        f"PSZSU: {PSZSU_URL}",
+        flush=True,
+    )
+
+    print(
+        f"monitor: {MONITOR_URL}",
         flush=True,
     )
 
@@ -1289,8 +1529,6 @@ def run_bot():
         state["started_at"] = startup_time
         state["last_check"] = startup_time
 
-    # Heartbeat появляется ещё ДО проверки Telegram API
-    # и ДО работы с закреплённым статусом.
     write_parser_heartbeat()
 
     print(
@@ -1328,10 +1566,10 @@ def run_bot():
             check_updates()
 
         except Exception as e:
-            # Ошибка одной проверки не должна остановить
-            # весь фоновый parser.
+            # Ошибка одного цикла не должна остановить parser.
             with state_lock:
-                state["source_ok"] = False
+                state["pszsu_ok"] = False
+                state["monitor_ok"] = False
 
             print(
                 f"Ошибка цикла парсера: "
