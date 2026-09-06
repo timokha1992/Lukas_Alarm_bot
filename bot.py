@@ -1,6 +1,7 @@
-import html
 import os
 import time
+import html
+import json
 import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -16,8 +17,9 @@ from flask import Flask
 
 SOURCE_URL = "https://t.me/s/kpszsu"
 
-# Ищем корень "кременч" без учёта регистра.
-# Это покрывает Кременчук, Кременчуга, Кременчуку, Кременчуці и т.д.
+# ТЕСТОВОЕ ключевое слово.
+# Ищем "БПЛА" без учёта регистра.
+# После теста вернём KEYWORD обратно на "кременч".
 KEYWORD = "бпла"
 
 CHECK_INTERVAL_SECONDS = 15
@@ -360,13 +362,21 @@ def telegram_request(method, data=None, retries=3):
     return None
 
 
-def send_telegram_message(text, parse_mode=None):
+def send_telegram_message(text, parse_mode=None, disable_link_preview=False):
     data = {
         "chat_id": CHAT_ID,
         "text": text,
     }
+
     if parse_mode:
         data["parse_mode"] = parse_mode
+
+    if disable_link_preview:
+        # Отключаем автоматическое превью ссылки, но сама ссылка
+        # остаётся кликабельной.
+        data["link_preview_options"] = json.dumps({
+            "is_disabled": True,
+        })
 
     result = telegram_request(
         "sendMessage",
@@ -1179,10 +1189,20 @@ def check_updates():
             # В Telegram ограничение на размер обычного сообщения
             # значительно больше этого значения, но оставляем запас.
             safe_text = text[:3500]
-            escaped_text = html.escape(safe_text, quote=False)
+
+            # Оригинал сообщения не изменяем по смыслу и визуально
+            # отделяем нативным Telegram blockquote.
+            # HTML-спецсимволы экранируем, чтобы исходный текст
+            # не мог сломать Telegram-разметку.
+            escaped_text = html.escape(
+                safe_text,
+                quote=False,
+            )
 
             alert_text = (
-                "🔴🚨 <b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>\n"
+                "🚨 <i>ВНИМАНИЕ!</i>\n"
+                "\n"
+                "<b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>\n"
                 "\n"
                 '<a href="https://t.me/kpszsu">📡 Повітряні Сили ЗС України</a>\n'
                 "\n"
@@ -1196,6 +1216,7 @@ def check_updates():
             message_id = send_telegram_message(
                 alert_text,
                 parse_mode="HTML",
+                disable_link_preview=True,
             )
 
             if message_id:
