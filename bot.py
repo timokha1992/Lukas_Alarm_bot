@@ -3,13 +3,14 @@ import time
 import html
 import json
 import re
+import secrets
 import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
+from flask import Flask, jsonify, request
 
 
 # ============================================================
@@ -128,6 +129,7 @@ IMPACT_PATTERNS = (
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID_RAW = os.getenv("CHAT_ID")
+EXTERNAL_CHECK_TOKEN = os.getenv("EXTERNAL_CHECK_TOKEN")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_TOKEN")
@@ -289,6 +291,150 @@ def health():
         )
 
     return "OK", 200
+
+
+def telegram_api_fast_check():
+    """
+    Быстрая независимая проверка Telegram Bot API для /external-check.
+    Не использует обычный telegram_request(), чтобы не ждать до 35 секунд
+    и не запускать несколько повторных попыток.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe"
+
+    try:
+        response = session.post(
+            url,
+            data={},
+            timeout=(3, 8),
+        )
+
+        if response.status_code != 200:
+            with state_lock:
+                state["telegram_api_ok"] = False
+
+            return False, (
+                f"Telegram Bot API вернул HTTP "
+                f"{response.status_code}"
+            )
+
+        result = response.json()
+
+        if not result.get("ok"):
+            with state_lock:
+                state["telegram_api_ok"] = False
+
+            return False, "Telegram Bot API вернул ошибку"
+
+        with state_lock:
+            state["telegram_api_ok"] = True
+
+        return True, None
+
+    except Exception as e:
+        with state_lock:
+            state["telegram_api_ok"] = False
+
+        return False, f"{type(e).__name__}: {e}"
+
+
+def perform_external_self_check():
+    """
+    Немедленная самопроверка по запросу внешнего контроля.
+
+    Проверяем не только доступность Flask, а состояние основного парсера,
+    свежесть полного цикла по обоим источникам и отдельный быстрый запрос
+    к Telegram Bot API.
+    """
+    now = now_utc()
+    problems = []
+
+    heartbeat_age = get_parser_heartbeat_age()
+
+    with state_lock:
+        parser_running = state["parser_running"]
+        pszsu_ok = state["pszsu_ok"]
+        monitor_ok = state["monitor_ok"]
+        last_pszsu_check = state["last_pszsu_check"]
+        last_monitor_check = state["last_monitor_check"]
+        started_at = state["started_at"]
+
+    if started_at is not None:
+        startup_age = (now - started_at).total_seconds()
+    else:
+        startup_age = None
+
+    if not parser_running:
+        problems.append("парсер не запущен")
+
+    if heartbeat_age is None:
+        problems.append("heartbeat парсера отсутствует")
+    elif heartbeat_age > PARSER_STALE_AFTER_SECONDS:
+        problems.append(
+            f"heartbeat парсера устарел ({int(heartbeat_age)} сек.)"
+        )
+
+    if last_pszsu_check is None:
+        problems.append("PSZSU ещё не проверен")
+    elif (now - last_pszsu_check).total_seconds() > PARSER_STALE_AFTER_SECONDS:
+        problems.append("последняя проверка PSZSU устарела")
+
+    if last_monitor_check is None:
+        problems.append("monitor ещё не проверен")
+    elif (now - last_monitor_check).total_seconds() > PARSER_STALE_AFTER_SECONDS:
+        problems.append("последняя проверка monitor устарела")
+
+    if not pszsu_ok:
+        problems.append("PSZSU сейчас недоступен или обработан с ошибкой")
+
+    if not monitor_ok:
+        problems.append("monitor сейчас недоступен или обработан с ошибкой")
+
+    telegram_ok, telegram_reason = telegram_api_fast_check()
+
+    if not telegram_ok:
+        problems.append(
+            "Telegram Bot API недоступен"
+            + (f": {telegram_reason}" if telegram_reason else "")
+        )
+
+    if problems:
+        return False, "; ".join(problems)
+
+    return True, "Самопроверка пройдена"
+
+
+@app.route("/external-check")
+def external_check():
+    """
+    Защищённый endpoint для независимого внешнего контроля.
+    Сам endpoint запускает немедленную самопроверку состояния бота.
+    """
+    if not EXTERNAL_CHECK_TOKEN:
+        return jsonify({
+            "ok": False,
+            "reason": "EXTERNAL_CHECK_TOKEN не настроен",
+        }), 503
+
+    supplied_token = request.headers.get("X-External-Check-Token", "")
+
+    if not supplied_token or not secrets.compare_digest(
+        supplied_token,
+        EXTERNAL_CHECK_TOKEN,
+    ):
+        return jsonify({
+            "ok": False,
+            "reason": "Unauthorized",
+        }), 401
+
+    ok, reason = perform_external_self_check()
+
+    payload = {
+        "ok": ok,
+        "reason": reason,
+        "checked_at": now_utc().astimezone(KYIV_TZ).isoformat(),
+    }
+
+    return jsonify(payload), 200 if ok else 503
 
 
 # ============================================================
@@ -673,6 +819,8 @@ def watchdog_check_recovery(failure_type, recovery_reason):
             clear_failure_state(failure_type)
         return
 
+    duration = (now_utc() - since).total_seconds()
+
     text = (
         "🟢 СИСТЕМА ВОССТАНОВЛЕНА\n"
         "\n"
@@ -680,7 +828,7 @@ def watchdog_check_recovery(failure_type, recovery_reason):
         "НА ЕГО УВЕДОМЛЕНИЯ СНОВА МОЖНО РАССЧИТЫВАТЬ.\n"
         "\n"
         f"{recovery_reason}\n"
-        f"Длительность сбоя: {format_duration(info['duration'])}"
+        f"Длительность сбоя: {format_duration(duration)}"
     )
 
     message_id = send_telegram_message(text)
