@@ -26,8 +26,8 @@ PSZSU_LINK = "https://t.me/kpszsu"
 MONITOR_NAME = "monitor"
 MONITOR_LINK = "https://t.me/war_monitor"
 
-# Корень для всех форм Кременчуга:
-# Кременчук, Кременчуга, Кременчуці, Кременчуцький район и т.д.
+# Корень для всех форм Кременчуга.
+# Используется для PSZSU и для подтверждений событий monitor.
 KEYWORD = "кременч"
 
 CHECK_INTERVAL_SECONDS = 15
@@ -41,7 +41,6 @@ STARTUP_GRACE_SECONDS = 90
 MAX_MESSAGE_AGE_MINUTES = 5
 MAX_SENT_MESSAGES = 1000
 
-# Telegram /test использует long polling до 20 секунд.
 REQUEST_TIMEOUT = (5, 35)
 SOURCE_REQUEST_TIMEOUT = (5, 15)
 
@@ -54,6 +53,20 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 # ФИЛЬТР MONITOR
 # ============================================================
 
+# Именно город Кременчук.
+# Кременчуцький район сюда не входит.
+KREMENCHUK_CITY_PATTERNS = (
+    "кременчук",
+    "кременчука",
+    "кременчуці",
+)
+
+BANDEROL_PATTERNS = (
+    "бандероль",
+    "бандеролі",
+    "бандероллю",
+)
+
 HIGH_SPEED_PATTERNS = (
     "балістик",
     "балістична ракета",
@@ -63,7 +76,6 @@ HIGH_SPEED_PATTERNS = (
     "аеробалістична",
     "аеробалістичні",
     "кинжал",
-    "кинджал",
     "циркон",
     "3м22",
     "х-47м2",
@@ -439,7 +451,6 @@ def perform_external_self_check():
         monitor_ok = state["monitor_ok"]
         last_pszsu_check = state["last_pszsu_check"]
         last_monitor_check = state["last_monitor_check"]
-        started_at = state["started_at"]
 
     if not parser_running:
         problems.append("парсер не запущен")
@@ -1625,6 +1636,39 @@ def has_kremenchuk(text):
     )
 
 
+def has_kremenchuk_city(text):
+    normalized = normalize_text(
+        text
+    )
+
+    return any(
+        pattern in normalized
+        for pattern in KREMENCHUK_CITY_PATTERNS
+    )
+
+
+def has_banderol(text):
+    normalized = normalize_text(
+        text
+    )
+
+    return any(
+        pattern in normalized
+        for pattern in BANDEROL_PATTERNS
+    )
+
+
+def is_banderol_reconnaissance(text):
+    normalized = normalize_text(
+        text
+    )
+
+    return (
+        "дорозвідка по бандеролі" in normalized
+        or "дорозвідка по бандеролях" in normalized
+    )
+
+
 def has_impact(text):
     normalized = normalize_text(
         text
@@ -1686,18 +1730,57 @@ def classify_monitor_message(text):
       IMPACT_CONFIRMED
       HIGH_SPEED_THREAT
       IGNORE
+
+    Для подтверждённых событий:
+      Кременчук или Кременчуцький район.
+
+    Для новой конкретной угрозы:
+      только город Кременчук.
     """
 
-    if not has_kremenchuk(text):
-        return "IGNORE"
+    # --------------------------------------------------------
+    # ЖЁЛТОЕ:
+    # уже произошедшее событие.
+    #
+    # Здесь район разрешён.
+    # --------------------------------------------------------
 
-    if has_impact(text):
+    if has_kremenchuk(text) and has_impact(text):
         return "IMPACT_CONFIRMED"
+
+    # --------------------------------------------------------
+    # Продолжающаяся угроза:
+    # не создаём новую тревогу.
+    # --------------------------------------------------------
 
     if is_continuing_threat(text):
         return "IGNORE"
 
+    # --------------------------------------------------------
+    # Для красного уведомления требуется
+    # именно город Кременчук.
+    # --------------------------------------------------------
+
+    if not has_kremenchuk_city(text):
+        return "IGNORE"
+
+    # --------------------------------------------------------
+    # БАНДЕРОЛЬ
+    # --------------------------------------------------------
+
+    if has_banderol(text):
+
+        if is_banderol_reconnaissance(text):
+            return "IGNORE"
+
+        return "HIGH_SPEED_THREAT"
+
+    # --------------------------------------------------------
+    # Остальные скоростные угрозы
+    # --------------------------------------------------------
+
     if has_high_speed_threat(text):
+
         if is_post_event_report(text):
             return "IGNORE"
 
