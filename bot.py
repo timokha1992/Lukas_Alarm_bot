@@ -332,9 +332,21 @@ def health():
             f"({int(heartbeat_age)} сек.)",
             503,
         )
+
+    if last_pszsu_check is None:
+        print(
+            "HEALTH 503: PSZSU ещё не был проверен.",
+            flush=True,
+        )
         return (
             "NOT OK: PSZSU ещё не проверен",
             503,
+        )
+
+    if last_monitor_check is None:
+        print(
+            "HEALTH 503: monitor ещё не был проверен.",
+            flush=True,
         )
         return (
             "NOT OK: monitor ещё не проверен",
@@ -449,6 +461,22 @@ def perform_external_self_check():
     elif heartbeat_age > PARSER_STALE_AFTER_SECONDS:
         problems.append(
             f"heartbeat парсера устарел ({int(heartbeat_age)} сек.)"
+        )
+
+
+    elif (
+        now - last_pszsu_check
+    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
+        problems.append(
+            "последняя проверка PSZSU устарела"
+        )
+
+
+    elif (
+        now - last_monitor_check
+    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
+        problems.append(
+            "последняя проверка monitor устарела"
         )
 
     if not pszsu_ok:
