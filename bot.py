@@ -37,7 +37,7 @@ WATCHDOG_INTERVAL_SECONDS = 10
 
 PARSER_STALE_AFTER_SECONDS = 60
 FAILURE_NOTIFICATION_AFTER_SECONDS = 60
-STARTUP_GRACE_SECONDS = 45
+STARTUP_GRACE_SECONDS = 90
 
 MAX_MESSAGE_AGE_MINUTES = 5
 MAX_SENT_MESSAGES = 1000
@@ -404,7 +404,7 @@ def telegram_api_fast_check():
         response = session.post(
             url,
             data={},
-            timeout=(2, 2),
+            timeout=(3, 8),
         )
 
         if response.status_code != 200:
@@ -500,17 +500,9 @@ def perform_external_self_check():
             "monitor сейчас недоступен или обработан с ошибкой"
         )
 
-    telegram_ok, telegram_reason = telegram_api_fast_check()
-
-    if not telegram_ok:
-        problems.append(
-            "Telegram Bot API недоступен"
-            + (
-                f": {telegram_reason}"
-                if telegram_reason
-                else ""
-            )
-        )
+    # Внешний контроль не проверяет Telegram напрямую.
+    # Статус Telegram уже обновляется основным ботом.
+    # telegram_ok, telegram_reason = telegram_api_fast_check()
 
     if problems:
         return False, "; ".join(problems)
