@@ -470,26 +470,6 @@ def perform_external_self_check():
             f"heartbeat парсера устарел ({int(heartbeat_age)} сек.)"
         )
 
-    if last_pszsu_check is None:
-        problems.append("PSZSU ещё не проверен")
-
-    elif (
-        now - last_pszsu_check
-    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
-        problems.append(
-            "последняя проверка PSZSU устарела"
-        )
-
-    if last_monitor_check is None:
-        problems.append("monitor ещё не проверен")
-
-    elif (
-        now - last_monitor_check
-    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
-        problems.append(
-            "последняя проверка monitor устарела"
-        )
-
     if not pszsu_ok:
         problems.append(
             "PSZSU сейчас недоступен или обработан с ошибкой"
@@ -500,9 +480,17 @@ def perform_external_self_check():
             "monitor сейчас недоступен или обработан с ошибкой"
         )
 
-    # Внешний контроль не проверяет Telegram напрямую.
-    # Статус Telegram уже обновляется основным ботом.
-    # telegram_ok, telegram_reason = telegram_api_fast_check()
+    telegram_ok, telegram_reason = telegram_api_fast_check()
+
+    if not telegram_ok:
+        problems.append(
+            "Telegram Bot API недоступен"
+            + (
+                f": {telegram_reason}"
+                if telegram_reason
+                else ""
+            )
+        )
 
     if problems:
         return False, "; ".join(problems)
