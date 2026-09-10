@@ -31,6 +31,7 @@ MONITOR_LINK = "https://t.me/war_monitor"
 KEYWORD = "кременч"
 
 CHECK_INTERVAL_SECONDS = 15
+START_TIME = time.time()
 STATUS_UPDATE_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 10
 
@@ -441,6 +442,12 @@ def perform_external_self_check():
     """
 
     now = now_utc()
+    # Даём боту 45 секунд после запуска на первые проверки.
+    uptime = time.time() - START_TIME
+
+    if uptime < 45:
+        return True, "Бот запускается"
+
     problems = []
 
     heartbeat_age = get_parser_heartbeat_age()
@@ -517,10 +524,7 @@ def external_check():
     Защищённый endpoint для независимого внешнего контроля.
     """
 
-    print("EXTERNAL_CHECK: request received", flush=True)
-
     if not EXTERNAL_CHECK_TOKEN:
-        print("EXTERNAL_CHECK: token missing", flush=True)
         return jsonify({
             "ok": False,
             "reason": "EXTERNAL_CHECK_TOKEN не настроен",
@@ -531,33 +535,16 @@ def external_check():
         "",
     )
 
-    if not supplied_token:
-        print("EXTERNAL_CHECK: no header", flush=True)
-        return jsonify({
-            "ok": False,
-            "reason": "Unauthorized",
-        }), 401
-
-    print("EXTERNAL_CHECK: header received", flush=True)
-
-    if not secrets.compare_digest(
+    if not supplied_token or not secrets.compare_digest(
         supplied_token,
         EXTERNAL_CHECK_TOKEN,
     ):
-        print("EXTERNAL_CHECK: bad token", flush=True)
         return jsonify({
             "ok": False,
             "reason": "Unauthorized",
         }), 401
 
-    print("EXTERNAL_CHECK: token OK", flush=True)
-
     ok, reason = perform_external_self_check()
-
-    print(
-        f"EXTERNAL_CHECK: self-check finished ({ok})",
-        flush=True,
-    )
 
     payload = {
         "ok": ok,
