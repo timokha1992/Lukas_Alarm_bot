@@ -36,7 +36,7 @@ WATCHDOG_INTERVAL_SECONDS = 10
 
 PARSER_STALE_AFTER_SECONDS = 60
 FAILURE_NOTIFICATION_AFTER_SECONDS = 60
-STARTUP_GRACE_SECONDS = 60
+STARTUP_GRACE_SECONDS = 90
 
 MAX_MESSAGE_AGE_MINUTES = 5
 MAX_SENT_MESSAGES = 1000
@@ -290,13 +290,8 @@ def index():
     return "Lukas Alarm Bot is active", 200
 
 
-@app.route("/health", methods=["GET", "HEAD"])
+@app.route("/health")
 def health():
-    # Для UptimeRobot (HEAD) сразу отдаём 200,
-    # не ломая существующую самодиагностику для GET.
-    if request.method == "HEAD":
-        return ("", 200)
-
     now = now_utc()
 
     heartbeat_age = get_parser_heartbeat_age()
@@ -307,7 +302,7 @@ def health():
         last_monitor_check = state["last_monitor_check"]
 
     if started_at is None:
-        return "STARTING", 200
+        return "OK", 200
 
     startup_age = (
         now - started_at
@@ -337,21 +332,9 @@ def health():
             f"({int(heartbeat_age)} сек.)",
             503,
         )
-
-    if last_pszsu_check is None:
-        print(
-            "HEALTH 503: PSZSU ещё не был проверен.",
-            flush=True,
-        )
         return (
             "NOT OK: PSZSU ещё не проверен",
             503,
-        )
-
-    if last_monitor_check is None:
-        print(
-            "HEALTH 503: monitor ещё не был проверен.",
-            flush=True,
         )
         return (
             "NOT OK: monitor ещё не проверен",
@@ -466,26 +449,6 @@ def perform_external_self_check():
     elif heartbeat_age > PARSER_STALE_AFTER_SECONDS:
         problems.append(
             f"heartbeat парсера устарел ({int(heartbeat_age)} сек.)"
-        )
-
-    if last_pszsu_check is None:
-        problems.append("PSZSU ещё не проверен")
-
-    elif (
-        now - last_pszsu_check
-    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
-        problems.append(
-            "последняя проверка PSZSU устарела"
-        )
-
-    if last_monitor_check is None:
-        problems.append("monitor ещё не проверен")
-
-    elif (
-        now - last_monitor_check
-    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
-        problems.append(
-            "последняя проверка monitor устарела"
         )
 
     if not pszsu_ok:
