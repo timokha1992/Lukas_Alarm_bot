@@ -30,14 +30,13 @@ MONITOR_LINK = "https://t.me/war_monitor"
 # Используется для PSZSU и для подтверждений событий monitor.
 KEYWORD = "кременч"
 
-CHECK_INTERVAL_SECONDS = 15
-START_TIME = time.time()
+CHECK_INTERVAL_SECONDS = 45
 STATUS_UPDATE_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 10
 
 PARSER_STALE_AFTER_SECONDS = 60
 FAILURE_NOTIFICATION_AFTER_SECONDS = 60
-STARTUP_GRACE_SECONDS = 90
+STARTUP_GRACE_SECONDS = 45
 
 MAX_MESSAGE_AGE_MINUTES = 5
 MAX_SENT_MESSAGES = 1000
@@ -442,12 +441,6 @@ def perform_external_self_check():
     """
 
     now = now_utc()
-    # Даём боту 45 секунд после запуска на первые проверки.
-    uptime = time.time() - START_TIME
-
-    if uptime < 45:
-        return True, "Бот запускается"
-
     problems = []
 
     heartbeat_age = get_parser_heartbeat_age()
