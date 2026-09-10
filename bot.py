@@ -36,7 +36,7 @@ WATCHDOG_INTERVAL_SECONDS = 10
 
 PARSER_STALE_AFTER_SECONDS = 60
 FAILURE_NOTIFICATION_AFTER_SECONDS = 60
-STARTUP_GRACE_SECONDS = 90
+STARTUP_GRACE_SECONDS = 60
 
 MAX_MESSAGE_AGE_MINUTES = 5
 MAX_SENT_MESSAGES = 1000
@@ -307,7 +307,7 @@ def health():
         last_monitor_check = state["last_monitor_check"]
 
     if started_at is None:
-        return "OK", 200
+        return "STARTING", 200
 
     startup_age = (
         now - started_at
