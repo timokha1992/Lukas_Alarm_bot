@@ -403,7 +403,7 @@ def telegram_api_fast_check():
         response = session.post(
             url,
             data={},
-            timeout=(3, 8),
+            timeout=(2, 2),
         )
 
         if response.status_code != 200:
