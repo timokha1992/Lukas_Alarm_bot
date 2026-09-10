@@ -31,7 +31,6 @@ MONITOR_LINK = "https://t.me/war_monitor"
 KEYWORD = "кременч"
 
 CHECK_INTERVAL_SECONDS = 15
-START_TIME = time.time()
 STATUS_UPDATE_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 10
 
@@ -291,8 +290,13 @@ def index():
     return "Lukas Alarm Bot is active", 200
 
 
-@app.route("/health")
+@app.route("/health", methods=["GET", "HEAD"])
 def health():
+    # Для UptimeRobot (HEAD) сразу отдаём 200,
+    # не ломая существующую самодиагностику для GET.
+    if request.method == "HEAD":
+        return ("", 200)
+
     now = now_utc()
 
     heartbeat_age = get_parser_heartbeat_age()
@@ -404,7 +408,7 @@ def telegram_api_fast_check():
         response = session.post(
             url,
             data={},
-            timeout=(3, 8),
+            timeout=(2, 2),
         )
 
         if response.status_code != 200:
@@ -442,12 +446,6 @@ def perform_external_self_check():
     """
 
     now = now_utc()
-    # Даём боту 45 секунд после запуска на первые проверки.
-    uptime = time.time() - START_TIME
-
-    if uptime < 45:
-        return True, "Бот запускается"
-
     problems = []
 
     heartbeat_age = get_parser_heartbeat_age()
@@ -468,6 +466,26 @@ def perform_external_self_check():
     elif heartbeat_age > PARSER_STALE_AFTER_SECONDS:
         problems.append(
             f"heartbeat парсера устарел ({int(heartbeat_age)} сек.)"
+        )
+
+    if last_pszsu_check is None:
+        problems.append("PSZSU ещё не проверен")
+
+    elif (
+        now - last_pszsu_check
+    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
+        problems.append(
+            "последняя проверка PSZSU устарела"
+        )
+
+    if last_monitor_check is None:
+        problems.append("monitor ещё не проверен")
+
+    elif (
+        now - last_monitor_check
+    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
+        problems.append(
+            "последняя проверка monitor устарела"
         )
 
     if not pszsu_ok:
