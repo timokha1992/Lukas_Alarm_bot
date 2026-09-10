@@ -30,7 +30,8 @@ MONITOR_LINK = "https://t.me/war_monitor"
 # Используется для PSZSU и для подтверждений событий monitor.
 KEYWORD = "кременч"
 
-CHECK_INTERVAL_SECONDS = 45
+CHECK_INTERVAL_SECONDS = 15
+START_TIME = time.time()
 STATUS_UPDATE_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 10
 
@@ -403,7 +404,7 @@ def telegram_api_fast_check():
         response = session.post(
             url,
             data={},
-            timeout=(3, 8),
+            timeout=(2, 2),
         )
 
         if response.status_code != 200:
@@ -441,6 +442,12 @@ def perform_external_self_check():
     """
 
     now = now_utc()
+    # Даём боту 45 секунд после запуска на первые проверки.
+    uptime = time.time() - START_TIME
+
+    if uptime < 45:
+        return True, "Бот запускается"
+
     problems = []
 
     heartbeat_age = get_parser_heartbeat_age()
