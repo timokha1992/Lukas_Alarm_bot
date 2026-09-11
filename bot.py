@@ -692,10 +692,75 @@ def perform_external_self_check():
     return True, "Самопроверка пройдена"
 
 
+def perform_fast_internal_check():
+    """
+    Быстрая самопроверка ТОЛЬКО по внутреннему состоянию процесса,
+    без единого сетевого запроса наружу (без Telegram API, без
+    PSZSU, без monitor). Предназначена исключительно для
+    /external-check, который должен отвечать почти мгновенно,
+    чтобы не упираться в таймаут Cloudflare Worker'а.
+
+    В отличие от perform_external_self_check() (используется
+    /health), здесь НЕТ вызова telegram_api_fast_check() — именно
+    он был источником задержки в несколько секунд, которая
+    приводила к обрыву запроса по AbortController на стороне
+    Cloudflare.
+
+    Критерии те же по смыслу, что и раньше, но полностью
+    локальные:
+      - стартовый период (STARTUP_GRACE_SECONDS) — как и везде;
+      - жив ли поток парсера (parser_thread.is_alive());
+      - запущен ли парсер (state["parser_running"]);
+      - свежий ли heartbeat парсера.
+    """
+
+    with state_lock:
+        started_at = state["started_at"]
+        parser_running = state["parser_running"]
+
+    if (
+        started_at is None
+        or (
+            now_utc() - started_at
+        ).total_seconds()
+        < STARTUP_GRACE_SECONDS
+    ):
+        return True, "Стартовый период, самопроверка пропущена"
+
+    problems = []
+
+    if parser_thread is not None and not parser_thread.is_alive():
+        problems.append("поток парсера не работает")
+
+    if not parser_running:
+        problems.append("парсер не запущен")
+
+    heartbeat_age = get_parser_heartbeat_age()
+
+    if heartbeat_age is None:
+        problems.append("heartbeat парсера отсутствует")
+
+    elif heartbeat_age > PARSER_STALE_AFTER_SECONDS:
+        problems.append(
+            f"heartbeat парсера устарел ({int(heartbeat_age)} сек.)"
+        )
+
+    if problems:
+        return False, "; ".join(problems)
+
+    return True, "Самопроверка пройдена (без проверки Telegram API)"
+
+
 @app.route("/external-check")
 def external_check():
     """
     Защищённый endpoint для независимого внешнего контроля.
+
+    Должен отвечать почти мгновенно, поэтому использует только
+    perform_fast_internal_check() — без каких-либо сетевых
+    запросов наружу. Проверка доступности Telegram API осталась
+    только в /health (perform_external_self_check), который таким
+    таймингом не ограничен.
     """
 
     if not EXTERNAL_CHECK_TOKEN:
@@ -718,7 +783,7 @@ def external_check():
             "reason": "Unauthorized",
         }), 401
 
-    ok, reason = perform_external_self_check()
+    ok, reason = perform_fast_internal_check()
 
     payload = {
         "ok": ok,
