@@ -709,9 +709,18 @@ def perform_fast_internal_check():
     Критерии те же по смыслу, что и раньше, но полностью
     локальные:
       - стартовый период (STARTUP_GRACE_SECONDS) — как и везде;
-      - жив ли поток парсера (parser_thread.is_alive());
       - запущен ли парсер (state["parser_running"]);
       - свежий ли heartbeat парсера.
+
+    Важно: НЕ используется parser_thread.is_alive(). Ссылка на
+    объект потока, захваченная на уровне модуля, может стать
+    неактуальной после запуска/перезапуска (например, если
+    процесс-уровневый watchdog перезапускал поток или произошла
+    любая другая внутренняя пересборка), из-за чего is_alive()
+    ложно показывал "поток мёртв", хотя парсер реально работает
+    и heartbeat свежий. Источник истины — state["parser_running"]
+    (выставляется самим циклом парсера) и heartbeat-файл, а не
+    объект потока.
     """
 
     with state_lock:
@@ -728,9 +737,6 @@ def perform_fast_internal_check():
         return True, "Стартовый период, самопроверка пропущена"
 
     problems = []
-
-    if parser_thread is not None and not parser_thread.is_alive():
-        problems.append("поток парсера не работает")
 
     if not parser_running:
         problems.append("парсер не запущен")
