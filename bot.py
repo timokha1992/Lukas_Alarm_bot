@@ -265,7 +265,7 @@ MESSAGES = {
     # эмодзи и формулировки можно менять здесь свободно —
     # build_status_text() лишь вычисляет значения плейсхолдеров.
     "status_body": (
-        "🛠️{parser_icon}{telegram_icon}{pszsu_icon}{monitor_icon} {updated_at}\n"
+        "🛠️  {parser_icon}{telegram_icon}{pszsu_icon}{monitor_icon}  🕒 Последняя проверка {last_check}\n"
         "\n"
         "{parser_icon} {parser_label}: {parser_value}\n"
         "{telegram_icon} {telegram_label}: {telegram_value}\n"
@@ -275,7 +275,7 @@ MESSAGES = {
         "🔎 Ключевое слово: {keyword}\n"
         "⏱ Проверка: каждые {check_interval} сек.\n"
         "\n"
-        "🕐 Последняя проверка: {last_check}\n"
+        "🕒 Обновлено: {updated_at}\n"
         "🚨 Последняя тревога: {last_alert}\n"
         "\n"
         "{marker}"
@@ -536,32 +536,98 @@ def index():
 
 @app.route("/health")
 def health():
-    """
-    /health теперь использует ровно ту же модель определения
-    работоспособности, что и perform_external_self_check()
-    (см. /external-check ниже): тот же учёт STARTUP_GRACE_SECONDS
-    и те же реальные критерии аварии (heartbeat отсутствует/устарел,
-    parser не запущен, Telegram API недоступен). Временная
-    недоступность PSZSU или monitor (в т.ч. last_pszsu_check is
-    None / last_monitor_check is None) больше не считается
-    аварией и не может дать здесь ложный 503 — это диагностика
-    источника, а не здоровье процесса.
-    """
+    now = now_utc()
 
-    ok, reason = perform_external_self_check()
+    heartbeat_age = get_parser_heartbeat_age()
 
-    if ok:
+    with state_lock:
+        started_at = state["started_at"]
+        last_pszsu_check = state["last_pszsu_check"]
+        last_monitor_check = state["last_monitor_check"]
+
+    if started_at is None:
         return "OK", 200
 
-    print(
-        f"HEALTH 503: {reason}",
-        flush=True,
-    )
+    startup_age = (
+        now - started_at
+    ).total_seconds()
 
-    return (
-        f"NOT OK: {reason}",
-        503,
-    )
+    if startup_age < STARTUP_GRACE_SECONDS:
+        return "OK", 200
+
+    if heartbeat_age is None:
+        print(
+            "HEALTH 503: heartbeat отсутствует.",
+            flush=True,
+        )
+        return (
+            "NOT OK: parser heartbeat отсутствует",
+            503,
+        )
+
+    if heartbeat_age > PARSER_STALE_AFTER_SECONDS:
+        print(
+            "HEALTH 503: parser heartbeat устарел "
+            f"({int(heartbeat_age)} сек.).",
+            flush=True,
+        )
+        return (
+            "NOT OK: parser heartbeat устарел "
+            f"({int(heartbeat_age)} сек.)",
+            503,
+        )
+
+    if last_pszsu_check is None:
+        print(
+            "HEALTH 503: PSZSU ещё не был проверен.",
+            flush=True,
+        )
+        return (
+            "NOT OK: PSZSU ещё не проверен",
+            503,
+        )
+
+    if last_monitor_check is None:
+        print(
+            "HEALTH 503: monitor ещё не был проверен.",
+            flush=True,
+        )
+        return (
+            "NOT OK: monitor ещё не проверен",
+            503,
+        )
+
+    pszsu_age = (
+        now - last_pszsu_check
+    ).total_seconds()
+
+    monitor_age = (
+        now - last_monitor_check
+    ).total_seconds()
+
+    if pszsu_age > PARSER_STALE_AFTER_SECONDS:
+        print(
+            "HEALTH 503: последняя проверка PSZSU устарела "
+            f"({int(pszsu_age)} сек.).",
+            flush=True,
+        )
+        return (
+            "NOT OK: последняя проверка PSZSU устарела",
+            503,
+        )
+
+    if monitor_age > PARSER_STALE_AFTER_SECONDS:
+        print(
+            "HEALTH 503: последняя проверка monitor устарела "
+            f"({int(monitor_age)} сек.).",
+            flush=True,
+        )
+        return (
+            "NOT OK: последняя проверка monitor устарела",
+            503,
+        )
+
+    return "OK", 200
 
 
 # ============================================================
