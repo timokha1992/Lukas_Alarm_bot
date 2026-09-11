@@ -214,6 +214,17 @@ MESSAGES = {
         "Длительность сбоя: {duration}"
     ),
 
+    # Отправляется самим ботом (не Cloudflare), когда внешний
+    # Cloudflare Watchdog был в состоянии SUSPECTED (уже отправил
+    # предупреждение "Проверяю...") и получил успешный ответ от
+    # /external-check до перехода в DEAD. Вызывается ботом через
+    # защищённый endpoint /external-recovered.
+    "external_check_recovered_body": (
+        "🟢 ПРОВЕРКА ЗАВЕРШЕНА\n"
+        "\n"
+        "Со мной всё нормально."
+    ),
+
     "watchdog_recovery_reasons": {
         "parser": "Парсер снова выполняет проверки.",
         "pszsu": "Источник PSZSU снова доступен.",
@@ -265,7 +276,8 @@ MESSAGES = {
     # эмодзи и формулировки можно менять здесь свободно —
     # build_status_text() лишь вычисляет значения плейсхолдеров.
     "status_body": (
-        "  {parser_icon}{telegram_icon}{pszsu_icon}{monitor_icon}  🕒 Последняя проверка {last_check}\n"
+        "{marker}{parser_icon}{telegram_icon}{pszsu_icon}"
+        "{monitor_icon} Последнее обновление: {updated_at}\n"
         "\n"
         "{parser_icon} {parser_label}: {parser_value}\n"
         "{telegram_icon} {telegram_label}: {telegram_value}\n"
@@ -275,10 +287,8 @@ MESSAGES = {
         "🔎 Ключевое слово: {keyword}\n"
         "⏱ Проверка: каждые {check_interval} сек.\n"
         "\n"
-        "🕒 Обновлено: {updated_at}\n"
-        "🚨 Последняя тревога: {last_alert}\n"
-        "\n"
-        "{marker}"
+        "🕐 Последняя проверка: {last_check}\n"
+        "🚨 Последняя тревога: {last_alert}"
     ),
 }
 
@@ -536,98 +546,32 @@ def index():
 
 @app.route("/health")
 def health():
-    now = now_utc()
+    """
+    /health теперь использует ровно ту же модель определения
+    работоспособности, что и perform_external_self_check()
+    (см. /external-check ниже): тот же учёт STARTUP_GRACE_SECONDS
+    и те же реальные критерии аварии (heartbeat отсутствует/устарел,
+    parser не запущен, Telegram API недоступен). Временная
+    недоступность PSZSU или monitor (в т.ч. last_pszsu_check is
+    None / last_monitor_check is None) больше не считается
+    аварией и не может дать здесь ложный 503 — это диагностика
+    источника, а не здоровье процесса.
+    """
 
-    heartbeat_age = get_parser_heartbeat_age()
+    ok, reason = perform_external_self_check()
 
-    with state_lock:
-        started_at = state["started_at"]
-        last_pszsu_check = state["last_pszsu_check"]
-        last_monitor_check = state["last_monitor_check"]
-
-    if started_at is None:
+    if ok:
         return "OK", 200
 
-    startup_age = (
-        now - started_at
-    ).total_seconds()
+    print(
+        f"HEALTH 503: {reason}",
+        flush=True,
+    )
 
-    if startup_age < STARTUP_GRACE_SECONDS:
-        return "OK", 200
-
-    if heartbeat_age is None:
-        print(
-            "HEALTH 503: heartbeat отсутствует.",
-            flush=True,
-        )
-        return (
-            "NOT OK: parser heartbeat отсутствует",
-            503,
-        )
-
-    if heartbeat_age > PARSER_STALE_AFTER_SECONDS:
-        print(
-            "HEALTH 503: parser heartbeat устарел "
-            f"({int(heartbeat_age)} сек.).",
-            flush=True,
-        )
-        return (
-            "NOT OK: parser heartbeat устарел "
-            f"({int(heartbeat_age)} сек.)",
-            503,
-        )
-
-    if last_pszsu_check is None:
-        print(
-            "HEALTH 503: PSZSU ещё не был проверен.",
-            flush=True,
-        )
-        return (
-            "NOT OK: PSZSU ещё не проверен",
-            503,
-        )
-
-    if last_monitor_check is None:
-        print(
-            "HEALTH 503: monitor ещё не был проверен.",
-            flush=True,
-        )
-        return (
-            "NOT OK: monitor ещё не проверен",
-            503,
-        )
-
-    pszsu_age = (
-        now - last_pszsu_check
-    ).total_seconds()
-
-    monitor_age = (
-        now - last_monitor_check
-    ).total_seconds()
-
-    if pszsu_age > PARSER_STALE_AFTER_SECONDS:
-        print(
-            "HEALTH 503: последняя проверка PSZSU устарела "
-            f"({int(pszsu_age)} сек.).",
-            flush=True,
-        )
-        return (
-            "NOT OK: последняя проверка PSZSU устарела",
-            503,
-        )
-
-    if monitor_age > PARSER_STALE_AFTER_SECONDS:
-        print(
-            "HEALTH 503: последняя проверка monitor устарела "
-            f"({int(monitor_age)} сек.).",
-            flush=True,
-        )
-        return (
-            "NOT OK: последняя проверка monitor устарела",
-            503,
-        )
-
-    return "OK", 200
+    return (
+        f"NOT OK: {reason}",
+        503,
+    )
 
 
 # ============================================================
@@ -785,6 +729,54 @@ def external_check():
     }
 
     return jsonify(payload), 200 if ok else 503
+
+
+@app.route("/external-recovered", methods=["GET", "POST"])
+def external_recovered():
+    """
+    Задача №2 (ТЗ): связка Cloudflare Watchdog и бота.
+
+    Вызывается Cloudflare Watchdog в момент, когда он находился
+    в состоянии SUSPECTED (уже отправил "⚠️ ПРОВЕРКА СИСТЕМЫ")
+    и получил успешный ответ от /external-check до того, как
+    перейти в DEAD. Сам факт вызова этого endpoint означает, что
+    Cloudflare уже сбрасывает своё состояние обратно в NORMAL —
+    бот в ответ на это только один раз отправляет пользователю
+    "Со мной всё нормально".
+
+    Никак не связан с существующей логикой восстановления после
+    подтверждённой смерти (DEAD) — то сообщение ("Система
+    восстановлена") бот отправляет сам через свой внутренний
+    watchdog, и эта логика не меняется.
+
+    Защищён тем же токеном, что и /external-check.
+    """
+
+    if not EXTERNAL_CHECK_TOKEN:
+        return jsonify({
+            "ok": False,
+            "reason": "EXTERNAL_CHECK_TOKEN не настроен",
+        }), 503
+
+    supplied_token = request.headers.get(
+        "X-External-Check-Token",
+        "",
+    )
+
+    if not supplied_token or not secrets.compare_digest(
+        supplied_token,
+        EXTERNAL_CHECK_TOKEN,
+    ):
+        return jsonify({
+            "ok": False,
+            "reason": "Unauthorized",
+        }), 401
+
+    send_telegram_message(
+        MESSAGES["external_check_recovered_body"],
+    )
+
+    return jsonify({"ok": True}), 200
 
 
 # ============================================================
