@@ -265,7 +265,7 @@ MESSAGES = {
     # эмодзи и формулировки можно менять здесь свободно —
     # build_status_text() лишь вычисляет значения плейсхолдеров.
     "status_body": (
-        "🛠️  {parser_icon}{telegram_icon}{pszsu_icon}{monitor_icon}  🕒 Последняя проверка {last_check}\n"
+        "  {parser_icon}{telegram_icon}{pszsu_icon}{monitor_icon}  🕒 Последняя проверка {last_check}\n"
         "\n"
         "{parser_icon} {parser_label}: {parser_value}\n"
         "{telegram_icon} {telegram_label}: {telegram_value}\n"
