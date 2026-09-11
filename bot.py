@@ -38,6 +38,14 @@ PARSER_STALE_AFTER_SECONDS = 60
 FAILURE_NOTIFICATION_AFTER_SECONDS = 60
 STARTUP_GRACE_SECONDS = 90
 
+# Внутренний процесс-уровневый watchdog.
+# Не связан с Cloudflare Watchdog и ничего не пишет в Telegram.
+# Его единственная задача — обнаружить РЕАЛЬНУЮ гибель/зависание
+# фонового парсера и принудительно завершить процесс, чтобы
+# gunicorn поднял новый рабочий процесс автоматически.
+INTERNAL_WATCHDOG_INTERVAL_SECONDS = 20
+PROCESS_HANG_THRESHOLD_SECONDS = 120
+
 MAX_MESSAGE_AGE_MINUTES = 5
 MAX_SENT_MESSAGES = 1000
 
@@ -47,6 +55,231 @@ SOURCE_REQUEST_TIMEOUT = (5, 15)
 PARSER_HEARTBEAT_FILE = "/tmp/lukas_alarm_parser_heartbeat"
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+# ============================================================
+# ТЕКСТЫ И ШАБЛОНЫ СООБЩЕНИЙ
+# ============================================================
+#
+# Единый конфигурационный блок для ВСЕХ пользовательских текстов,
+# формулировок и оформления закреплённого сообщения.
+#
+# Правило: чтобы изменить текст, формулировку, эмодзи или порядок
+# строк в любом сообщении бота — правьте только словарь MESSAGES
+# ниже. Логика ниже по файлу (кто, когда и почему отправляет
+# сообщение) остаётся неизменной и не должна трогаться при
+# правках текста.
+#
+# Шаблоны используют Python str.format() с именованными
+# плейсхолдерами {в_фигурных_скобках}. Подставляемые значения
+# (например, текст поста из Telegram-канала) вставляются как
+# обычные строки и не интерпретируются как часть шаблона, даже
+# если сами содержат символы "{" или "}".
+
+MESSAGES = {
+
+    # --------------------------------------------------------
+    # Оперативные тревожные сообщения (PSZSU / monitor)
+    # --------------------------------------------------------
+
+    "alert_title_impact_confirmed": (
+        "🟡 внимание 🟡\n"
+        "\n"
+        "<b>ПОДТВЕРЖДЕНИЕ АТАКИ НА КРЕМЕНЧУГ / РАЙОН</b>"
+    ),
+
+    "alert_title_threat": (
+        "🚨 внимание 🚨\n"
+        "\n"
+        "<b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>"
+    ),
+
+    # {title} — один из alert_title_* выше.
+    # {source_link}, {source_name} — параметры источника (PSZSU/monitor).
+    # {escaped_text} — экранированный текст исходного поста.
+    "alert_body": (
+        "{title}\n"
+        "\n"
+        '<a href="{source_link}">📡 {source_name}</a>\n'
+        "\n"
+        "<blockquote><b>{escaped_text}</b></blockquote>"
+    ),
+
+    # --------------------------------------------------------
+    # Команда /test
+    # --------------------------------------------------------
+
+    "test_command_response": (
+        "🔔 ТЕСТОВОЕ УВЕДОМЛЕНИЕ\n"
+        "\n"
+        "Бот получил команду /test.\n"
+        "Связь с Telegram и рабочей группой проверена."
+    ),
+
+    # --------------------------------------------------------
+    # Watchdog: заголовки и формулировки по типу сбоя
+    # (parser / pszsu / monitor / telegram)
+    # --------------------------------------------------------
+
+    "watchdog_failure_titles": {
+        "parser": "🔴 ПРОБЛЕМА СИСТЕМЫ",
+        "pszsu": "🔴 ПРОБЛЕМА ИСТОЧНИКА PSZSU",
+        "monitor": "🔴 ПРОБЛЕМА ИСТОЧНИКА MONITOR",
+        "telegram": "🔴 ПРОБЛЕМА TELEGRAM API",
+        "default": "🔴 ПРОБЛЕМА СИСТЕМЫ",
+    },
+
+    # {reason} и {last_check} подставляются там, где присутствуют
+    # в конкретном шаблоне; лишние именованные аргументы str.format()
+    # игнорирует, поэтому шаблон "parser" ниже намеренно не использует
+    # {reason} (сохранено исходное поведение).
+    "watchdog_failure_details": {
+        "parser": (
+            "Парсер не выполняет проверки.\n"
+            "Последняя проверка: {last_check}\n"
+            "Причина: причина не определена."
+        ),
+        "pszsu": (
+            "Источник PSZSU временно недоступен "
+            "или произошла ошибка при его обработке.\n"
+            "Причина: {reason}"
+        ),
+        "monitor": (
+            "Источник monitor временно недоступен "
+            "или произошла ошибка при его обработке.\n"
+            "Причина: {reason}"
+        ),
+        "telegram": (
+            "Бот не может нормально связаться с Telegram Bot API.\n"
+            "Причина: {reason}"
+        ),
+    },
+
+    # {failure_title}, {details}, {threshold_seconds}
+    # Используется только для реальной гибели/неработоспособности
+    # самого бота (parser / telegram). Не используется для
+    # временной недоступности отдельного источника (pszsu / monitor).
+    "watchdog_failure_body": (
+        "{failure_title}\n"
+        "\n"
+        "⚠️ ВНИМАНИЕ!\n"
+        "\n"
+        "БОТ НЕ РАБОТАЕТ.\n"
+        "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
+        "\n"
+        "{details}\n"
+        "\n"
+        "Проблема длится более {threshold_seconds} секунд."
+    ),
+
+    # {recovery_reason}, {duration}
+    # Пара к watchdog_failure_body: восстановление именно
+    # самого бота (parser / telegram).
+    "watchdog_recovery_body": (
+        "🟢 СИСТЕМА ВОССТАНОВЛЕНА\n"
+        "\n"
+        "✅ БОТ СНОВА АКТИВЕН.\n"
+        "НА ЕГО УВЕДОМЛЕНИЯ СНОВА МОЖНО РАССЧИТЫВАТЬ.\n"
+        "\n"
+        "{recovery_reason}\n"
+        "Длительность сбоя: {duration}"
+    ),
+
+    # {failure_title}, {details}, {threshold_seconds}
+    # Используется для временной недоступности отдельного
+    # источника (pszsu / monitor). Это диагностика источника,
+    # а не сообщение о гибели бота, и не должно пересекаться
+    # по смыслу с сообщениями Cloudflare Watchdog.
+    "watchdog_source_issue_body": (
+        "{failure_title}\n"
+        "\n"
+        "ℹ️ ДИАГНОСТИКА ИСТОЧНИКА\n"
+        "\n"
+        "Источник временно недоступен "
+        "или обработан с ошибкой.\n"
+        "Сам бот продолжает работать.\n"
+        "\n"
+        "{details}\n"
+        "\n"
+        "Проблема длится более {threshold_seconds} секунд."
+    ),
+
+    # {recovery_reason}, {duration}
+    # Пара к watchdog_source_issue_body: восстановление
+    # доступности отдельного источника.
+    "watchdog_source_recovery_body": (
+        "🟢 ИСТОЧНИК ВОССТАНОВЛЕН\n"
+        "\n"
+        "{recovery_reason}\n"
+        "Длительность сбоя: {duration}"
+    ),
+
+    "watchdog_recovery_reasons": {
+        "parser": "Парсер снова выполняет проверки.",
+        "pszsu": "Источник PSZSU снова доступен.",
+        "monitor": "Источник monitor снова доступен.",
+        "telegram": "Telegram Bot API снова доступен.",
+    },
+
+    "watchdog_failure_reasons": {
+        "parser": "Парсер не обновляет heartbeat.",
+        "pszsu": (
+            "Источник PSZSU не отвечает или произошла ошибка "
+            "при его обработке."
+        ),
+        "monitor": (
+            "Источник monitor не отвечает или произошла ошибка "
+            "при его обработке."
+        ),
+        "telegram": (
+            "Telegram Bot API не отвечает или возвращает ошибку."
+        ),
+    },
+
+    # --------------------------------------------------------
+    # Закреплённое сообщение о состоянии системы
+    # --------------------------------------------------------
+
+    # Невидимый технический маркер для того, чтобы бот узнавал
+    # своё собственное закреплённое сообщение после перезапуска.
+    # Не показывается пользователю, но является частью оформления
+    # закреплённого сообщения — поэтому вынесен именно сюда.
+    "status_marker": "\u200b\u200bLUKAS_STATUS_MARKER\u200b",
+
+    "icon_ok": "🟢",
+    "icon_error": "🔴",
+
+    "status_value_alive": "РАБОТАЕТ",
+    "status_value_dead": "НЕТ ПРОВЕРКИ",
+    "status_value_ok": "OK",
+    "status_value_error": "ОШИБКА",
+
+    "status_labels": {
+        "parser": "Парсер",
+        "telegram": "Telegram API",
+        "pszsu": "Источник PSZSU",
+        "monitor": "Источник monitor",
+    },
+
+    # Полный шаблон закреплённого сообщения. Порядок строк,
+    # эмодзи и формулировки можно менять здесь свободно —
+    # build_status_text() лишь вычисляет значения плейсхолдеров.
+    "status_body": (
+        "{marker}{parser_icon}{telegram_icon}{pszsu_icon}"
+        "{monitor_icon} Последнее обновление: {updated_at}\n"
+        "\n"
+        "{parser_icon} {parser_label}: {parser_value}\n"
+        "{telegram_icon} {telegram_label}: {telegram_value}\n"
+        "{pszsu_icon} {pszsu_label}: {pszsu_value}\n"
+        "{monitor_icon} {monitor_label}: {monitor_value}\n"
+        "\n"
+        "🔎 Ключевое слово: {keyword}\n"
+        "⏱ Проверка: каждые {check_interval} сек.\n"
+        "\n"
+        "🕐 Последняя проверка: {last_check}\n"
+        "🚨 Последняя тревога: {last_alert}"
+    ),
+}
 
 
 # ============================================================
@@ -219,6 +452,16 @@ def format_time(dt):
         return "—"
 
 
+def format_time_hm(dt):
+    if not dt:
+        return "—"
+
+    try:
+        return dt.astimezone(KYIV_TZ).strftime("%H:%M")
+    except Exception:
+        return "—"
+
+
 def format_duration(seconds):
     if seconds is None:
         return "—"
@@ -292,98 +535,32 @@ def index():
 
 @app.route("/health")
 def health():
-    now = now_utc()
+    """
+    /health теперь использует ровно ту же модель определения
+    работоспособности, что и perform_external_self_check()
+    (см. /external-check ниже): тот же учёт STARTUP_GRACE_SECONDS
+    и те же реальные критерии аварии (heartbeat отсутствует/устарел,
+    parser не запущен, Telegram API недоступен). Временная
+    недоступность PSZSU или monitor (в т.ч. last_pszsu_check is
+    None / last_monitor_check is None) больше не считается
+    аварией и не может дать здесь ложный 503 — это диагностика
+    источника, а не здоровье процесса.
+    """
 
-    heartbeat_age = get_parser_heartbeat_age()
+    ok, reason = perform_external_self_check()
 
-    with state_lock:
-        started_at = state["started_at"]
-        last_pszsu_check = state["last_pszsu_check"]
-        last_monitor_check = state["last_monitor_check"]
-
-    if started_at is None:
+    if ok:
         return "OK", 200
 
-    startup_age = (
-        now - started_at
-    ).total_seconds()
+    print(
+        f"HEALTH 503: {reason}",
+        flush=True,
+    )
 
-    if startup_age < STARTUP_GRACE_SECONDS:
-        return "OK", 200
-
-    if heartbeat_age is None:
-        print(
-            "HEALTH 503: heartbeat отсутствует.",
-            flush=True,
-        )
-        return (
-            "NOT OK: parser heartbeat отсутствует",
-            503,
-        )
-
-    if heartbeat_age > PARSER_STALE_AFTER_SECONDS:
-        print(
-            "HEALTH 503: parser heartbeat устарел "
-            f"({int(heartbeat_age)} сек.).",
-            flush=True,
-        )
-        return (
-            "NOT OK: parser heartbeat устарел "
-            f"({int(heartbeat_age)} сек.)",
-            503,
-        )
-
-    if last_pszsu_check is None:
-        print(
-            "HEALTH 503: PSZSU ещё не был проверен.",
-            flush=True,
-        )
-        return (
-            "NOT OK: PSZSU ещё не проверен",
-            503,
-        )
-
-    if last_monitor_check is None:
-        print(
-            "HEALTH 503: monitor ещё не был проверен.",
-            flush=True,
-        )
-        return (
-            "NOT OK: monitor ещё не проверен",
-            503,
-        )
-
-    pszsu_age = (
-        now - last_pszsu_check
-    ).total_seconds()
-
-    monitor_age = (
-        now - last_monitor_check
-    ).total_seconds()
-
-    if pszsu_age > PARSER_STALE_AFTER_SECONDS:
-        print(
-            "HEALTH 503: последняя проверка PSZSU устарела "
-            f"({int(pszsu_age)} сек.).",
-            flush=True,
-        )
-        return (
-            "NOT OK: последняя проверка PSZSU устарела",
-            503,
-        )
-
-    if monitor_age > PARSER_STALE_AFTER_SECONDS:
-        print(
-            "HEALTH 503: последняя проверка monitor устарела "
-            f"({int(monitor_age)} сек.).",
-            flush=True,
-        )
-        return (
-            "NOT OK: последняя проверка monitor устарела",
-            503,
-        )
-
-    return "OK", 200
+    return (
+        f"NOT OK: {reason}",
+        503,
+    )
 
 
 # ============================================================
@@ -438,19 +615,42 @@ def telegram_api_fast_check():
 def perform_external_self_check():
     """
     Немедленная самопроверка по запросу внешнего контроля.
+
+    Исправление №1 (ТЗ): использует ту же стартовую логику,
+    что и /health. Во время STARTUP_GRACE_SECONDS бот не может
+    считаться аварийным.
+
+    Правильные критерии смерти процесса (и только они):
+      - heartbeat парсера отсутствует;
+      - heartbeat парсера слишком старый;
+      - parser не запущен;
+      - Telegram API действительно недоступен.
+
+    Временная недоступность отдельного источника
+    (last_pszsu_check is None, last_monitor_check is None,
+    pszsu_ok == False, monitor_ok == False) сама по себе НЕ
+    считается смертью бота — это диагностика источника, а не
+    авария процесса, и не должна использоваться этой функцией.
     """
 
-    now = now_utc()
+    with state_lock:
+        started_at = state["started_at"]
+
+    if (
+        started_at is None
+        or (
+            now_utc() - started_at
+        ).total_seconds()
+        < STARTUP_GRACE_SECONDS
+    ):
+        return True, "Стартовый период, самопроверка пропущена"
+
     problems = []
 
     heartbeat_age = get_parser_heartbeat_age()
 
     with state_lock:
         parser_running = state["parser_running"]
-        pszsu_ok = state["pszsu_ok"]
-        monitor_ok = state["monitor_ok"]
-        last_pszsu_check = state["last_pszsu_check"]
-        last_monitor_check = state["last_monitor_check"]
 
     if not parser_running:
         problems.append("парсер не запущен")
@@ -461,32 +661,6 @@ def perform_external_self_check():
     elif heartbeat_age > PARSER_STALE_AFTER_SECONDS:
         problems.append(
             f"heartbeat парсера устарел ({int(heartbeat_age)} сек.)"
-        )
-
-
-    elif (
-        now - last_pszsu_check
-    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
-        problems.append(
-            "последняя проверка PSZSU устарела"
-        )
-
-
-    elif (
-        now - last_monitor_check
-    ).total_seconds() > PARSER_STALE_AFTER_SECONDS:
-        problems.append(
-            "последняя проверка monitor устарела"
-        )
-
-    if not pszsu_ok:
-        problems.append(
-            "PSZSU сейчас недоступен или обработан с ошибкой"
-        )
-
-    if not monitor_ok:
-        problems.append(
-            "monitor сейчас недоступен или обработан с ошибкой"
         )
 
     telegram_ok, telegram_reason = telegram_api_fast_check()
@@ -711,6 +885,14 @@ def test_telegram_api():
 # WATCHDOG
 # ============================================================
 
+# Типы сбоев, относящиеся к отдельному источнику данных, а не
+# к смерти самого бота. Недоступность источника — это
+# диагностика источника (Исправление №3 ТЗ), она использует
+# отдельные шаблоны сообщений и не должна звучать как
+# "бот не работает".
+SOURCE_FAILURE_TYPES = ("pszsu", "monitor")
+
+
 def set_failure_state(
     failure_type,
     reason,
@@ -800,57 +982,32 @@ def watchdog_send_failure(
     if duration < FAILURE_NOTIFICATION_AFTER_SECONDS:
         return
 
-    titles = {
-        "parser": "🔴 ПРОБЛЕМА СИСТЕМЫ",
-        "pszsu": "🔴 ПРОБЛЕМА ИСТОЧНИКА PSZSU",
-        "monitor": "🔴 ПРОБЛЕМА ИСТОЧНИКА MONITOR",
-        "telegram": "🔴 ПРОБЛЕМА TELEGRAM API",
-    }
+    failure_title = MESSAGES["watchdog_failure_titles"].get(
+        failure_type,
+        MESSAGES["watchdog_failure_titles"]["default"],
+    )
 
-    if failure_type == "parser":
-        details = (
-            "Парсер не выполняет проверки.\n"
-            f"Последняя проверка: "
-            f"{format_time(last_check)}\n"
-            "Причина: причина не определена."
+    detail_template = MESSAGES["watchdog_failure_details"].get(
+        failure_type
+    )
+
+    if detail_template:
+        details = detail_template.format(
+            reason=reason,
+            last_check=format_time(last_check),
         )
-
-    elif failure_type == "pszsu":
-        details = (
-            "Источник PSZSU временно недоступен "
-            "или произошла ошибка при его обработке.\n"
-            f"Причина: {reason}"
-        )
-
-    elif failure_type == "monitor":
-        details = (
-            "Источник monitor временно недоступен "
-            "или произошла ошибка при его обработке.\n"
-            f"Причина: {reason}"
-        )
-
-    elif failure_type == "telegram":
-        details = (
-            "Бот не может нормально связаться "
-            "с Telegram Bot API.\n"
-            f"Причина: {reason}"
-        )
-
     else:
         details = reason
 
-    text = (
-        f"{titles.get(failure_type, '🔴 ПРОБЛЕМА СИСТЕМЫ')}\n"
-        "\n"
-        "⚠️ ВНИМАНИЕ!\n"
-        "\n"
-        "БОТ НЕ РАБОТАЕТ.\n"
-        "НА ЕГО УВЕДОМЛЕНИЯ НЕЛЬЗЯ РАССЧИТЫВАТЬ.\n"
-        "\n"
-        f"{details}\n"
-        "\n"
-        f"Проблема длится более "
-        f"{FAILURE_NOTIFICATION_AFTER_SECONDS} секунд."
+    if failure_type in SOURCE_FAILURE_TYPES:
+        body_template = MESSAGES["watchdog_source_issue_body"]
+    else:
+        body_template = MESSAGES["watchdog_failure_body"]
+
+    text = body_template.format(
+        failure_title=failure_title,
+        details=details,
+        threshold_seconds=FAILURE_NOTIFICATION_AFTER_SECONDS,
     )
 
     message_id = send_telegram_message(
@@ -896,15 +1053,14 @@ def watchdog_check_recovery(
         now_utc() - since
     ).total_seconds()
 
-    text = (
-        "🟢 СИСТЕМА ВОССТАНОВЛЕНА\n"
-        "\n"
-        "✅ БОТ СНОВА АКТИВЕН.\n"
-        "НА ЕГО УВЕДОМЛЕНИЯ СНОВА МОЖНО РАССЧИТЫВАТЬ.\n"
-        "\n"
-        f"{recovery_reason}\n"
-        f"Длительность сбоя: "
-        f"{format_duration(duration)}"
+    if failure_type in SOURCE_FAILURE_TYPES:
+        body_template = MESSAGES["watchdog_source_recovery_body"]
+    else:
+        body_template = MESSAGES["watchdog_recovery_body"]
+
+    text = body_template.format(
+        recovery_reason=recovery_reason,
+        duration=format_duration(duration),
     )
 
     message_id = send_telegram_message(
@@ -985,18 +1141,18 @@ def watchdog_loop():
             if parser_alive:
                 watchdog_check_recovery(
                     "parser",
-                    "Парсер снова выполняет проверки.",
+                    MESSAGES["watchdog_recovery_reasons"]["parser"],
                 )
 
             else:
                 set_failure_state(
                     "parser",
-                    "Парсер не обновляет heartbeat.",
+                    MESSAGES["watchdog_failure_reasons"]["parser"],
                 )
 
                 watchdog_send_failure(
                     "parser",
-                    "Парсер не обновляет heartbeat.",
+                    MESSAGES["watchdog_failure_reasons"]["parser"],
                 )
 
             # ------------------------------------------------
@@ -1006,22 +1162,18 @@ def watchdog_loop():
             if pszsu_ok:
                 watchdog_check_recovery(
                     "pszsu",
-                    "Источник PSZSU снова доступен.",
+                    MESSAGES["watchdog_recovery_reasons"]["pszsu"],
                 )
 
             else:
                 set_failure_state(
                     "pszsu",
-                    "Источник PSZSU не отвечает "
-                    "или произошла ошибка "
-                    "при его обработке.",
+                    MESSAGES["watchdog_failure_reasons"]["pszsu"],
                 )
 
                 watchdog_send_failure(
                     "pszsu",
-                    "Источник PSZSU не отвечает "
-                    "или произошла ошибка "
-                    "при его обработке.",
+                    MESSAGES["watchdog_failure_reasons"]["pszsu"],
                 )
 
             # ------------------------------------------------
@@ -1031,22 +1183,18 @@ def watchdog_loop():
             if monitor_ok:
                 watchdog_check_recovery(
                     "monitor",
-                    "Источник monitor снова доступен.",
+                    MESSAGES["watchdog_recovery_reasons"]["monitor"],
                 )
 
             else:
                 set_failure_state(
                     "monitor",
-                    "Источник monitor не отвечает "
-                    "или произошла ошибка "
-                    "при его обработке.",
+                    MESSAGES["watchdog_failure_reasons"]["monitor"],
                 )
 
                 watchdog_send_failure(
                     "monitor",
-                    "Источник monitor не отвечает "
-                    "или произошла ошибка "
-                    "при его обработке.",
+                    MESSAGES["watchdog_failure_reasons"]["monitor"],
                 )
 
             # ------------------------------------------------
@@ -1056,20 +1204,18 @@ def watchdog_loop():
             if telegram_api_ok:
                 watchdog_check_recovery(
                     "telegram",
-                    "Telegram Bot API снова доступен.",
+                    MESSAGES["watchdog_recovery_reasons"]["telegram"],
                 )
 
             else:
                 set_failure_state(
                     "telegram",
-                    "Telegram Bot API не отвечает "
-                    "или возвращает ошибку.",
+                    MESSAGES["watchdog_failure_reasons"]["telegram"],
                 )
 
                 watchdog_send_failure(
                     "telegram",
-                    "Telegram Bot API не отвечает "
-                    "или возвращает ошибку.",
+                    MESSAGES["watchdog_failure_reasons"]["telegram"],
                 )
 
         except Exception as e:
@@ -1087,10 +1233,6 @@ def watchdog_loop():
 # ============================================================
 # PINNED STATUS
 # ============================================================
-
-STATUS_TITLE_MARKER = (
-    "🛠️ СОСТОЯНИЕ СИСТЕМЫ"
-)
 
 
 def get_pinned_message_id():
@@ -1122,7 +1264,7 @@ def get_pinned_message_id():
             "",
         )
 
-        if STATUS_TITLE_MARKER in text:
+        if MESSAGES["status_marker"] in text:
             return message_id
 
     except Exception as e:
@@ -1172,83 +1314,78 @@ def build_status_text():
         <= PARSER_STALE_AFTER_SECONDS
     )
 
+    icon_ok = MESSAGES["icon_ok"]
+    icon_error = MESSAGES["icon_error"]
+
     parser_icon = (
-        "🟢"
+        icon_ok
         if parser_alive
-        else "🔴"
+        else icon_error
     )
 
     parser_text = (
-        "РАБОТАЕТ"
+        MESSAGES["status_value_alive"]
         if parser_alive
-        else "НЕТ ПРОВЕРКИ"
+        else MESSAGES["status_value_dead"]
     )
 
     telegram_icon = (
-        "🟢"
+        icon_ok
         if telegram_api_ok
-        else "🔴"
+        else icon_error
     )
 
     telegram_text = (
-        "OK"
+        MESSAGES["status_value_ok"]
         if telegram_api_ok
-        else "ОШИБКА"
+        else MESSAGES["status_value_error"]
     )
 
     pszsu_icon = (
-        "🟢"
+        icon_ok
         if pszsu_ok
-        else "🔴"
+        else icon_error
     )
 
     pszsu_text = (
-        "OK"
+        MESSAGES["status_value_ok"]
         if pszsu_ok
-        else "ОШИБКА"
+        else MESSAGES["status_value_error"]
     )
 
     monitor_icon = (
-        "🟢"
+        icon_ok
         if monitor_ok
-        else "🔴"
+        else icon_error
     )
 
     monitor_text = (
-        "OK"
+        MESSAGES["status_value_ok"]
         if monitor_ok
-        else "ОШИБКА"
+        else MESSAGES["status_value_error"]
     )
 
-    title = (
-        f"{parser_icon}"
-        f"{telegram_icon}"
-        f"{pszsu_icon}"
-        f"{monitor_icon} "
-        f"{STATUS_TITLE_MARKER}"
-    )
+    labels = MESSAGES["status_labels"]
 
-    return (
-        f"{title}\n"
-        "\n"
-        f"{parser_icon} Парсер: "
-        f"{parser_text}\n"
-        f"{telegram_icon} Telegram API: "
-        f"{telegram_text}\n"
-        f"{pszsu_icon} Источник PSZSU: "
-        f"{pszsu_text}\n"
-        f"{monitor_icon} Источник monitor: "
-        f"{monitor_text}\n"
-        "\n"
-        f"🔎 Ключевое слово: "
-        f"{KEYWORD}\n"
-        f"⏱ Проверка: каждые "
-        f"{CHECK_INTERVAL_SECONDS} сек.\n"
-        "\n"
-        f"🕐 Последняя проверка: "
-        f"{format_time(last_check)}\n"
-        f"🚨 Последняя тревога: "
-        f"{format_time(last_alert)}"
+    return MESSAGES["status_body"].format(
+        marker=MESSAGES["status_marker"],
+        parser_icon=parser_icon,
+        telegram_icon=telegram_icon,
+        pszsu_icon=pszsu_icon,
+        monitor_icon=monitor_icon,
+        updated_at=format_time_hm(now_utc()),
+        parser_label=labels["parser"],
+        parser_value=parser_text,
+        telegram_label=labels["telegram"],
+        telegram_value=telegram_text,
+        pszsu_label=labels["pszsu"],
+        pszsu_value=pszsu_text,
+        monitor_label=labels["monitor"],
+        monitor_value=monitor_text,
+        keyword=KEYWORD,
+        check_interval=CHECK_INTERVAL_SECONDS,
+        last_check=format_time(last_check),
+        last_alert=format_time(last_alert),
     )
 
 
@@ -1400,17 +1537,48 @@ def handle_test_command(message):
         flush=True,
     )
 
-    test_text = (
-        "🔔 ТЕСТОВОЕ УВЕДОМЛЕНИЕ\n"
-        "\n"
-        "Бот получил команду /test.\n"
-        "Связь с Telegram и рабочей "
-        "группой проверена."
+    send_telegram_message(
+        MESSAGES["test_command_response"]
     )
 
-    send_telegram_message(
-        test_text
+
+def delete_service_message(message):
+    """
+    Удаляет служебное сообщение Telegram о том, что
+    участник присоединился к группе или покинул её.
+    Другие сообщения этой функцией не затрагиваются.
+    """
+
+    chat = message.get(
+        "chat",
+        {},
     )
+
+    chat_id = chat.get(
+        "id"
+    )
+
+    message_id = message.get(
+        "message_id"
+    )
+
+    if chat_id != CHAT_ID or not message_id:
+        return
+
+    result = telegram_request(
+        "deleteMessage",
+        {
+            "chat_id": CHAT_ID,
+            "message_id": message_id,
+        },
+    )
+
+    if result:
+        print(
+            "Удалено служебное сообщение "
+            f"(message_id={message_id}).",
+            flush=True,
+        )
 
 
 def telegram_command_listener():
@@ -1495,6 +1663,16 @@ def telegram_command_listener():
                 )
 
                 if not message:
+                    continue
+
+                if message.get(
+                    "new_chat_members"
+                ) or message.get(
+                    "left_chat_member"
+                ):
+                    delete_service_message(
+                        message
+                    )
                     continue
 
                 text = message.get(
@@ -1803,29 +1981,16 @@ def build_alert_text(
     )
 
     if classification == "IMPACT_CONFIRMED":
-        title = (
-            "🟡 внимание 🟡\n"
-            "\n"
-            "<b>ПОДТВЕРЖДЕНИЕ АТАКИ "
-            "НА КРЕМЕНЧУГ / РАЙОН</b>"
-        )
+        title = MESSAGES["alert_title_impact_confirmed"]
 
     else:
-        title = (
-            "🚨 внимание 🚨\n"
-            "\n"
-            "<b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>"
-        )
+        title = MESSAGES["alert_title_threat"]
 
-    return (
-        f"{title}\n"
-        "\n"
-        f'<a href="{source_link}">📡 '
-        f"{source_name}</a>\n"
-        "\n"
-        f"<blockquote><b>"
-        f"{escaped_text}"
-        f"</b></blockquote>"
+    return MESSAGES["alert_body"].format(
+        title=title,
+        source_link=source_link,
+        source_name=source_name,
+        escaped_text=escaped_text,
     )
 
 
@@ -2232,6 +2397,161 @@ def run_bot():
 
 
 # ============================================================
+# ВНУТРЕННИЙ WATCHDOG ПРОЦЕССА
+# ============================================================
+#
+# Отдельная функция от watchdog_loop() выше.
+# watchdog_loop() — это "внешний" по смыслу контроль состояния
+# источников/Telegram API, который шлёт уведомления в чат.
+#
+# internal_process_watchdog_loop() — это внутренний контроль
+# самого процесса. Он НИЧЕГО не пишет в Telegram и не меняет
+# ни архитектуру, ни Gunicorn, ни Render, ни интервалы парсера.
+#
+# Его задача — то, что описано в ТЗ как "Внутренний Watchdog
+# (Render)": следить за heartbeat парсера и за живостью
+# критических потоков, и при обнаружении РЕАЛЬНОЙ гибели/
+# зависания принудительно завершить процесс (os._exit).
+# После этого gunicorn (worker=1) сам поднимает новый рабочий
+# процесс — без участия Render и без изменения его настроек.
+# Это устраняет ситуацию "Render показывает Live, а бот мёртв".
+
+def internal_process_watchdog_loop():
+    print(
+        "Запущен внутренний watchdog процесса",
+        flush=True,
+    )
+
+    # Исправление №2 (ТЗ): двухэтапная проверка.
+    #
+    # Проблема обнаруживается на цикле N, состояние
+    # запоминается, но процесс НЕ завершается сразу.
+    # На следующем цикле (через INTERNAL_WATCHDOG_INTERVAL_SECONDS)
+    # проблема перепроверяется, и только если она подтвердилась
+    # повторно — выполняется os._exit(1).
+    #
+    # Это относится отдельно к потокам и отдельно к heartbeat.
+    suspected_dead_threads = set()
+    heartbeat_suspected = False
+
+    while True:
+        try:
+            with state_lock:
+                started_at = state["started_at"]
+
+            if (
+                started_at is None
+                or (
+                    now_utc() - started_at
+                ).total_seconds()
+                < STARTUP_GRACE_SECONDS
+            ):
+                # На старте ещё нет смысла копить подозрения.
+                suspected_dead_threads = set()
+                heartbeat_suspected = False
+
+                time.sleep(
+                    INTERNAL_WATCHDOG_INTERVAL_SECONDS
+                )
+                continue
+
+            # ----------------------------------------------
+            # Проверка живости критических потоков.
+            # Этап 1: обнаружить. Этап 2 (следующий цикл):
+            # подтвердить и только тогда завершить процесс.
+            # ----------------------------------------------
+
+            critical_threads = (
+                ("telegram-monitor", parser_thread),
+                ("status-updater", status_thread),
+                ("system-watchdog", watchdog_thread),
+                ("telegram-commands", commands_thread),
+            )
+
+            currently_dead_threads = set()
+
+            for thread_name, thread_obj in critical_threads:
+                if (
+                    thread_obj is not None
+                    and not thread_obj.is_alive()
+                ):
+                    currently_dead_threads.add(thread_name)
+
+            confirmed_dead_threads = (
+                currently_dead_threads
+                & suspected_dead_threads
+            )
+
+            if confirmed_dead_threads:
+                print(
+                    "ВНУТРЕННИЙ WATCHDOG: поток(и) "
+                    f"{sorted(confirmed_dead_threads)} "
+                    "подтверждённо мертвы повторной проверкой. "
+                    "Принудительное завершение процесса "
+                    "для автоматического перезапуска.",
+                    flush=True,
+                )
+                os._exit(1)
+
+            if currently_dead_threads:
+                print(
+                    "ВНУТРЕННИЙ WATCHDOG: обнаружена возможная "
+                    f"проблема с потоком(и) {sorted(currently_dead_threads)}. "
+                    "Будет перепроверено на следующем цикле "
+                    f"({INTERNAL_WATCHDOG_INTERVAL_SECONDS} сек.).",
+                    flush=True,
+                )
+
+            suspected_dead_threads = currently_dead_threads
+
+            # ----------------------------------------------
+            # Проверка реального зависания парсера
+            # по heartbeat-файлу. Та же двухэтапная логика.
+            # ----------------------------------------------
+
+            heartbeat_age = get_parser_heartbeat_age()
+
+            heartbeat_problem_now = (
+                heartbeat_age is not None
+                and heartbeat_age
+                > PROCESS_HANG_THRESHOLD_SECONDS
+            )
+
+            if heartbeat_problem_now and heartbeat_suspected:
+                print(
+                    "ВНУТРЕННИЙ WATCHDOG: heartbeat парсера "
+                    f"устарел на {int(heartbeat_age)} сек. "
+                    "Зависание подтверждено повторной проверкой. "
+                    "Принудительное завершение процесса "
+                    "для автоматического перезапуска.",
+                    flush=True,
+                )
+                os._exit(1)
+
+            if heartbeat_problem_now:
+                print(
+                    "ВНУТРЕННИЙ WATCHDOG: обнаружено возможное "
+                    f"зависание heartbeat ({int(heartbeat_age)} сек.). "
+                    "Будет перепроверено на следующем цикле "
+                    f"({INTERNAL_WATCHDOG_INTERVAL_SECONDS} сек.).",
+                    flush=True,
+                )
+
+            heartbeat_suspected = heartbeat_problem_now
+
+        except Exception as e:
+            print(
+                "Ошибка внутреннего watchdog процесса: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+        time.sleep(
+            INTERNAL_WATCHDOG_INTERVAL_SECONDS
+        )
+
+
+# ============================================================
 # ЗАПУСК ФОНОВЫХ ПОТОКОВ
 # ============================================================
 
@@ -2269,6 +2589,15 @@ commands_thread = threading.Thread(
 )
 
 commands_thread.start()
+
+
+internal_watchdog_thread = threading.Thread(
+    target=internal_process_watchdog_loop,
+    name="internal-process-watchdog",
+    daemon=True,
+)
+
+internal_watchdog_thread.start()
 
 
 # ============================================================
