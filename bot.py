@@ -277,8 +277,8 @@ MESSAGES = {
     # эмодзи и формулировки можно менять здесь свободно —
     # build_status_text() лишь вычисляет значения плейсхолдеров.
     "status_body": (
-        "{last_check} 🕐  Последняя проверка  "
-        "{parser_icon}{telegram_icon}{pszsu_icon}{monitor_icon}\n"
+        "{last_check} 🕐 Последняя проверка   "
+        "{parser_icon} {telegram_icon} {pszsu_icon} {monitor_icon}\n"
         "\n"
         "{parser_icon} {parser_label}: {parser_value}\n"
         "<i>(обрабатывает сообщения и ищет информацию об угрозах)</i>\n"
@@ -1174,7 +1174,6 @@ def watchdog_send_failure(
 
     message_id = send_telegram_message(
         text,
-        parse_mode="HTML",
     )
 
     if message_id:
@@ -1425,16 +1424,41 @@ def get_pinned_message_id():
         text = pinned.get(
             "text",
             "",
+        ) or pinned.get(
+            "caption",
+            "",
         )
 
-        # Узнаём как старую версию закреплённого статуса,
-        # так и новую. После первого обновления старый технический
-        # маркер исчезнет из текста.
+        # Сначала пытаемся точно распознать наше сообщение состояния.
+        # Пробелы и переносы строк не должны влиять на распознавание.
+        normalized_text = " ".join(
+            str(text).split()
+        ).lower()
+
+        status_phrase = (
+            "последняя проверка" in normalized_text
+            and "отслеживание угроз для города кременчуг"
+            in normalized_text
+        )
+
         if (
-            MESSAGES["status_marker"] in text
-            or "🕐 Последняя проверка" in text
+            MESSAGES["status_marker"] in str(text)
+            or status_phrase
         ):
             return message_id
+
+        # В нашей рабочей группе закреплено именно сообщение состояния.
+        # Если Telegram вернул закреплённое сообщение, но его текст по
+        # какой-либо причине не распознался (например, после изменения
+        # форматирования), НЕ создаём новое сообщение. Используем уже
+        # существующее закрепление. Это предотвращает дублирование и
+        # повторное закрепление при перезапуске Render.
+        print(
+            "Закреплённое сообщение найдено, но его текст не распознан. "
+            "Используется существующее сообщение без создания нового.",
+            flush=True,
+        )
+        return message_id
 
     except Exception as e:
         print(
