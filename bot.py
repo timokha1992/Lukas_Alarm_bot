@@ -466,6 +466,19 @@ state_lock = threading.Lock()
 # догоняющие попытки) не запускают несколько одновременных
 # попыток отправки одного и того же UP-сообщения. Не связан с
 # state_lock и не используется больше нигде в боте.
+#
+# ВАЖНО (исправление зависания "already in progress"):
+# ответственность за release() этого лока может передаваться
+# из обработчика /external-recovered в фоновый поток
+# _external_recovery_background_retry(). Раньше эта передача не
+# была защищена try/finally: если между захватом лока и стартом
+# фонового потока происходило любое непредвиденное исключение,
+# лок оставался заблокированным НАВСЕГДА (освобождать его после
+# этого было уже некому), и все последующие вызовы
+# /external-recovered бесконечно получали 503 "recovery send
+# already in progress". Теперь вся секция обёрнута в
+# try/except/finally с явным флагом handed_off — см.
+# external_recovered().
 external_recovery_lock = threading.Lock()
 
 
@@ -859,7 +872,7 @@ def send_telegram_message_recovery_fast(text):
     timeout. Обычный send_telegram_message() использует
     telegram_request(), рассчитанный на фоновые циклы — до 3
     попыток с таймаутом REQUEST_TIMEOUT = (5, 35) и паузами между
-    попытками, то есть один вызов в худшем случае может занять
+    попытками, то есть один вызов в худшем случае может занимать
     более 100 секунд. Из-за этого при медленном ответе Telegram
     сразу после рестарта Render запрос Cloudflare обрывался по
     таймауту раньше, чем telegram_request() успевал завершиться,
@@ -997,10 +1010,12 @@ def _external_recovery_background_retry():
     используется и не изменяется.
 
     Лок external_recovery_lock захватывается вызывающим кодом
-    (в external_recovered()) и освобождается здесь же, в finally,
-    после первого успеха либо после исчерпания всех попыток —
-    это гарантирует, что одновременно выполняется не более одной
-    цепочки попыток доставки recovery-сообщения.
+    (в external_recovered(), только когда этот поток УСПЕШНО
+    запущен — см. флаг handed_off там) и освобождается здесь же,
+    в finally, после первого успеха либо после исчерпания всех
+    попыток — это гарантирует, что владение локом однозначно
+    находится либо у обработчика запроса, либо у этого потока,
+    но никогда не "теряется" между ними.
     """
 
     try:
@@ -1093,11 +1108,30 @@ def external_recovered():
         при параллельно работающих догоняющих попытках наружу
         уйдёт не более одного сообщения UP на один инцидент.
 
+    ИСПРАВЛЕНИЕ (утечка лока / вечные 503 "already in progress"):
+    раньше секция между acquire() лока и либо его release(), либо
+    стартом фонового потока-владельца НЕ была защищена
+    try/finally. Если между этими точками возникало любое
+    непредвиденное исключение (например, ошибка при старте
+    threading.Thread из-за нехватки системных ресурсов сразу
+    после рестарта Render), лок оставался захваченным навсегда —
+    освобождать его после этого было уже некому, и все
+    последующие вызовы /external-recovered бесконечно получали
+    503 "recovery send already in progress". Теперь вся секция
+    обёрнута в try/except/finally с явным флагом handed_off:
+    если фоновый поток успешно запущен, ответственность за
+    release() переходит к нему (как и раньше); в любом другом
+    случае (ошибка старта потока, любое другое исключение) —
+    лок release()-ится прямо здесь, в finally этого обработчика.
+    Владелец лока в любой момент времени определён однозначно.
+
     Результат отправки по-прежнему проверяется явно: 200
     возвращается только если сообщение реально ушло (получен
     message_id) или уже было отправлено недавно по этому же
     инциденту; 502 — если быстрая попытка не удалась (при этом
-    запускаются фоновые повторы).
+    запускаются фоновые повторы); 500 — если внутри обработчика
+    произошла непредвиденная ошибка (лок при этом всё равно
+    гарантированно освобождается).
 
     Защищён тем же токеном, что и /external-check.
     """
@@ -1154,45 +1188,93 @@ def external_recovered():
             "reason": "recovery send already in progress",
         }), 503
 
-    message_id = send_telegram_message_recovery_fast(
-        MESSAGES["external_check_recovered_body"],
-    )
+    # С этого момента лок захвачен именно этим запросом.
+    # handed_off отслеживает, кто отвечает за release():
+    #   False -> сам этот обработчик, в блоке finally ниже;
+    #   True  -> фоновый поток _external_recovery_background_retry(),
+    #            который уже успешно запущен.
+    # Ровно один из этих путей release()-ит лок ровно один раз.
+    handed_off = False
 
-    if message_id:
-        _mark_external_recovery_sent()
-        external_recovery_lock.release()
+    try:
+        message_id = send_telegram_message_recovery_fast(
+            MESSAGES["external_check_recovered_body"],
+        )
+
+        if message_id:
+            _mark_external_recovery_sent()
+
+            print(
+                "ОТПРАВЛЕНО СООБЩЕНИЕ О ВОССТАНОВЛЕНИИ "
+                "(/external-recovered).",
+                flush=True,
+            )
+
+            return jsonify({"ok": True}), 200
 
         print(
-            "ОТПРАВЛЕНО СООБЩЕНИЕ О ВОССТАНОВЛЕНИИ "
-            "(/external-recovered).",
+            "ОШИБКА /external-recovered: не удалось отправить "
+            "сообщение о восстановлении в Telegram с первой быстрой "
+            "попытки. Запускаю фоновые повторные попытки.",
             flush=True,
         )
 
-        return jsonify({"ok": True}), 200
+        try:
+            threading.Thread(
+                target=_external_recovery_background_retry,
+                name="external-recovery-retry",
+                daemon=True,
+            ).start()
 
-    print(
-        "ОШИБКА /external-recovered: не удалось отправить "
-        "сообщение о восстановлении в Telegram с первой быстрой "
-        "попытки. Запускаю фоновые повторные попытки.",
-        flush=True,
-    )
+            # Поток успешно стартовал — теперь именно он владеет
+            # локом и обязан освободить его в своём finally.
+            handed_off = True
 
-    # Лок НЕ освобождается здесь — это сделает
-    # _external_recovery_background_retry() после успеха или
-    # исчерпания попыток. Это и есть однопоточная гарантия
-    # "не более одной цепочки доставки одновременно".
-    threading.Thread(
-        target=_external_recovery_background_retry,
-        name="external-recovery-retry",
-        daemon=True,
-    ).start()
+        except Exception as thread_error:
+            # Не удалось даже запустить фоновый поток. handed_off
+            # остаётся False, поэтому лок release()-ится ниже, в
+            # finally этого обработчика — иначе он остался бы
+            # заблокированным навсегда (это и была причина
+            # исходного бага).
+            print(
+                "ОШИБКА /external-recovered: не удалось запустить "
+                "фоновый поток повторных попыток: "
+                f"{type(thread_error).__name__}: {thread_error}",
+                flush=True,
+            )
 
-    return jsonify({
-        "ok": False,
-        "reason": (
-            "Telegram sendMessage failed, retrying in background"
-        ),
-    }), 502
+        return jsonify({
+            "ok": False,
+            "reason": (
+                "Telegram sendMessage failed, retrying in background"
+                if handed_off
+                else (
+                    "Telegram sendMessage failed, background retry "
+                    "could not start"
+                )
+            ),
+        }), 502
+
+    except Exception as e:
+        # Любое другое непредвиденное исключение внутри критической
+        # секции. Раньше именно такой случай приводил к тому, что
+        # лок оставался захваченным навсегда и /external-recovered
+        # бесконечно отвечал 503 "already in progress". Теперь он
+        # гарантированно освобождается в finally ниже.
+        print(
+            "ОШИБКА /external-recovered: непредвиденное исключение "
+            f"внутри обработчика: {type(e).__name__}: {e}",
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": False,
+            "reason": f"internal error: {type(e).__name__}: {e}",
+        }), 500
+
+    finally:
+        if not handed_off:
+            external_recovery_lock.release()
 
 
 # ============================================================
