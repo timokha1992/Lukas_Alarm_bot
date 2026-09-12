@@ -52,6 +52,31 @@ MAX_SENT_MESSAGES = 1000
 REQUEST_TIMEOUT = (5, 35)
 SOURCE_REQUEST_TIMEOUT = (5, 15)
 
+# Короткий таймаут исключительно для быстрой изолированной
+# отправки recovery-сообщения в /external-recovered.
+# Не используется нигде больше и никак не влияет на
+# REQUEST_TIMEOUT / telegram_request().
+RECOVERY_TELEGRAM_TIMEOUT = (3, 5)
+
+# Если recovery-сообщение уже было успешно отправлено недавно —
+# повторный вызов /external-recovered (например, если Cloudflare
+# Watchdog сам повторяет запрос после 502) не должен создавать
+# второе сообщение UP. Окно намеренно небольшое: реальный новый
+# инцидент DOWN->UP физически не может произойти настолько быстро
+# после предыдущего восстановления (см. FAILURE_NOTIFICATION_AFTER_SECONDS
+# и интервалы проверок), а Cloudflare-ретраи одного и того же
+# события укладываются в это окно.
+EXTERNAL_RECOVERY_DEDUP_WINDOW_SECONDS = 60
+
+# Если самая первая быстрая попытка отправки recovery-сообщения
+# не удалась (например, сеть/Telegram ещё не готовы сразу после
+# автоматического рестарта Render), выполняются несколько
+# ДОГОНЯЮЩИХ попыток в фоне, не блокируя ответ Cloudflare Watchdog.
+# Каждая попытка — это тот же самый короткий одиночный запрос
+# (send_telegram_message_recovery_fast), без telegram_request().
+EXTERNAL_RECOVERY_RETRY_ATTEMPTS = 3
+EXTERNAL_RECOVERY_RETRY_DELAY_SECONDS = 5
+
 PARSER_HEARTBEAT_FILE = "/tmp/lukas_alarm_parser_heartbeat"
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -424,9 +449,24 @@ state = {
 
     "status_message_id": None,
     "started_at": None,
+
+    # Момент последней УСПЕШНОЙ отправки recovery-сообщения через
+    # /external-recovered. Используется только для дедупликации
+    # UP-сообщений (см. EXTERNAL_RECOVERY_DEDUP_WINDOW_SECONDS) и
+    # никак не пересекается с parser/pszsu/monitor/telegram
+    # failure-состояниями выше.
+    "last_external_recovery_sent_at": None,
 }
 
 state_lock = threading.Lock()
+
+# Отдельный лок для recovery-доставки в /external-recovered.
+# Гарантирует, что параллельные вызовы этого endpoint (например,
+# повтор со стороны Cloudflare Watchdog после 502, или фоновые
+# догоняющие попытки) не запускают несколько одновременных
+# попыток отправки одного и того же UP-сообщения. Не связан с
+# state_lock и не используется больше нигде в боте.
+external_recovery_lock = threading.Lock()
 
 
 # ============================================================
@@ -809,6 +849,204 @@ def external_check():
     return jsonify(payload), 200 if ok else 503
 
 
+def send_telegram_message_recovery_fast(text):
+    """
+    Быстрая, полностью изолированная отправка Telegram-сообщения,
+    предназначенная ИСКЛЮЧИТЕЛЬНО для /external-recovered.
+
+    Причина существования этой функции: /external-recovered
+    вызывается Cloudflare Watchdog, у которого короткий fetch
+    timeout. Обычный send_telegram_message() использует
+    telegram_request(), рассчитанный на фоновые циклы — до 3
+    попыток с таймаутом REQUEST_TIMEOUT = (5, 35) и паузами между
+    попытками, то есть один вызов в худшем случае может занять
+    более 100 секунд. Из-за этого при медленном ответе Telegram
+    сразу после рестарта Render запрос Cloudflare обрывался по
+    таймауту раньше, чем telegram_request() успевал завершиться,
+    и recovery-сообщение не уходило.
+
+    По аналогии с уже существующей telegram_api_fast_check() —
+    один запрос, короткий таймаут, без повторных попыток.
+
+    ВАЖНО: эта функция НЕ использует telegram_request() и НЕ
+    используется больше нигде в боте. send_telegram_message() и
+    telegram_request() остаются полностью без изменений и
+    по-прежнему используются для тревог, /test, статуса и
+    остальных Watchdog-уведомлений.
+
+    Возвращает message_id при успешной отправке или None при
+    ошибке. Успех/ошибка однозначно логируются (без токенов).
+    """
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text,
+    }
+
+    try:
+        response = session.post(
+            url,
+            data=data,
+            timeout=RECOVERY_TELEGRAM_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            print(
+                "RECOVERY TELEGRAM FAILED: "
+                f"HTTP {response.status_code}",
+                flush=True,
+            )
+            return None
+
+        try:
+            result = response.json()
+        except Exception as e:
+            print(
+                "RECOVERY TELEGRAM FAILED: "
+                f"не удалось разобрать ответ Telegram: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+            return None
+
+        if not result.get("ok"):
+            print(
+                "RECOVERY TELEGRAM FAILED: "
+                "Telegram Bot API вернул ошибку "
+                f"(error_code={result.get('error_code')}, "
+                f"description={result.get('description')})",
+                flush=True,
+            )
+            return None
+
+        message_id = result.get("result", {}).get("message_id")
+
+        if not message_id:
+            print(
+                "RECOVERY TELEGRAM FAILED: "
+                "ответ Telegram не содержит message_id",
+                flush=True,
+            )
+            return None
+
+        print(
+            f"RECOVERY TELEGRAM SENT (message_id={message_id})",
+            flush=True,
+        )
+
+        return message_id
+
+    except Exception as e:
+        print(
+            "RECOVERY TELEGRAM FAILED: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+        return None
+
+
+def _mark_external_recovery_sent():
+    with state_lock:
+        state["last_external_recovery_sent_at"] = now_utc()
+
+
+def _external_recovery_recently_sent():
+    """
+    True, если recovery-сообщение уже было успешно отправлено в
+    пределах EXTERNAL_RECOVERY_DEDUP_WINDOW_SECONDS. Используется
+    для защиты от повторного UP-сообщения по одному и тому же
+    инциденту (см. docstring external_recovered()).
+    """
+
+    with state_lock:
+        last_sent = state["last_external_recovery_sent_at"]
+
+    if last_sent is None:
+        return False
+
+    return (
+        now_utc() - last_sent
+    ).total_seconds() < EXTERNAL_RECOVERY_DEDUP_WINDOW_SECONDS
+
+
+def _external_recovery_background_retry():
+    """
+    Догоняющие попытки отправки recovery-сообщения ПОСЛЕ того,
+    как самая первая быстрая попытка внутри /external-recovered
+    не удалась.
+
+    Зачем это нужно: после автоматического рестарта Render HTTP
+    endpoint может начать отвечать раньше, чем полностью
+    восстановится сетевое окружение процесса (например, исходящие
+    запросы к Telegram API временно нестабильны в первые секунды
+    после рестарта). Раньше единственная быстрая попытка отправки
+    recovery была одноразовой без какого-либо запасного варианта:
+    при её неудаче сообщение UP терялось насовсем, пока не
+    случался и не разрешался ещё один отдельный DOWN/UP-инцидент.
+
+    Работает полностью в фоне, отдельным демон-потоком, и НИКАК
+    не влияет на HTTP-ответ, который Cloudflare Watchdog уже
+    получил (502) — таймаут Cloudflare этим потоком не
+    затрагивается.
+
+    Каждая попытка — это та же самая короткая изолированная
+    функция send_telegram_message_recovery_fast() (один запрос,
+    короткий timeout). telegram_request() здесь по-прежнему не
+    используется и не изменяется.
+
+    Лок external_recovery_lock захватывается вызывающим кодом
+    (в external_recovered()) и освобождается здесь же, в finally,
+    после первого успеха либо после исчерпания всех попыток —
+    это гарантирует, что одновременно выполняется не более одной
+    цепочки попыток доставки recovery-сообщения.
+    """
+
+    try:
+        for attempt in range(1, EXTERNAL_RECOVERY_RETRY_ATTEMPTS + 1):
+            time.sleep(EXTERNAL_RECOVERY_RETRY_DELAY_SECONDS)
+
+            if _external_recovery_recently_sent():
+                # Успех уже случился — например, эта же цепочка
+                # успела отправить сообщение на предыдущей
+                # итерации до записи состояния, либо (в теории)
+                # параллельный путь уже всё отправил.
+                return
+
+            message_id = send_telegram_message_recovery_fast(
+                MESSAGES["external_check_recovered_body"],
+            )
+
+            if message_id:
+                _mark_external_recovery_sent()
+
+                print(
+                    "RECOVERY TELEGRAM SENT "
+                    f"(фоновая попытка №{attempt}, "
+                    f"message_id={message_id})",
+                    flush=True,
+                )
+
+                return
+
+            print(
+                "RECOVERY TELEGRAM FAILED "
+                f"(фоновая попытка №{attempt} из "
+                f"{EXTERNAL_RECOVERY_RETRY_ATTEMPTS})",
+                flush=True,
+            )
+
+        print(
+            "RECOVERY TELEGRAM FAILED: все фоновые повторные "
+            "попытки отправки recovery-сообщения исчерпаны.",
+            flush=True,
+        )
+
+    finally:
+        external_recovery_lock.release()
+
+
 @app.route("/external-recovered", methods=["GET", "POST"])
 def external_recovered():
     """
@@ -822,16 +1060,44 @@ def external_recovered():
     этом сам НИЧЕГО не пишет в Telegram про восстановление,
     сообщение отправляет именно bot.py.
 
-    ИСПРАВЛЕНИЕ: раньше HTTP 200 возвращался сразу после вызова
-    send_telegram_message(), без проверки её результата. Если
-    отправка в Telegram по какой-то причине не удавалась (ошибка
-    Telegram API, временная сетевая проблема на Render сразу
-    после рестарта и т.п.), эндпоинт всё равно тихо отвечал 200 —
-    и в логах это было неотличимо от настоящего успеха. Теперь
-    результат отправки проверяется явно: 200 возвращается только
-    если сообщение реально ушло (send_telegram_message() вернула
-    message_id), иначе — 502 с понятной причиной в JSON и записью
-    в лог, без утечки токенов.
+    ИСПРАВЛЕНИЕ (быстрая отправка, сохранено без изменений):
+    раньше отправка recovery-сообщения шла через
+    send_telegram_message() -> telegram_request(), у которой в
+    худшем случае (несколько попыток по 35 секунд с паузами)
+    вызов мог занимать более 100 секунд. Cloudflare Watchdog
+    вызывает этот endpoint с коротким fetch timeout, поэтому
+    запрос обрывался раньше, чем telegram_request() успевал
+    закончить попытки, и recovery-сообщение не доходило до
+    группы, хотя сам POST на /external-recovered в логах Render
+    был виден (200 OK). Для этого конкретного endpoint по-прежнему
+    используется отдельная быстрая функция
+    send_telegram_message_recovery_fast() — один короткий запрос,
+    без длинных повторных попыток. send_telegram_message() и
+    telegram_request() не изменены и продолжают использоваться
+    везде, кроме этого места.
+
+    ДОПОЛНЕНИЕ (автоматический рестарт Render): единственной
+    быстрой попытки достаточно в подавляющем большинстве случаев,
+    но сразу после автоматического рестарта Render сетевой доступ
+    к Telegram API может на секунды остаться нестабильным уже
+    ПОСЛЕ того, как HTTP endpoint начал отвечать. Чтобы не терять
+    recovery-сообщение в этом случае:
+      - если первая быстрая попытка не удалась, запускается
+        несколько догоняющих попыток в фоне (см.
+        _external_recovery_background_retry()), не задерживая
+        ответ Cloudflare Watchdog;
+      - защита от дублей (EXTERNAL_RECOVERY_DEDUP_WINDOW_SECONDS +
+        external_recovery_lock) гарантирует, что даже при
+        повторных вызовах этого endpoint (например, если
+        Cloudflare Watchdog сам повторяет запрос после 502) или
+        при параллельно работающих догоняющих попытках наружу
+        уйдёт не более одного сообщения UP на один инцидент.
+
+    Результат отправки по-прежнему проверяется явно: 200
+    возвращается только если сообщение реально ушло (получен
+    message_id) или уже было отправлено недавно по этому же
+    инциденту; 502 — если быстрая попытка не удалась (при этом
+    запускаются фоновые повторы).
 
     Защищён тем же токеном, что и /external-check.
     """
@@ -856,29 +1122,77 @@ def external_recovered():
             "reason": "Unauthorized",
         }), 401
 
-    message_id = send_telegram_message(
-        MESSAGES["external_check_recovered_body"],
-    )
-
-    if not message_id:
+    if _external_recovery_recently_sent():
         print(
-            "ОШИБКА /external-recovered: не удалось отправить "
-            "сообщение о восстановлении в Telegram.",
+            "/external-recovered: recovery-сообщение уже было "
+            "отправлено недавно по этому инциденту — повторная "
+            "отправка пропущена (защита от дублей).",
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": True,
+            "reason": "recovery already sent recently",
+        }), 200
+
+    acquired = external_recovery_lock.acquire(timeout=1.5)
+
+    if not acquired:
+        # Отправка recovery уже выполняется прямо сейчас — либо
+        # синхронно по параллельному вызову, либо фоновыми
+        # повторными попытками. Новую попытку не запускаем, чтобы
+        # не отправить дублирующее сообщение.
+        print(
+            "/external-recovered: отправка recovery уже "
+            "выполняется параллельно — новая попытка не "
+            "запускается.",
             flush=True,
         )
 
         return jsonify({
             "ok": False,
-            "reason": "Telegram sendMessage failed",
-        }), 502
+            "reason": "recovery send already in progress",
+        }), 503
+
+    message_id = send_telegram_message_recovery_fast(
+        MESSAGES["external_check_recovered_body"],
+    )
+
+    if message_id:
+        _mark_external_recovery_sent()
+        external_recovery_lock.release()
+
+        print(
+            "ОТПРАВЛЕНО СООБЩЕНИЕ О ВОССТАНОВЛЕНИИ "
+            "(/external-recovered).",
+            flush=True,
+        )
+
+        return jsonify({"ok": True}), 200
 
     print(
-        "ОТПРАВЛЕНО СООБЩЕНИЕ О ВОССТАНОВЛЕНИИ "
-        "(/external-recovered).",
+        "ОШИБКА /external-recovered: не удалось отправить "
+        "сообщение о восстановлении в Telegram с первой быстрой "
+        "попытки. Запускаю фоновые повторные попытки.",
         flush=True,
     )
 
-    return jsonify({"ok": True}), 200
+    # Лок НЕ освобождается здесь — это сделает
+    # _external_recovery_background_retry() после успеха или
+    # исчерпания попыток. Это и есть однопоточная гарантия
+    # "не более одной цепочки доставки одновременно".
+    threading.Thread(
+        target=_external_recovery_background_retry,
+        name="external-recovery-retry",
+        daemon=True,
+    ).start()
+
+    return jsonify({
+        "ok": False,
+        "reason": (
+            "Telegram sendMessage failed, retrying in background"
+        ),
+    }), 502
 
 
 # ============================================================
