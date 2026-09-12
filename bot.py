@@ -215,14 +215,15 @@ MESSAGES = {
     ),
 
     # Отправляется самим ботом (не Cloudflare), когда внешний
-    # Cloudflare Watchdog был в состоянии SUSPECTED (уже отправил
-    # предупреждение "Проверяю...") и получил успешный ответ от
-    # /external-check до перехода в DEAD. Вызывается ботом через
-    # защищённый endpoint /external-recovered.
+    # Cloudflare Watchdog обнаружил восстановление (переход из
+    # SUSPECTED или из DEAD обратно в NORMAL) и вызвал защищённый
+    # endpoint /external-recovered.
     "external_check_recovered_body": (
-        "🟢 ПРОВЕРКА ЗАВЕРШЕНА\n"
+        "✅ СИСТЕМА РАБОТАЕТ\n"
         "\n"
-        "Со мной всё нормально."
+        "🔰 Диагностика системы проведена.\n"
+        "\n"
+        "🔰 Сообщения об угрозах доступны."
     ),
 
     "watchdog_recovery_reasons": {
@@ -276,18 +277,24 @@ MESSAGES = {
     # эмодзи и формулировки можно менять здесь свободно —
     # build_status_text() лишь вычисляет значения плейсхолдеров.
     "status_body": (
-        "{marker}{parser_icon}{telegram_icon}{pszsu_icon}"
-        "{monitor_icon} Последнее обновление: {updated_at}\n"
+        "{last_check} 🕐 Последняя проверка   "
+        "{parser_icon} {telegram_icon} {pszsu_icon} {monitor_icon}\n"
         "\n"
         "{parser_icon} {parser_label}: {parser_value}\n"
-        "{telegram_icon} {telegram_label}: {telegram_value}\n"
-        "{pszsu_icon} {pszsu_label}: {pszsu_value}\n"
-        "{monitor_icon} {monitor_label}: {monitor_value}\n"
+        "<i>(обрабатывает сообщения и ищет информацию об угрозах)</i>\n"
         "\n"
-        "🔎 Ключевое слово: {keyword}\n"
+        "{telegram_icon} {telegram_label}: {telegram_value}\n"
+        "<i>(обеспечивает связь бота с Telegram)</i>\n"
+        "\n"
+        "{pszsu_icon} {pszsu_label}: {pszsu_value}\n"
+        "<i>(получает сообщения с официального источника)</i>\n"
+        "\n"
+        "{monitor_icon} {monitor_label}: {monitor_value}\n"
+        "<i>(получает данные из дополнительного источника)</i>\n"
+        "\n"
+        "🔎 Отслеживание угроз для города Кременчуг\n"
         "⏱ Проверка: каждые {check_interval} сек.\n"
         "\n"
-        "🕐 Последняя проверка: {last_check}\n"
         "🚨 Последняя тревога: {last_alert}"
     ),
 }
@@ -805,20 +812,26 @@ def external_check():
 @app.route("/external-recovered", methods=["GET", "POST"])
 def external_recovered():
     """
-    Задача №2 (ТЗ): связка Cloudflare Watchdog и бота.
+    Связка Cloudflare Watchdog и бота.
 
-    Вызывается Cloudflare Watchdog в момент, когда он находился
-    в состоянии SUSPECTED (уже отправил "⚠️ ПРОВЕРКА СИСТЕМЫ")
-    и получил успешный ответ от /external-check до того, как
-    перейти в DEAD. Сам факт вызова этого endpoint означает, что
-    Cloudflare уже сбрасывает своё состояние обратно в NORMAL —
-    бот в ответ на это только один раз отправляет пользователю
-    "Со мной всё нормально".
+    Вызывается Cloudflare Watchdog в момент, когда он обнаружил
+    восстановление внешней проверки — как при переходе
+    SUSPECTED -> NORMAL, так и при переходе DEAD -> NORMAL. Сам
+    факт вызова этого endpoint означает, что Cloudflare Watchdog
+    уже сбросил своё состояние обратно в NORMAL — Watchdog при
+    этом сам НИЧЕГО не пишет в Telegram про восстановление,
+    сообщение отправляет именно bot.py.
 
-    Никак не связан с существующей логикой восстановления после
-    подтверждённой смерти (DEAD) — то сообщение ("Система
-    восстановлена") бот отправляет сам через свой внутренний
-    watchdog, и эта логика не меняется.
+    ИСПРАВЛЕНИЕ: раньше HTTP 200 возвращался сразу после вызова
+    send_telegram_message(), без проверки её результата. Если
+    отправка в Telegram по какой-то причине не удавалась (ошибка
+    Telegram API, временная сетевая проблема на Render сразу
+    после рестарта и т.п.), эндпоинт всё равно тихо отвечал 200 —
+    и в логах это было неотличимо от настоящего успеха. Теперь
+    результат отправки проверяется явно: 200 возвращается только
+    если сообщение реально ушло (send_telegram_message() вернула
+    message_id), иначе — 502 с понятной причиной в JSON и записью
+    в лог, без утечки токенов.
 
     Защищён тем же токеном, что и /external-check.
     """
@@ -843,8 +856,26 @@ def external_recovered():
             "reason": "Unauthorized",
         }), 401
 
-    send_telegram_message(
+    message_id = send_telegram_message(
         MESSAGES["external_check_recovered_body"],
+    )
+
+    if not message_id:
+        print(
+            "ОШИБКА /external-recovered: не удалось отправить "
+            "сообщение о восстановлении в Telegram.",
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": False,
+            "reason": "Telegram sendMessage failed",
+        }), 502
+
+    print(
+        "ОТПРАВЛЕНО СООБЩЕНИЕ О ВОССТАНОВЛЕНИИ "
+        "(/external-recovered).",
+        flush=True,
     )
 
     return jsonify({"ok": True}), 200
@@ -996,6 +1027,7 @@ def edit_telegram_message(
             "chat_id": CHAT_ID,
             "message_id": message_id,
             "text": text,
+            "parse_mode": "HTML",
         },
     )
 
@@ -1142,6 +1174,7 @@ def watchdog_send_failure(
 
     message_id = send_telegram_message(
         text,
+        parse_mode="HTML",
     )
 
     if message_id:
@@ -1394,7 +1427,13 @@ def get_pinned_message_id():
             "",
         )
 
-        if MESSAGES["status_marker"] in text:
+        # Узнаём как старую версию закреплённого статуса,
+        # так и новую. После первого обновления старый технический
+        # маркер исчезнет из текста.
+        if (
+            MESSAGES["status_marker"] in text
+            or "🕐 Последняя проверка" in text
+        ):
             return message_id
 
     except Exception as e:
@@ -1537,6 +1576,7 @@ def ensure_status_message():
 
     message_id = send_telegram_message(
         text,
+        parse_mode="HTML",
     )
 
     if not message_id:
