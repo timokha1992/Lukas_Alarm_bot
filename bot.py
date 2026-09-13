@@ -58,14 +58,6 @@ SOURCE_REQUEST_TIMEOUT = (5, 15)
 # REQUEST_TIMEOUT / telegram_request().
 RECOVERY_TELEGRAM_TIMEOUT = (3, 5)
 
-# Короткий таймаут для нового изолированного вызова
-# notify_watchdog_of_message_id() (bot.py -> Cloudflare Worker).
-# По аналогии с RECOVERY_TELEGRAM_TIMEOUT: один быстрый запрос без
-# повторных попыток, чтобы не задерживать ни путь
-# /external-recovered, ни фоновые попытки
-# _external_recovery_background_retry().
-WATCHDOG_CALLBACK_TIMEOUT = (3, 5)
-
 # Если recovery-сообщение уже было успешно отправлено недавно —
 # повторный вызов /external-recovered (например, если Cloudflare
 # Watchdog сам повторяет запрос после 502) не должен создавать
@@ -424,53 +416,6 @@ try:
 except ValueError:
     raise RuntimeError("CHAT_ID должен быть числом")
 
-# ------------------------------------------------------------
-# WATCHDOG_WORKER_URL (опционально)
-# ------------------------------------------------------------
-#
-# Базовый URL Cloudflare Worker (например,
-# "https://lukas-alarm-watchdog.<account>.workers.dev"), используемый
-# ИСКЛЮЧИТЕЛЬНО для одного нового вызова —
-# notify_watchdog_of_message_id() (см. ниже) — который сообщает
-# Durable Object новый message_id зелёного сообщения
-# "🟢 СИСТЕМА РАБОТАЕТ" после его успешной отправки, включая случай,
-# когда сообщение успешно отправлено именно
-# _external_recovery_background_retry() уже ПОСЛЕ того, как первый
-# (быстрый) HTTP-ответ на /external-recovered ушёл к Cloudflare
-# Watchdog с ошибкой (502).
-#
-# Это единственная причина существования этой переменной и функции
-# notify_watchdog_of_message_id(). Она не используется больше нигде:
-# /health, /external-check, /external-recovered (его существующий
-# контракт запроса/ответа), external_recovery_lock, handed_off,
-# дедуп-окно и вся остальная логика бота от неё не зависят и
-# продолжают работать без изменений, даже если эта переменная не
-# задана.
-#
-# Если переменная не задана, notify_watchdog_of_message_id() просто
-# ничего не делает — ничего не ломается. Однако в этом случае
-# Durable Object может в редких случаях не узнать message_id
-# зелёного сообщения, отправленного именно фоновой попыткой, из-за
-# чего следующее WARNING/DEAD от Cloudflare Watchdog не сможет
-# удалить это зелёное сообщение. Поэтому для полного устранения
-# этой проблемы переменную рекомендуется задать.
-WATCHDOG_WORKER_URL = os.getenv("WATCHDOG_WORKER_URL")
-
-if not WATCHDOG_WORKER_URL:
-    print(
-        "ПРЕДУПРЕЖДЕНИЕ: переменная окружения WATCHDOG_WORKER_URL "
-        "не задана. Durable Object может не узнать message_id "
-        "зелёного сообщения '🟢 СИСТЕМА РАБОТАЕТ' в случае, если оно "
-        "было отправлено фоновой попыткой "
-        "(_external_recovery_background_retry()) уже ПОСЛЕ того, как "
-        "первый (быстрый) вызов /external-recovered вернул ошибку. "
-        "Это не влияет ни на одну другую часть системы — "
-        "рекомендуется задать WATCHDOG_WORKER_URL, чтобы полностью "
-        "устранить возможность появления в чате более одного "
-        "актуального служебного сообщения одновременно.",
-        flush=True,
-    )
-
 
 # ============================================================
 # СОСТОЯНИЕ
@@ -511,18 +456,6 @@ state = {
     # никак не пересекается с parser/pszsu/monitor/telegram
     # failure-состояниями выше.
     "last_external_recovery_sent_at": None,
-
-    # message_id ЕДИНСТВЕННОГО актуального служебного сообщения
-    # Watchdog (предупреждение / авария / восстановление —
-    # parser, pszsu, monitor, telegram, а также сообщение,
-    # отправляемое через /external-recovered). Не путать с
-    # status_message_id — это отдельный, закреплённый вечный
-    # индикатор состояния «🛠️ СОСТОЯНИЕ СИСТЕМЫ», который эта
-    # доработка не затрагивает. Перед отправкой нового служебного
-    # сообщения Watchdog всегда удаляется сообщение с этим
-    # message_id (если оно ещё есть), чтобы в чате в любой момент
-    # существовало не более одного такого сообщения.
-    "watchdog_service_message_id": None,
 }
 
 state_lock = threading.Lock()
@@ -1027,127 +960,6 @@ def send_telegram_message_recovery_fast(text):
         return None
 
 
-def delete_telegram_message_fast(message_id):
-    """
-    Быстрое, полностью изолированное удаление одного Telegram-
-    сообщения. По духу — аналог send_telegram_message_recovery_fast():
-    один короткий запрос, без повторных попыток, короткий таймаут
-    RECOVERY_TELEGRAM_TIMEOUT.
-
-    Используется ИСКЛЮЧИТЕЛЬНО в пути /external-recovered (сам
-    обработчик и его фоновые догоняющие попытки), чтобы удалить
-    предыдущее служебное сообщение Watchdog перед отправкой
-    "✅ СИСТЕМА РАБОТАЕТ" — не задерживая при этом ответ Cloudflare
-    Watchdog обычным telegram_request().
-
-    Ошибка удаления (в том числе "message to delete not found",
-    если сообщение уже было удалено кем-то ещё) НЕ считается
-    фатальной: вызывающий код в любом случае должен отправить
-    новое сообщение.
-    """
-
-    if not message_id:
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
-
-    try:
-        session.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "message_id": message_id,
-            },
-            timeout=RECOVERY_TELEGRAM_TIMEOUT,
-        )
-
-    except Exception as e:
-        print(
-            "Не удалось быстро удалить предыдущее служебное "
-            f"сообщение Watchdog (message_id={message_id}), "
-            f"работа продолжается: {type(e).__name__}: {e}",
-            flush=True,
-        )
-
-
-def notify_watchdog_of_message_id(message_id):
-    """
-    НОВАЯ, минимальная и полностью изолированная функция.
-
-    Сообщает Cloudflare Worker (Durable Object) новый message_id
-    зелёного сообщения "🟢 СИСТЕМА РАБОТАЕТ" сразу после его
-    успешной отправки — как при мгновенной отправке внутри самого
-    обработчика /external-recovered, так и (что особенно важно)
-    после успеха именно _external_recovery_background_retry().
-
-    Зачем это нужно: Durable Object — единственный источник истины
-    о serviceMessageId для служебных сообщений Watchdog
-    (⚠️ ПРЕДУПРЕЖДЕНИЕ / ❌ АВАРИЯ / 🟢 СИСТЕМА РАБОТАЕТ). Когда
-    самая первая быстрая попытка отправки recovery в
-    /external-recovered не удаётся, обработчик отвечает Cloudflare
-    Watchdog кодом 502 ДО того, как фоновая попытка вообще успела
-    отправить сообщение — то есть Durable Object физически не
-    может узнать message_id зелёного сообщения из HTTP-ответа на
-    тот конкретный вызов. Без этой функции Durable Object в таком
-    случае терял бы актуальный serviceMessageId, и следующее
-    WARNING/DEAD не смогло бы удалить зелёное сообщение — в чате
-    оставалось бы два служебных сообщения одновременно.
-
-    Это ЕДИНСТВЕННЫЙ новый канал взаимодействия bot.py -> Worker.
-    Он не меняет ни один существующий контракт: /external-check,
-    /external-recovered (коды ответов, JSON-поля, лок, дедуп,
-    таймауты, количество попыток) остаются полностью такими же,
-    как были. Ошибка этого вызова НЕ фатальна и ни на что другое
-    не влияет — она только логируется.
-
-    Если WATCHDOG_WORKER_URL не задан, функция ничего не делает
-    (см. предупреждение при старте бота).
-    """
-
-    if not WATCHDOG_WORKER_URL or not EXTERNAL_CHECK_TOKEN:
-        return
-
-    url = f"{WATCHDOG_WORKER_URL.rstrip('/')}/report-message-id"
-
-    try:
-        response = session.post(
-            url,
-            json={
-                "message_id": message_id,
-            },
-            headers={
-                "X-External-Check-Token": EXTERNAL_CHECK_TOKEN,
-            },
-            timeout=WATCHDOG_CALLBACK_TIMEOUT,
-        )
-
-        if response.status_code != 200:
-            print(
-                "Не удалось сообщить Cloudflare Worker новый "
-                "message_id зелёного сообщения "
-                f"(HTTP {response.status_code}). Это не влияет на "
-                "уже отправленное зелёное сообщение, но Durable "
-                "Object может не узнать о нём.",
-                flush=True,
-            )
-            return
-
-        print(
-            "Cloudflare Worker уведомлён о новом message_id "
-            f"зелёного сообщения (message_id={message_id}).",
-            flush=True,
-        )
-
-    except Exception as e:
-        print(
-            "Ошибка при уведомлении Cloudflare Worker о message_id "
-            f"зелёного сообщения: {type(e).__name__}: {e}. Это не "
-            "влияет на уже отправленное зелёное сообщение, но "
-            "Durable Object может не узнать о нём.",
-            flush=True,
-        )
-
-
 def _mark_external_recovery_sent():
     with state_lock:
         state["last_external_recovery_sent_at"] = now_utc()
@@ -1170,27 +982,6 @@ def _external_recovery_recently_sent():
     return (
         now_utc() - last_sent
     ).total_seconds() < EXTERNAL_RECOVERY_DEDUP_WINDOW_SECONDS
-
-
-def _take_and_clear_watchdog_service_message_id():
-    """
-    Атомарно читает и сбрасывает в None текущий
-    state["watchdog_service_message_id"], возвращая прежнее
-    значение. Используется в /external-recovered и в его фоновых
-    догоняющих попытках непосредственно перед быстрым удалением
-    предыдущего служебного сообщения Watchdog.
-    """
-
-    with state_lock:
-        previous_id = state["watchdog_service_message_id"]
-        state["watchdog_service_message_id"] = None
-
-    return previous_id
-
-
-def _store_watchdog_service_message_id(message_id):
-    with state_lock:
-        state["watchdog_service_message_id"] = message_id
 
 
 def _external_recovery_background_retry():
@@ -1218,26 +1009,6 @@ def _external_recovery_background_retry():
     короткий timeout). telegram_request() здесь по-прежнему не
     используется и не изменяется.
 
-    Единственное сервисное сообщение Watchdog: перед каждой
-    попыткой повторно забирается актуальный
-    watchdog_service_message_id (он мог измениться, например если
-    внутренний watchdog_loop() успел за это время отправить своё
-    собственное служебное сообщение) и быстро удаляется тем же
-    способом, что и в самом обработчике /external-recovered — так
-    гарантируется, что в чате не появится второе служебное
-    сообщение, даже если что-то успело отправиться в паузах между
-    догоняющими попытками.
-
-    ДОПОЛНЕНИЕ (синхронизация Durable Object): сразу после
-    успешной отправки сообщения здесь дополнительно вызывается
-    notify_watchdog_of_message_id() — единственный новый канал
-    bot.py -> Worker (см. его docstring). Это необходимо именно
-    для этого пути: HTTP-ответ на исходный вызов
-    /external-recovered уже ушёл к Cloudflare Watchdog с кодом 502
-    ДО того, как этот фоновый поток вообще начал работать, поэтому
-    Durable Object не может узнать message_id из того ответа.
-    Ничего другого в этой функции не изменено.
-
     Лок external_recovery_lock захватывается вызывающим кодом
     (в external_recovered(), только когда этот поток УСПЕШНО
     запущен — см. флаг handed_off там) и освобождается здесь же,
@@ -1258,21 +1029,12 @@ def _external_recovery_background_retry():
                 # параллельный путь уже всё отправил.
                 return
 
-            previous_service_message_id = (
-                _take_and_clear_watchdog_service_message_id()
-            )
-            delete_telegram_message_fast(
-                previous_service_message_id
-            )
-
             message_id = send_telegram_message_recovery_fast(
                 MESSAGES["external_check_recovered_body"],
             )
 
             if message_id:
                 _mark_external_recovery_sent()
-                _store_watchdog_service_message_id(message_id)
-                notify_watchdog_of_message_id(message_id)
 
                 print(
                     "RECOVERY TELEGRAM SENT "
@@ -1363,40 +1125,6 @@ def external_recovered():
     лок release()-ится прямо здесь, в finally этого обработчика.
     Владелец лока в любой момент времени определён однозначно.
 
-    ДОПОЛНЕНИЕ (единственное служебное сообщение Watchdog):
-    перед отправкой "✅ СИСТЕМА РАБОТАЕТ" удаляется предыдущее
-    служебное сообщение Watchdog (если оно есть) через быстрый
-    delete_telegram_message_fast() — тем же способом, что и сама
-    отправка (короткий запрос, без ретраев telegram_request()).
-    Ошибка удаления (например, сообщение уже удалено) не мешает
-    отправке нового сообщения — оно отправляется в любом случае.
-    Это не меняет ни лок/dedup-логику, ни таймауты, ни коды
-    ответа этого обработчика — добавлена только сама операция
-    удаления перед уже существующей отправкой.
-
-    ДОПОЛНЕНИЕ (единая точка правды в Durable Object): чтобы
-    Cloudflare Worker мог сделать свой собственный DO-хранимый
-    serviceMessageId единственным источником правды о текущем
-    служебном сообщении (WARNING/DEAD/RECOVERED), обе успешные
-    ветки ответа по-прежнему возвращают в JSON поле "message_id"
-    с id фактически отправленного (или уже отправленного ранее —
-    для ветки дедупликации) recovery-сообщения.
-
-    ДОПОЛНЕНИЕ (синхронизация Durable Object для фонового
-    recovery): сразу после успешной МГНОВЕННОЙ отправки здесь
-    дополнительно вызывается notify_watchdog_of_message_id() —
-    новый, единственный и полностью изолированный канал
-    bot.py -> Worker (см. его docstring). Он не меняет коды
-    ответов, JSON-контракт, лок, дедуп-окно и таймауты этого
-    обработчика — это просто ещё один способ для Durable Object
-    узнать актуальный message_id, дополняющий уже существующее
-    поле "message_id" в JSON-ответе. Тот же вызов сделан в
-    _external_recovery_background_retry() — именно там он
-    по-настоящему необходим, поскольку в случае неудачи быстрой
-    попытки HTTP-ответ на этот вызов уходит к Cloudflare Watchdog
-    (с кодом 502) ДО того, как фоновая попытка успевает что-либо
-    отправить.
-
     Результат отправки по-прежнему проверяется явно: 200
     возвращается только если сообщение реально ушло (получен
     message_id) или уже было отправлено недавно по этому же
@@ -1436,13 +1164,9 @@ def external_recovered():
             flush=True,
         )
 
-        with state_lock:
-            known_message_id = state["watchdog_service_message_id"]
-
         return jsonify({
             "ok": True,
             "reason": "recovery already sent recently",
-            "message_id": known_message_id,
         }), 200
 
     acquired = external_recovery_lock.acquire(timeout=1.5)
@@ -1473,21 +1197,12 @@ def external_recovered():
     handed_off = False
 
     try:
-        previous_service_message_id = (
-            _take_and_clear_watchdog_service_message_id()
-        )
-        delete_telegram_message_fast(
-            previous_service_message_id
-        )
-
         message_id = send_telegram_message_recovery_fast(
             MESSAGES["external_check_recovered_body"],
         )
 
         if message_id:
             _mark_external_recovery_sent()
-            _store_watchdog_service_message_id(message_id)
-            notify_watchdog_of_message_id(message_id)
 
             print(
                 "ОТПРАВЛЕНО СООБЩЕНИЕ О ВОССТАНОВЛЕНИИ "
@@ -1495,10 +1210,7 @@ def external_recovered():
                 flush=True,
             )
 
-            return jsonify({
-                "ok": True,
-                "message_id": message_id,
-            }), 200
+            return jsonify({"ok": True}), 200
 
         print(
             "ОШИБКА /external-recovered: не удалось отправить "
@@ -1718,87 +1430,6 @@ def edit_telegram_message(
     return result is not None
 
 
-def delete_watchdog_service_message():
-    """
-    Удаляет текущее единственное служебное сообщение Watchdog
-    (state["watchdog_service_message_id"]), если оно есть.
-
-    Используется универсальными путями отправки Watchdog-
-    уведомлений (watchdog_send_failure / watchdog_check_recovery)
-    через существующий telegram_request(). Отдельная быстрая
-    версия для /external-recovered — delete_telegram_message_fast().
-
-    Если Telegram отвечает, что сообщение уже удалено (или любая
-    другая ошибка удаления, например "message to delete not
-    found") — это не является фатальной ошибкой: отправка нового
-    сообщения в любом случае должна продолжиться, вызывающий код
-    просто игнорирует результат этой функции.
-
-    retries=1: повторять запрос на удаление уже несуществующего
-    сообщения бессмысленно (ошибка Telegram в этом случае
-    детерминирована), поэтому здесь не используются обычные
-    повторные попытки telegram_request(), чтобы не задерживать
-    watchdog_loop() лишними секундами ожидания.
-    """
-
-    with state_lock:
-        message_id = state["watchdog_service_message_id"]
-        state["watchdog_service_message_id"] = None
-
-    if not message_id:
-        return
-
-    result = telegram_request(
-        "deleteMessage",
-        {
-            "chat_id": CHAT_ID,
-            "message_id": message_id,
-        },
-        retries=1,
-    )
-
-    if result is None:
-        print(
-            "Не удалось удалить предыдущее служебное сообщение "
-            f"Watchdog (message_id={message_id}) — возможно, уже "
-            "удалено. Работа продолжается.",
-            flush=True,
-        )
-
-
-def send_watchdog_service_message(text, parse_mode=None):
-    """
-    Отправляет служебное сообщение Watchdog (предупреждение,
-    авария, диагностика источника, восстановление) как
-    ЕДИНСТВЕННОЕ актуальное служебное сообщение в чате.
-
-    Перед отправкой нового сообщения всегда удаляется предыдущее
-    служебное сообщение Watchdog (если оно ещё существует, см.
-    delete_watchdog_service_message()) — так, чтобы в любой момент
-    времени существовало не более одного такого сообщения. Новое
-    сообщение отправляется в любом случае — независимо от того,
-    удалилось ли предыдущее.
-
-    Использует ИСКЛЮЧИТЕЛЬНО уже существующие функции отправки —
-    send_telegram_message() -> telegram_request(). Новый механизм
-    доставки не создаётся, новый endpoint не создаётся, новый
-    поток не создаётся.
-    """
-
-    delete_watchdog_service_message()
-
-    message_id = send_telegram_message(
-        text,
-        parse_mode=parse_mode,
-    )
-
-    if message_id:
-        with state_lock:
-            state["watchdog_service_message_id"] = message_id
-
-    return message_id
-
-
 def test_telegram_api():
     result = telegram_request(
         "getMe",
@@ -1937,7 +1568,7 @@ def watchdog_send_failure(
         threshold_seconds=FAILURE_NOTIFICATION_AFTER_SECONDS,
     )
 
-    message_id = send_watchdog_service_message(
+    message_id = send_telegram_message(
         text,
     )
 
@@ -1990,7 +1621,7 @@ def watchdog_check_recovery(
         duration=format_duration(duration),
     )
 
-    message_id = send_watchdog_service_message(
+    message_id = send_telegram_message(
         text,
     )
 
