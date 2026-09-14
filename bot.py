@@ -2379,6 +2379,75 @@ def get_post_datetime(element):
         return None
 
 
+def extract_current_message_text(post):
+    """
+    Возвращает ТОЛЬКО текст текущего сообщения Telegram.
+
+    Критически важно для t.me/s/:
+      - текст текущего поста находится в
+        .tgme_widget_message_bubble > .tgme_widget_message_text;
+      - блок ответа на другое сообщение
+        (.tgme_widget_message_reply) и блок пересланного источника
+        (.tgme_widget_message_forwarded_from) не являются текстом
+        текущего поста и не должны участвовать в фильтрации угроз.
+
+    Сначала используем точный селектор прямого потомка message bubble.
+    Это предотвращает ситуацию, когда при наличии reply/forward первым
+    найденным .tgme_widget_message_text оказывается текст контекста.
+
+    Затем есть безопасный fallback для возможных изменений HTML Telegram:
+    перебираем найденные блоки текста и исключаем те, которые находятся
+    внутри reply/forward-контейнеров.
+    """
+
+    text_element = post.select_one(
+        ".tgme_widget_message_bubble > .tgme_widget_message_text"
+    )
+
+    if text_element is None:
+        candidates = post.select(
+            ".tgme_widget_message_text"
+        )
+
+        for candidate in candidates:
+            if candidate.find_parent(
+                class_="tgme_widget_message_reply"
+            ) is not None:
+                continue
+
+            if candidate.find_parent(
+                class_="tgme_widget_message_forwarded_from"
+            ) is not None:
+                continue
+
+            text_element = candidate
+            break
+
+    if text_element is None:
+        return ""
+
+    # На случай нестандартной разметки, где Telegram вложит reply/forward
+    # непосредственно внутрь найденного текстового блока, убираем только
+    # эти служебные контейнеры. Обычный blockquote текущего сообщения
+    # НЕ трогаем: это может быть настоящая цитата, опубликованная автором.
+    clean_html = str(text_element)
+    clean_soup = BeautifulSoup(
+        clean_html,
+        "html.parser",
+    )
+
+    for context in clean_soup.select(
+        ".tgme_widget_message_reply, "
+        ".tgme_widget_message_forwarded_from"
+    ):
+        context.decompose()
+
+    return clean_soup.get_text(
+        "\n",
+        strip=True,
+    )
+
+
 # ============================================================
 # ФИЛЬТРЫ
 # ============================================================
@@ -2703,16 +2772,8 @@ def check_source(
             ):
                 break
 
-            text_element = post.select_one(
-                ".tgme_widget_message_text"
-            )
-
-            if not text_element:
-                continue
-
-            text = text_element.get_text(
-                "\n",
-                strip=True,
+            text = extract_current_message_text(
+                post
             )
 
             if not text:
@@ -3204,4 +3265,3 @@ if __name__ == "__main__":
             )
         ),
     )
-
