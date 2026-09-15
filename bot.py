@@ -47,7 +47,14 @@ INTERNAL_WATCHDOG_INTERVAL_SECONDS = 20
 PROCESS_HANG_THRESHOLD_SECONDS = 120
 
 MAX_MESSAGE_AGE_MINUTES = 5
-MAX_SENT_MESSAGES = 1000
+MAX_SENT_MESSAGES = 10000  # исторический лимит; реестр не обрезается, чтобы не терять ID
+
+# Реестр уже отправленных тревог.
+# Путь можно вынести на persistent storage без изменения логики парсера.
+SENT_MESSAGES_FILE = os.getenv(
+    "SENT_MESSAGES_FILE",
+    "/tmp/lukas_alarm_sent_messages.json",
+)
 
 REQUEST_TIMEOUT = (5, 35)
 SOURCE_REQUEST_TIMEOUT = (5, 15)
@@ -329,6 +336,36 @@ MESSAGES = {
 # ФИЛЬТР MONITOR
 # ============================================================
 
+# ============================================================
+# ОПЕЧАТКИ: PSZSU / ПОВІТРЯНІ СИЛИ
+# ============================================================
+# Отдельный блок. Эти варианты НЕ являются частью основного
+# реестра ключевых слов и могут изменяться независимо.
+KREMENCHUK_PSZSU_TYPOS = (
+    "кремечук",
+    "кремечука",
+    "кремечуці",
+    "кремычук",
+    "кремычука",
+    "кремычуці",
+)
+
+
+# ============================================================
+# ОПЕЧАТКИ: MONITOR
+# ============================================================
+# Отдельный блок именно для строгого городского фильтра monitor.
+# Районные паттерны этой логикой не заменяются и не расширяются.
+MONITOR_KREMENCHUK_TYPOS = (
+    "кремечук",
+    "кремечука",
+    "кремечуці",
+    "кремычук",
+    "кремычука",
+    "кремычуці",
+)
+
+
 # Именно город Кременчук.
 # Кременчуцький район сюда не входит.
 KREMENCHUK_CITY_PATTERNS = (
@@ -503,6 +540,62 @@ session.headers.update({
 
 sent_messages = set()
 sent_messages_lock = threading.Lock()
+
+
+def load_sent_messages():
+    """Загружает реестр уже отправленных тревог из JSON-файла."""
+    try:
+        with open(SENT_MESSAGES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            return set()
+
+        return {
+            str(item)
+            for item in data
+            if isinstance(item, str)
+        }
+
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        print(
+            "Ошибка загрузки реестра отправленных тревог: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+        return set()
+
+
+def save_sent_messages():
+    """Атомарно сохраняет реестр уже отправленных тревог."""
+    try:
+        directory = os.path.dirname(SENT_MESSAGES_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        tmp_file = f"{SENT_MESSAGES_FILE}.tmp"
+
+        with sent_messages_lock:
+            data = sorted(sent_messages)
+
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_file, SENT_MESSAGES_FILE)
+
+    except Exception as e:
+        print(
+            "Ошибка сохранения реестра отправленных тревог: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+
+sent_messages.update(load_sent_messages())
 
 
 # ============================================================
@@ -2379,75 +2472,6 @@ def get_post_datetime(element):
         return None
 
 
-def extract_current_message_text(post):
-    """
-    Возвращает ТОЛЬКО текст текущего сообщения Telegram.
-
-    Критически важно для t.me/s/:
-      - текст текущего поста находится в
-        .tgme_widget_message_bubble > .tgme_widget_message_text;
-      - блок ответа на другое сообщение
-        (.tgme_widget_message_reply) и блок пересланного источника
-        (.tgme_widget_message_forwarded_from) не являются текстом
-        текущего поста и не должны участвовать в фильтрации угроз.
-
-    Сначала используем точный селектор прямого потомка message bubble.
-    Это предотвращает ситуацию, когда при наличии reply/forward первым
-    найденным .tgme_widget_message_text оказывается текст контекста.
-
-    Затем есть безопасный fallback для возможных изменений HTML Telegram:
-    перебираем найденные блоки текста и исключаем те, которые находятся
-    внутри reply/forward-контейнеров.
-    """
-
-    text_element = post.select_one(
-        ".tgme_widget_message_bubble > .tgme_widget_message_text"
-    )
-
-    if text_element is None:
-        candidates = post.select(
-            ".tgme_widget_message_text"
-        )
-
-        for candidate in candidates:
-            if candidate.find_parent(
-                class_="tgme_widget_message_reply"
-            ) is not None:
-                continue
-
-            if candidate.find_parent(
-                class_="tgme_widget_message_forwarded_from"
-            ) is not None:
-                continue
-
-            text_element = candidate
-            break
-
-    if text_element is None:
-        return ""
-
-    # На случай нестандартной разметки, где Telegram вложит reply/forward
-    # непосредственно внутрь найденного текстового блока, убираем только
-    # эти служебные контейнеры. Обычный blockquote текущего сообщения
-    # НЕ трогаем: это может быть настоящая цитата, опубликованная автором.
-    clean_html = str(text_element)
-    clean_soup = BeautifulSoup(
-        clean_html,
-        "html.parser",
-    )
-
-    for context in clean_soup.select(
-        ".tgme_widget_message_reply, "
-        ".tgme_widget_message_forwarded_from"
-    ):
-        context.decompose()
-
-    return clean_soup.get_text(
-        "\n",
-        strip=True,
-    )
-
-
 # ============================================================
 # ФИЛЬТРЫ
 # ============================================================
@@ -2464,19 +2488,29 @@ def normalize_text(text):
 
 
 def has_kremenchuk(text):
-    return KEYWORD in normalize_text(
-        text
+    normalized = normalize_text(text)
+
+    if KEYWORD in normalized:
+        return True
+
+    return any(
+        pattern in normalized
+        for pattern in KREMENCHUK_PSZSU_TYPOS
     )
 
 
 def has_kremenchuk_city(text):
-    normalized = normalize_text(
-        text
-    )
+    normalized = normalize_text(text)
+
+    if any(
+        pattern in normalized
+        for pattern in KREMENCHUK_CITY_PATTERNS
+    ):
+        return True
 
     return any(
         pattern in normalized
-        for pattern in KREMENCHUK_CITY_PATTERNS
+        for pattern in MONITOR_KREMENCHUK_TYPOS
     )
 
 
@@ -2691,8 +2725,31 @@ def send_alert(
             dedup_key
         )
 
-        if len(sent_messages) > MAX_SENT_MESSAGES:
-            sent_messages.pop()
+        # ID фиксируем только после успешной доставки.
+        # Изменение текста того же поста уже не создаст вторую тревогу.
+        sent_messages_to_save = sorted(sent_messages)
+
+    try:
+        directory = os.path.dirname(SENT_MESSAGES_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        tmp_file = f"{SENT_MESSAGES_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(
+                sent_messages_to_save,
+                f,
+                ensure_ascii=False,
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, SENT_MESSAGES_FILE)
+    except Exception as e:
+        print(
+            "Ошибка сохранения ID отправленного сообщения: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
 
     with state_lock:
         state["last_alert"] = now_utc()
@@ -2704,6 +2761,49 @@ def send_alert(
     )
 
     return True
+
+
+def extract_current_message_text(post):
+    """Возвращает только текст текущего Telegram-сообщения."""
+    text_element = post.select_one(
+        ".tgme_widget_message_bubble > .tgme_widget_message_text"
+    )
+
+    if text_element is None:
+        for candidate in post.select(
+            ".tgme_widget_message_text"
+        ):
+            if candidate.find_parent(
+                class_="tgme_widget_message_reply"
+            ) is not None:
+                continue
+
+            if candidate.find_parent(
+                class_="tgme_widget_message_forwarded_from"
+            ) is not None:
+                continue
+
+            text_element = candidate
+            break
+
+    if text_element is None:
+        return ""
+
+    clean_soup = BeautifulSoup(
+        str(text_element),
+        "html.parser",
+    )
+
+    for context in clean_soup.select(
+        ".tgme_widget_message_reply, "
+        ".tgme_widget_message_forwarded_from"
+    ):
+        context.decompose()
+
+    return clean_soup.get_text(
+        "\n",
+        strip=True,
+    )
 
 
 # ============================================================
@@ -2779,6 +2879,13 @@ def check_source(
             if not text:
                 continue
 
+            post_id = post.get(
+                "data-post"
+            )
+
+            if not post_id:
+                continue
+
             # ------------------------------------------------
             # PSZSU
             # ------------------------------------------------
@@ -2788,13 +2895,6 @@ def check_source(
                     continue
 
                 if is_post_event_report(text):
-                    continue
-
-                post_id = post.get(
-                    "data-post"
-                )
-
-                if not post_id:
                     continue
 
                 classification = (
@@ -2822,13 +2922,6 @@ def check_source(
             )
 
             if classification == "IGNORE":
-                continue
-
-            post_id = post.get(
-                "data-post"
-            )
-
-            if not post_id:
                 continue
 
             send_alert(
