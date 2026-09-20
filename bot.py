@@ -138,6 +138,42 @@ MESSAGES = {
     ),
 
     # --------------------------------------------------------
+    # Картотека Кременчуга
+    # --------------------------------------------------------
+
+    # Архивная карточка содержит время получения ботом,
+    # время публикации исходного поста, источник, уровень внимания,
+    # ID исходного сообщения, прямую ссылку на исходный пост
+    # и текст самого сообщения.
+    "archive_high_body": (
+        "🔴 КАРТОТЕКА — ПОВЫШЕННОЕ ВНИМАНИЕ\n"
+        "\n"
+        "🕐 Получено ботом: {received_at}\n"
+        "🕐 Время сообщения: {published_at}\n"
+        "📡 Источник: {source_name}\n"
+        "🎯 Тип: 🔴 повышенное внимание\n"
+        "🆔 ID исходного сообщения: {post_id}\n"
+        '<a href="{post_link}">🔗 Оригинальное сообщение</a>\n'
+        "\n"
+        "📝 Сообщение:\n"
+        "<blockquote>{escaped_text}</blockquote>"
+    ),
+
+    "archive_normal_body": (
+        "🟡 КАРТОТЕКА — ОБЫЧНОЕ ВНИМАНИЕ\n"
+        "\n"
+        "🕐 Получено ботом: {received_at}\n"
+        "🕐 Время сообщения: {published_at}\n"
+        "📡 Источник: {source_name}\n"
+        "🎯 Тип: 🟡 обычное внимание\n"
+        "🆔 ID исходного сообщения: {post_id}\n"
+        '<a href="{post_link}">🔗 Оригинальное сообщение</a>\n'
+        "\n"
+        "📝 Сообщение:\n"
+        "<blockquote>{escaped_text}</blockquote>"
+    ),
+
+    # --------------------------------------------------------
     # Команда /test
     # --------------------------------------------------------
 
@@ -441,6 +477,10 @@ IMPACT_PATTERNS = (
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID_RAW = os.getenv("CHAT_ID")
 EXTERNAL_CHECK_TOKEN = os.getenv("EXTERNAL_CHECK_TOKEN")
+
+# Отдельная тихая группа-картотека. Архивные сообщения НИКОГДА
+# не отправляются в основной рабочий чат CHAT_ID.
+ARCHIVE_CHAT_ID = -1003795112075
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_TOKEN")
@@ -2591,66 +2631,359 @@ def is_post_event_report(text):
     )
 
 
-def classify_monitor_message(text):
+# ============================================================
+# КЛАССИФИКАЦИЯ КРЕМЕНЧУГА
+# ============================================================
+#
+# Результаты классификации:
+#   ALERT          -> только основной рабочий чат
+#   ARCHIVE_HIGH   -> только картотека
+#   ARCHIVE_NORMAL -> только картотека
+#   IGNORE         -> никуда
+#
+# ВАЖНО:
+# 1. Текст для анализа берётся только из текущего сообщения.
+#    Reply/quote/forward-контекст Telegram не анализируется.
+#    Это защищает от повторных пересылок и ответов на старые посты.
+# 2. Приоритет строгий: ALERT > ARCHIVE_HIGH > ARCHIVE_NORMAL > IGNORE.
+# 3. Подтверждённое событие/удар по Кременчугу или Кременчугскому
+#    району сохраняется как ALERT — это существующая рабочая логика.
+# 4. Для обычной новой угрозы ALERT требует явного указания
+#    направления/цели на Кременчуг.
+
+KREMENCHUK_VARIANTS = (
+    "кременчук",
+    "кременчука",
+    "кременчуці",
+    "кременчуг",
+    "кременчуга",
+    "кременчуге",
+    "кремечук",
+    "кремечука",
+    "кремечуці",
+    "кремычук",
+    "кремычука",
+    "кремычуці",
+)
+
+KREMENCHUK_DIRECT_ALERT_PATTERNS = (
+    "на кременчук",
+    "на кременчука",
+    "на кременчуг",
+    "у напрямку кременчука",
+    "в напрямку кременчука",
+    "у напрямку кременчук",
+    "в напрямку кременчук",
+    "у напрямку кременчуга",
+    "в напрямку кременчуга",
+    "курс на кременчук",
+    "курс на кременчук",
+    "для кременчука",
+    "для кременчуга",
+    "до кременчука",
+    "до кременчуга",
+    "у бік кременчука",
+    "в бік кременчука",
+    "у бік кременчуга",
+    "в бік кременчуга",
+    "прямує до кременчука",
+    "прямують до кременчука",
+    "рухається на кременчук",
+    "рухаються на кременчук",
+    "летить на кременчук",
+    "летять на кременчук",
+    "ціль на кременчук",
+    "цілі на кременчук",
+    "ціль — кременчук",
+    "ціль - кременчук",
+    "цілі — кременчук",
+    "цілі - кременчук",
+)
+
+# Варианты для явного указания Кременчуга как цели/направления,
+# включая частые падежные формы и русское написание.
+KREMENCHUK_DIRECT_ALERT_REGEX = (
+    r"(?:"
+    r"на|до|у\s+бік|в\s+бік|у\s+напрямку|в\s+напрямку|"
+    r"курс\s+на|прямує\s+до|прямують\s+до|"
+    r"рухається\s+на|рухаються\s+на|летить\s+на|летять\s+на|"
+    r"ціль\s*(?:—|-|:)?\s*"
+    r")"
+    r"(?:кременчук(?:а|у|ом|ці)?|кременчуг(?:а|у|ом|е)?)"
+)
+
+KREMENCHUK_ARCHIVE_HIGH_LOCATION_PATTERNS = (
+    "між полтавою та кременчуком",
+    "між полтавою і кременчуком",
+    "між полтавою й кременчуком",
+    "між кременчуком та полтавою",
+    "між кременчуком і полтавою",
+    "між кременчуком й полтавою",
+    "між полтавою та кременчугом",
+    "між полтавою і кременчугом",
+    "між кременчугом та полтавою",
+    "між кременчугом і полтавою",
+)
+
+KREMENCHUK_ARCHIVE_NORMAL_DIRECTION_PATTERNS = (
+    "північніше кременчука",
+    "південніше кременчука",
+    "східніше кременчука",
+    "західніше кременчука",
+    "північніше кременчуга",
+    "південніше кременчуга",
+    "східніше кременчуга",
+    "західніше кременчуга",
+    "на північ від кременчука",
+    "на південь від кременчука",
+    "на схід від кременчука",
+    "на захід від кременчука",
+    "на північ від кременчуга",
+    "на південь від кременчуга",
+    "на схід від кременчуга",
+    "на захід від кременчуга",
+)
+
+# Для опечаток относительные конструкции проверяем через отдельные
+# regex, чтобы не расширять общий fuzzy-поиск.
+KREMENCHUK_ARCHIVE_NORMAL_TYPO_REGEX = (
+    r"(?:північніше|південніше|східніше|західніше)\s+"
+    r"(?:кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)"
+    r"|"
+    r"на\s+(?:північ|південь|схід|захід)\s+від\s+"
+    r"(?:кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)"
+)
+
+KREMENCHUK_ARCHIVE_HIGH_TYPO_REGEX = (
+    r"між\s+полтавою\s+(?:та|і|й)\s+"
+    r"(?:кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)"
+    r"|"
+    r"між\s+(?:кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)\s+"
+    r"(?:та|і|й)\s+полтавою"
+)
+
+COURSE_DIRECTION_REGEX = (
+    r"(?:"
+    r"курс(?:ом)?\s+(?:на\s+)?(?:"
+    r"захід|схід|північ|південь|"
+    r"західний|східний|північний|південний|"
+    r"західному|східному|північному|південному|"
+    r"північно-західний|північно-східний|"
+    r"південно-західний|південно-східний|"
+    r"північно-західному|північно-східному|"
+    r"південно-західному|південно-східному"
+    r")"
+    r"|напрям(?:ок)?\s+(?:на\s+)?(?:"
+    r"захід|схід|північ|південь|"
+    r"західний|східний|північний|південний|"
+    r"західному|східному|північному|південному|"
+    r"північно-західний|північно-східний|"
+    r"південно-західний|південно-східний|"
+    r"північно-західному|північно-східному|"
+    r"південно-західному|південно-східному"
+    r")"
+    r"|(?:рухається|рухаються|прямує|прямують|летить|летять)\s+"
+    r"(?:на\s+)?(?:"
+    r"захід|схід|північ|південь|"
+    r"західний|східний|північний|південний|"
+    r"західному|східному|північному|південному|"
+    r"північно-західний|північно-східний|"
+    r"південно-західний|південно-східний|"
+    r"північно-західному|північно-східному|"
+    r"південно-західному|південно-східному"
+    r")"
+    r"|(?:рухається|рухаються|прямує|прямують|летить|летять)\s+"
+    r"у\s+(?:західному|східному|північному|південному)\s+напрямку"
+    r")"
+)
+
+KREMENCHUK_RESERVOIR_PATTERNS = (
+    "кременчуцьке водосховище",
+    "кременчуцького водосховища",
+    "кременчуцьким водосховищем",
+    "кременчугское водохранилище",
+    "кременчугского водохранилища",
+)
+
+
+def text_has_kremenchuk_variant(normalized):
+    return any(
+        pattern in normalized
+        for pattern in KREMENCHUK_VARIANTS
+    )
+
+
+def has_kremenchuk_impact_location(text):
     """
-    Возвращает:
-      IMPACT_CONFIRMED
-      HIGH_SPEED_THREAT
-      IGNORE
+    Сохраняет старое правило подтверждённого события:
+    город Кременчук или Кременчугский район допускаются.
+    Одно только Кременчугское водохранилище не считается
+    местом события для ALERT без отдельной threat-relevant
+    конструкции.
+    """
+    normalized = normalize_text(text)
 
-    Для подтверждённых событий:
-      Кременчук или Кременчуцький район.
+    if not has_kremenchuk(text):
+        return False
 
-    Для новой конкретной угрозы:
-      только город Кременчук.
+    return not any(
+        pattern in normalized
+        for pattern in KREMENCHUK_RESERVOIR_PATTERNS
+    )
+
+
+def has_direct_kremenchuk_target(text):
+    normalized = normalize_text(text)
+
+    if any(
+        pattern in normalized
+        for pattern in KREMENCHUK_DIRECT_ALERT_PATTERNS
+    ):
+        return True
+
+    return re.search(
+        KREMENCHUK_DIRECT_ALERT_REGEX,
+        normalized,
+    ) is not None
+
+
+def has_archive_high_location(text):
+    normalized = normalize_text(text)
+
+    if any(
+        pattern in normalized
+        for pattern in KREMENCHUK_ARCHIVE_HIGH_LOCATION_PATTERNS
+    ):
+        return True
+
+    return re.search(
+        KREMENCHUK_ARCHIVE_HIGH_TYPO_REGEX,
+        normalized,
+    ) is not None
+
+
+def has_course_or_direction(text):
+    normalized = normalize_text(text)
+
+    return re.search(
+        COURSE_DIRECTION_REGEX,
+        normalized,
+    ) is not None
+
+
+def has_archive_normal_location(text):
+    normalized = normalize_text(text)
+
+    if any(
+        pattern in normalized
+        for pattern in KREMENCHUK_ARCHIVE_NORMAL_DIRECTION_PATTERNS
+    ):
+        return True
+
+    return re.search(
+        KREMENCHUK_ARCHIVE_NORMAL_TYPO_REGEX,
+        normalized,
+    ) is not None
+
+
+def classify_kremenchuk_message(text):
+    """
+    Основная четырёхуровневая классификация.
+
+    ALERT:
+      - подтверждённое событие/удар с упоминанием Кременчуга
+        или Кременчугского района — сохраняем существующую
+        рабочую логику;
+      - либо новая угроза, где Кременчуг явно указан как цель
+        или направление.
+
+    ARCHIVE_HIGH:
+      - сообщение о группах между Полтавой и Кременчуком
+        с указанным курсом/направлением.
+
+    ARCHIVE_NORMAL:
+      - сообщение о положении севернее/южнее/восточнее/
+        западнее Кременчуга (или аналогичная конструкция)
+        с указанным движением/курсом/направлением.
+
+    IGNORE:
+      - всё остальное, включая одно только упоминание
+        Кременчуга или Кременчугского водохранилища без
+        threat-relevant направления.
     """
 
-    # --------------------------------------------------------
-    # ЖЁЛТОЕ:
-    # уже произошедшее событие.
-    #
-    # Здесь район разрешён.
-    # --------------------------------------------------------
-
-    if has_kremenchuk(text) and has_impact(text):
-        return "IMPACT_CONFIRMED"
+    normalized = normalize_text(text)
 
     # --------------------------------------------------------
-    # Продолжающаяся угроза:
-    # не создаём новую тревогу.
+    # 1. ALERT — подтверждённое событие.
+    # Район здесь разрешён: это сохранение старой рабочей
+    # логики monitor.
     # --------------------------------------------------------
+    if has_kremenchuk_impact_location(text) and has_impact(text):
+        return "ALERT"
 
+    # Продолжающееся старое сообщение не создаёт новую тревогу.
     if is_continuing_threat(text):
         return "IGNORE"
 
-    # --------------------------------------------------------
-    # Для красного уведомления требуется
-    # именно город Кременчук.
-    # --------------------------------------------------------
-
-    if not has_kremenchuk_city(text):
+    # Пост-событийные сводки не должны превращаться в новые
+    # оперативные тревоги или карточки.
+    if is_post_event_report(text):
         return "IGNORE"
 
     # --------------------------------------------------------
-    # БАНДЕРОЛЬ
+    # 2. ALERT — явная цель/направление на Кременчуг.
     # --------------------------------------------------------
-
-    if has_banderol(text):
-
-        if is_banderol_reconnaissance(text):
-            return "IGNORE"
-
-        return "HIGH_SPEED_THREAT"
+    if has_direct_kremenchuk_target(text):
+        return "ALERT"
 
     # --------------------------------------------------------
-    # Остальные скоростные угрозы
+    # Явное упоминание только водохранилища без threat-relevant
+    # конструкции — IGNORE. Проверка сделана отдельно для
+    # читаемости и защиты от случайного расширения фильтра.
     # --------------------------------------------------------
+    reservoir_only = any(
+        pattern in normalized
+        for pattern in KREMENCHUK_RESERVOIR_PATTERNS
+    )
 
-    if has_high_speed_threat(text):
+    # --------------------------------------------------------
+    # 3. ARCHIVE_HIGH — между Полтавой и Кременчугом + курс.
+    # --------------------------------------------------------
+    if (
+        has_archive_high_location(text)
+        and has_course_or_direction(text)
+    ):
+        return "ARCHIVE_HIGH"
 
-        if is_post_event_report(text):
-            return "IGNORE"
+    # --------------------------------------------------------
+    # 4. ARCHIVE_NORMAL — пограничная география + курс.
+    # --------------------------------------------------------
+    if (
+        has_archive_normal_location(text)
+        and has_course_or_direction(text)
+    ):
+        return "ARCHIVE_NORMAL"
 
+    # Водохранилище без явного направления сюда попадает.
+    if reservoir_only:
+        return "IGNORE"
+
+    # Любое обычное упоминание города без нужной конструкции.
+    if text_has_kremenchuk_variant(normalized):
+        return "IGNORE"
+
+    return "IGNORE"
+
+
+# Обратная совместимость для участков проекта, где старое имя
+# функции ещё может использоваться во время перехода.
+def classify_monitor_message(text):
+    classification = classify_kremenchuk_message(text)
+
+    if classification == "ALERT":
+        if has_kremenchuk_impact_location(text) and has_impact(text):
+            return "IMPACT_CONFIRMED"
         return "HIGH_SPEED_THREAT"
 
     return "IGNORE"
@@ -2757,6 +3090,205 @@ def send_alert(
     print(
         f"ОТПРАВЛЕНО: {source_name}; "
         f"{classification}; {post_id}",
+        flush=True,
+    )
+
+    return True
+
+
+
+def build_archive_text(
+    source_name,
+    post_id,
+    post_link,
+    original_text,
+    classification,
+    received_at,
+    published_at,
+):
+    # Для обычных постов карточка помещается в одно сообщение.
+    # ВАЖНО: исходный текст здесь НЕ обрезается. Если пост слишком
+    # длинный для Telegram, send_archive() отправит его продолжение
+    # отдельным сообщением, чтобы архив не терял данные.
+    escaped_text = html.escape(
+        original_text,
+        quote=False,
+    )
+
+    if classification == "ARCHIVE_HIGH":
+        template = MESSAGES["archive_high_body"]
+    else:
+        template = MESSAGES["archive_normal_body"]
+
+    return template.format(
+        received_at=format_time(received_at),
+        published_at=format_time(published_at),
+        source_name=html.escape(source_name, quote=False),
+        post_id=html.escape(str(post_id), quote=False),
+        post_link=html.escape(post_link, quote=True),
+        escaped_text=escaped_text,
+    )
+
+
+def build_source_post_link(source_link, post_id):
+    """Строит прямую ссылку на конкретный публичный Telegram-пост."""
+    post_id = str(post_id or "").strip()
+
+    if "/" in post_id:
+        channel_part, message_part = post_id.rsplit("/", 1)
+        if channel_part and message_part.isdigit():
+            return f"https://t.me/{channel_part}/{message_part}"
+
+    # Если формат Telegram неожиданно другой, не придумываем URL.
+    return source_link
+
+
+def send_archive(
+    source_name,
+    source_link,
+    post_id,
+    original_text,
+    classification,
+    published_at,
+    received_at=None,
+):
+    """Отправляет только ARCHIVE_HIGH / ARCHIVE_NORMAL в картотеку."""
+    if classification not in (
+        "ARCHIVE_HIGH",
+        "ARCHIVE_NORMAL",
+    ):
+        return False
+
+    dedup_key = f"archive:{source_name}:{post_id}"
+
+    with sent_messages_lock:
+        if dedup_key in sent_messages:
+            return False
+
+    if received_at is None:
+        received_at = now_utc()
+
+    post_link = build_source_post_link(
+        source_link=source_link,
+        post_id=post_id,
+    )
+
+    archive_text = build_archive_text(
+        source_name=source_name,
+        post_id=post_id,
+        post_link=post_link,
+        original_text=original_text,
+        classification=classification,
+        received_at=received_at,
+        published_at=published_at,
+    )
+
+    # Telegram принимает максимум 4096 символов в одном сообщении.
+    # Сначала пробуем отправить карточку целиком. Для исключительно
+    # длинных исходных постов отправляем её частями, не теряя текст.
+    archive_parts = []
+    if len(archive_text) <= 4096:
+        archive_parts.append(archive_text)
+    else:
+        escaped_full_text = html.escape(
+            original_text,
+            quote=False,
+        )
+
+        # Первая часть сохраняет всю служебную шапку карточки.
+        prefix = build_archive_text(
+            source_name=source_name,
+            post_id=post_id,
+            post_link=post_link,
+            original_text="",
+            classification=classification,
+            received_at=received_at,
+            published_at=published_at,
+        )
+
+        prefix_marker = "<blockquote>"
+        suffix_marker = "</blockquote>"
+        prefix_before_text, _, prefix_after_text = prefix.partition(
+            prefix_marker
+        )
+        prefix_after_text = prefix_after_text.rsplit(
+            suffix_marker,
+            1,
+        )[0]
+
+        first_capacity = max(1, 4096 - len(prefix_before_text) - len(prefix_marker) - len(suffix_marker) - len(prefix_after_text))
+        first_chunk = escaped_full_text[:first_capacity]
+        archive_parts.append(
+            prefix_before_text
+            + prefix_marker
+            + first_chunk
+            + suffix_marker
+            + prefix_after_text
+        )
+
+        remaining = escaped_full_text[len(first_chunk):]
+        continuation_header = "📝 Продолжение сообщения:\n<blockquote>"
+        continuation_suffix = "</blockquote>"
+        continuation_capacity = max(1, 4096 - len(continuation_header) - len(continuation_suffix))
+
+        while remaining:
+            chunk = remaining[:continuation_capacity]
+            remaining = remaining[len(chunk):]
+            archive_parts.append(
+                continuation_header
+                + chunk
+                + continuation_suffix
+            )
+
+    message_ids = []
+
+    for part in archive_parts:
+        data = {
+            "chat_id": ARCHIVE_CHAT_ID,
+            "text": part,
+            "parse_mode": "HTML",
+            "link_preview_options": json.dumps({
+                "is_disabled": True,
+            }),
+        }
+
+        result = telegram_request("sendMessage", data)
+
+        if not result:
+            return False
+
+        try:
+            message_id = result["result"]["message_id"]
+        except Exception:
+            return False
+
+        message_ids.append(message_id)
+
+    with sent_messages_lock:
+        sent_messages.add(dedup_key)
+        sent_messages_to_save = sorted(sent_messages)
+
+    try:
+        directory = os.path.dirname(SENT_MESSAGES_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        tmp_file = f"{SENT_MESSAGES_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(sent_messages_to_save, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, SENT_MESSAGES_FILE)
+    except Exception as e:
+        print(
+            "Ошибка сохранения ID архивного сообщения: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+    print(
+        f"ОТПРАВЛЕНО В КАРТОТЕКУ: {source_name}; "
+        f"{classification}; {post_id}; message_ids={message_ids}",
         flush=True,
     )
 
@@ -2887,50 +3419,46 @@ def check_source(
                 continue
 
             # ------------------------------------------------
-            # PSZSU
+            # ЕДИНАЯ КЛАССИФИКАЦИЯ
             # ------------------------------------------------
+            # ВАЖНО: text уже извлечён функцией
+            # extract_current_message_text(), которая исключает
+            # reply/forward-контекст. Именно этот text идёт
+            # в классификатор и в исходное отправляемое сообщение.
 
-            if not is_monitor:
-                if not has_kremenchuk(text):
-                    continue
+            classification = classify_kremenchuk_message(text)
 
-                if is_post_event_report(text):
-                    continue
+            if classification == "IGNORE":
+                continue
 
-                classification = (
-                    "HIGH_SPEED_THREAT"
-                )
-
+            if classification == "ALERT":
                 send_alert(
                     source_name=source_name,
                     source_link=source_link,
                     post_id=post_id,
                     original_text=text,
+                    classification=(
+                        "IMPACT_CONFIRMED"
+                        if has_kremenchuk(text) and has_impact(text)
+                        else "HIGH_SPEED_THREAT"
+                    ),
+                )
+                continue
+
+            if classification in (
+                "ARCHIVE_HIGH",
+                "ARCHIVE_NORMAL",
+            ):
+                send_archive(
+                    source_name=source_name,
+                    source_link=source_link,
+                    post_id=post_id,
+                    original_text=text,
                     classification=classification,
+                    published_at=post_datetime,
+                    received_at=now_utc(),
                 )
-
                 continue
-
-            # ------------------------------------------------
-            # MONITOR
-            # ------------------------------------------------
-
-            classification = (
-                classify_monitor_message(
-                    text
-                )
-            )
-
-            if classification == "IGNORE":
-                continue
-
-            send_alert(
-                source_name=source_name,
-                source_link=source_link,
-                post_id=post_id,
-                original_text=text,
-                classification=classification,
-            )
 
         return True
 
@@ -3041,6 +3569,11 @@ def run_bot():
 
     print(
         f"monitor: {MONITOR_URL}",
+        flush=True,
+    )
+
+    print(
+        f"Картотека: {ARCHIVE_CHAT_ID}",
         flush=True,
     )
 
