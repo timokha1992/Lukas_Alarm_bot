@@ -126,15 +126,19 @@ MESSAGES = {
         "<b>УГРОЗА ДЛЯ КРЕМЕНЧУГА</b>"
     ),
 
+    # {source_label} — явная визуальная маркировка источника.
     # {title} — один из alert_title_* выше.
-    # {source_link}, {source_name} — параметры источника (PSZSU/monitor).
+    # {post_link} — прямая ссылка на конкретный исходный пост.
     # {escaped_text} — экранированный текст исходного поста.
+    # post_id в тревогу намеренно НЕ выводится.
     "alert_body": (
+        "{source_label}\n"
+        "\n"
         "{title}\n"
         "\n"
-        '<a href="{source_link}">📡 {source_name}</a>\n'
+        "<blockquote><b>{escaped_text}</b></blockquote>\n"
         "\n"
-        "<blockquote><b>{escaped_text}</b></blockquote>"
+        '<a href="{post_link}">📎 Первоисточник</a>'
     ),
 
     # --------------------------------------------------------
@@ -2712,6 +2716,19 @@ KREMENCHUK_DIRECT_ALERT_REGEX = (
     r"(?:кременчук(?:а|у|ом|ці)?|кременчуг(?:а|у|ом|е)?)"
 )
 
+# Отдельная форма официального сообщения: город указан первым,
+# после него объект и уже затем назначение «на місто».
+# Например: «Кременчук — ударний БпЛА на місто зі сходу».
+# Это не меняет общую логику ПСЗСУ, а закрывает конкретную форму
+# прямой угрозы, которая раньше выпадала из фильтра.
+KREMENCHUK_CITY_FIRST_TARGET_REGEX = (
+    r"(?:^|[^\w])\s*"
+    r"(?:кременчук(?:а|у|ом|ці)?|кременчуг(?:а|у|ом|е)?)"
+    r"\s*[-—:]\s*"
+    r"(?=[^\n]{0,120}\bбпла\b)"
+    r"[^\n]{0,120}\bна\s+місто\b"
+)
+
 KREMENCHUK_ARCHIVE_HIGH_LOCATION_PATTERNS = (
     "між полтавою та кременчуком",
     "між полтавою і кременчуком",
@@ -2841,8 +2858,16 @@ def has_direct_kremenchuk_target(text):
     ):
         return True
 
-    return re.search(
+    if re.search(
         KREMENCHUK_DIRECT_ALERT_REGEX,
+        normalized,
+    ) is not None:
+        return True
+
+    # Закрываем конкретную форму:
+    # «Кременчук — ударний БпЛА на місто зі сходу».
+    return re.search(
+        KREMENCHUK_CITY_FIRST_TARGET_REGEX,
         normalized,
     ) is not None
 
@@ -2976,6 +3001,136 @@ def classify_kremenchuk_message(text):
     return "IGNORE"
 
 
+def has_monitor_kremenchuk_binding(text):
+    """
+    Строгая привязка именно к городу Кременчук для MONITOR.
+    Кременчуцький район не считается городской привязкой.
+    Водохранилище учитывается отдельно: оно не отменяет прямую
+    привязку к городу, если такая привязка присутствует.
+    """
+    normalized = normalize_text(text)
+
+    return text_has_kremenchuk_variant(normalized)
+
+
+def has_monitor_operational_marker(text):
+    """Оперативные маркеры, достаточные для тревоги при привязке к Кременчугу."""
+    normalized = normalize_text(text)
+    return (
+        "ціль" in normalized
+        or "цілі" in normalized
+        or "вихід" in normalized
+        or "виходи" in normalized
+        or "швидкісна ціль" in normalized
+        or "швидкісні цілі" in normalized
+    )
+
+
+def has_monitor_direct_kremenchuk_binding(text):
+    """
+    Проверяет, что разрешённая цель действительно привязана к Кременчугу,
+    а не просто проходит рядом с городом.
+    """
+    normalized = normalize_text(text)
+
+    if not has_monitor_kremenchuk_binding(text):
+        return False
+
+    # Явные конструкции направления/цели.
+    if has_direct_kremenchuk_target(text):
+        return True
+
+    # Операционные сообщения вида «Кременчук 3 Циркони»,
+    # «Кременчук — спуск балістики», «Кременчук — вихід» и т.п.
+    # Разделяем короткие локальные сегменты по /, чтобы запись
+    # другого города в той же строке не привязывала его цель к Кременчугу.
+    segments = re.split(r"\s*/\s*|\n+", normalized)
+    kremenchuk_terms = (
+        "кременчук",
+        "кременчука",
+        "кременчуці",
+        "кременчуг",
+        "кременчуга",
+        "кременчуге",
+        "кремечук",
+        "кремечука",
+        "кремечуці",
+        "кремычук",
+        "кремычука",
+        "кремычуці",
+    )
+
+    for segment in segments:
+        if not any(term in segment for term in kremenchuk_terms):
+            continue
+
+        # Локальная запись вида «Кременчук 3 Циркони»,
+        # «Кременчук — спуск балістики» или «Кременчук 1х Бандероль».
+        # Самого упоминания города недостаточно: конструкции
+        # «Циркон довкола Кременчука» / «Бандероль через Кременчук»
+        # не должны становиться тревогой.
+        city_pattern = r"(?:кременчук(?:а|у|ом|ці)?|кременчуг(?:а|у|ом|е)?|кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)"
+        target_pattern = "|".join(
+            re.escape(pattern)
+            for pattern in HIGH_SPEED_PATTERNS
+        ) + r"|бандерол(?:ь|і|лю)?"
+        local_target = re.search(
+            city_pattern + r".{0,50}(?:" + target_pattern + r")",
+            segment,
+        )
+        if local_target is not None or has_monitor_operational_marker(segment):
+            return True
+
+    return False
+
+
+def classify_monitor_strict_message(text):
+    """
+    Отдельный строгий классификатор только для MONITOR.
+
+    ALERT допускается только для:
+      - баллистики / БР и других HIGH_SPEED_PATTERNS;
+      - Бандероли;
+      - оперативных маркеров «ціль» / «вихід» при привязке к Кременчугу.
+
+    Обычный БпЛА, «Кременчук увага», одни только взрывы, водохранилище
+    и прочие сообщения тревогу не создают. Сводки не создают ни тревогу,
+    ни архивную карточку.
+    """
+    if not has_monitor_kremenchuk_binding(text):
+        return "IGNORE"
+
+    if is_post_event_report(text):
+        return "IGNORE"
+
+    normalized = normalize_text(text)
+
+    has_allowed_target = has_high_speed_threat(text) or has_banderol(text)
+    has_operational_marker = has_monitor_operational_marker(text)
+
+    if not (has_allowed_target or has_operational_marker):
+        return "IGNORE"
+
+    if not has_monitor_direct_kremenchuk_binding(text):
+        return "IGNORE"
+
+    # Для Бандероли сохраняем строгую защиту от «через/повз/довкола
+    # Кременчука», если нет прямой конструкции цели.
+    if has_banderol(text):
+        if has_direct_kremenchuk_target(text):
+            return "ALERT"
+
+        segments = re.split(r"\s*/\s*|\n+", normalized)
+        for segment in segments:
+            if "кременчук" in segment or "кременчуга" in segment or "кременчуці" in segment:
+                # Локальная запись «Кременчук 1х Бандероль на місто».
+                if re.search(r"кременч(?:ук|уга|ука|уці).{0,50}бандерол", segment):
+                    return "ALERT"
+        return "IGNORE"
+
+    return "ALERT"
+
+
 # Обратная совместимость для участков проекта, где старое имя
 # функции ещё может использоваться во время перехода.
 def classify_monitor_message(text):
@@ -2996,6 +3151,7 @@ def classify_monitor_message(text):
 def build_alert_text(
     source_name,
     source_link,
+    post_link,
     original_text,
     classification,
 ):
@@ -3012,10 +3168,18 @@ def build_alert_text(
     else:
         title = MESSAGES["alert_title_threat"]
 
+    if source_link.rstrip("/").endswith("/kpszsu"):
+        source_label = "🇺🇦 ПОВІТРЯНІ СИЛИ ЗСУ"
+    elif source_link.rstrip("/").endswith("/war_monitor"):
+        source_label = "🛰️ MONITOR"
+    else:
+        # Запасной вариант для уже существующих/тестовых источников.
+        source_label = html.escape(source_name, quote=False)
+
     return MESSAGES["alert_body"].format(
+        source_label=source_label,
         title=title,
-        source_link=source_link,
-        source_name=source_name,
+        post_link=html.escape(post_link, quote=True),
         escaped_text=escaped_text,
     )
 
@@ -3035,9 +3199,15 @@ def send_alert(
         if dedup_key in sent_messages:
             return False
 
+    post_link = build_source_post_link(
+        source_link=source_link,
+        post_id=post_id,
+    )
+
     alert_text = build_alert_text(
         source_name=source_name,
         source_link=source_link,
+        post_link=post_link,
         original_text=original_text,
         classification=classification,
     )
@@ -3156,6 +3326,7 @@ def send_archive(
     if classification not in (
         "ARCHIVE_HIGH",
         "ARCHIVE_NORMAL",
+        "ARCHIVE_MONITOR",
     ):
         return False
 
@@ -3419,13 +3590,48 @@ def check_source(
                 continue
 
             # ------------------------------------------------
-            # ЕДИНАЯ КЛАССИФИКАЦИЯ
+            # РАЗДЕЛЬНАЯ ЛОГИКА PSZSU / MONITOR
             # ------------------------------------------------
-            # ВАЖНО: text уже извлечён функцией
-            # extract_current_message_text(), которая исключает
-            # reply/forward-контекст. Именно этот text идёт
-            # в классификатор и в исходное отправляемое сообщение.
+            # PSZSU оставляем на существующей классификации без изменений.
+            # Для MONITOR сначала проходит отдельный строгий тревожный
+            # фильтр. Если тревога НЕ сработала, но сообщение содержит
+            # Кременчук, оно отправляется ТОЛЬКО в картотеку.
 
+            if is_monitor:
+                monitor_classification = classify_monitor_strict_message(text)
+
+                if monitor_classification == "ALERT":
+                    send_alert(
+                        source_name=source_name,
+                        source_link=source_link,
+                        post_id=post_id,
+                        original_text=text,
+                        classification="HIGH_SPEED_THREAT",
+                    )
+                    continue
+
+                # Сводки/постфактумные отчёты исключаются полностью.
+                if is_post_event_report(text):
+                    continue
+
+                # Всё, что не прошло строгий тревожный фильтр, но
+                # содержит именно город Кременчук, идёт ТОЛЬКО в картотеку.
+                if has_monitor_kremenchuk_binding(text):
+                    send_archive(
+                        source_name=source_name,
+                        source_link=source_link,
+                        post_id=post_id,
+                        original_text=text,
+                        classification="ARCHIVE_MONITOR",
+                        published_at=post_datetime,
+                        received_at=now_utc(),
+                    )
+
+                continue
+
+            # ------------------------------------------------
+            # СТАРАЯ ЛОГИКА PSZSU — НЕ МЕНЯЕМ
+            # ------------------------------------------------
             classification = classify_kremenchuk_message(text)
 
             if classification == "IGNORE":
