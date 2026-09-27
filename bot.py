@@ -132,13 +132,13 @@ MESSAGES = {
     # {escaped_text} — экранированный текст исходного поста.
     # post_id в тревогу намеренно НЕ выводится.
     "alert_body": (
-        "{source_label}\n"
-        "\n"
         "{title}\n"
+        "\n"
+        "{source_label}\n"
         "\n"
         "<blockquote><b>{escaped_text}</b></blockquote>\n"
         "\n"
-        '<a href="{post_link}">📎 Первоисточник</a>'
+        '<a href="{post_link}">🔗 Оригинальный текст сообщения в первоисточнике</a>'
     ),
 
     # --------------------------------------------------------
@@ -377,42 +377,45 @@ MESSAGES = {
 # ============================================================
 
 # ============================================================
-# ОПЕЧАТКИ: PSZSU / ПОВІТРЯНІ СИЛИ
+# ЕДИНЫЕ ВАРИАНТЫ НАЗВАНИЯ ГОРОДА КРЕМЕНЧУК
 # ============================================================
-# Отдельный блок. Эти варианты НЕ являются частью основного
-# реестра ключевых слов и могут изменяться независимо.
-KREMENCHUK_PSZSU_TYPOS = (
-    "кремечук",
-    "кремечука",
-    "кремечуці",
-    "кремычук",
-    "кремычука",
-    "кремычуці",
-)
-
-
-# ============================================================
-# ОПЕЧАТКИ: MONITOR
-# ============================================================
-# Отдельный блок именно для строгого городского фильтра monitor.
-# Районные паттерны этой логикой не заменяются и не расширяются.
-MONITOR_KREMENCHUK_TYPOS = (
-    "кремечук",
-    "кремечука",
-    "кремечуці",
-    "кремычук",
-    "кремычука",
-    "кремычуці",
-)
-
-
-# Именно город Кременчук.
-# Кременчуцький район сюда не входит.
+# Общая настройка для PSZSU и MONITOR.
+# Типичные опечатки и варианты написания города не должны
+# приводить к потере сигнала независимо от типа разрешённой угрозы.
+# Кременчуцький/Кременчугский район сюда НЕ входит.
 KREMENCHUK_CITY_PATTERNS = (
     "кременчук",
     "кременчука",
     "кременчуці",
+    "кременчуком",
+    "кременчуг",
+    "кременчуга",
+    "кременчуге",
+    "кременчугом",
+    "кремечук",
+    "кремечука",
+    "кремечуці",
+    "кремечуком",
+    "кремычук",
+    "кремычука",
+    "кремычуці",
+    "кремычуком",
 )
+
+# Совместимые имена для существующего кода. Оба источника
+# используют теперь один общий набор вариантов.
+KREMENCHUK_PSZSU_TYPOS = (
+    "кремечук",
+    "кремечука",
+    "кремечуці",
+    "кремечуком",
+    "кремычук",
+    "кремычука",
+    "кремычуці",
+    "кремычуком",
+)
+MONITOR_KREMENCHUK_TYPOS = KREMENCHUK_PSZSU_TYPOS
+
 
 BANDEROL_PATTERNS = (
     "бандероль",
@@ -434,6 +437,42 @@ HIGH_SPEED_PATTERNS = (
     "х-47м2",
     "швидкісна ціль",
     "швидкісні цілі",
+)
+
+# Крилаті ракети / КР для MONITOR.
+# Позначення типу самі по собі не є тривогою — потрібна пряма
+# прив'язка саме до міста Кременчук.
+CRUISE_MISSILE_PATTERNS = (
+    "крилата ракета",
+    "крилаті ракети",
+    "крилатих ракет",
+    "крилатою ракетою",
+    "крылатая ракета",
+    "крылатые ракеты",
+    "крылатых ракет",
+    "х-101",
+    "х101",
+    "х-55",
+    "х55",
+    "х-59",
+    "х59",
+    "х-69",
+    "х69",
+    "х-22",
+    "х22",
+    "х-32",
+    "х32",
+    "калібр",
+    "калибр",
+    "3м14",
+    "іскандер-к",
+    "іскандер к",
+    "искандер-к",
+    "искандер к",
+    "9м727",
+    "9м729",
+    "р-500",
+    "р500",
 )
 
 BR_PATTERN = "бр"
@@ -2534,27 +2573,18 @@ def normalize_text(text):
 def has_kremenchuk(text):
     normalized = normalize_text(text)
 
-    if KEYWORD in normalized:
-        return True
-
     return any(
         pattern in normalized
-        for pattern in KREMENCHUK_PSZSU_TYPOS
+        for pattern in KREMENCHUK_VARIANTS
     )
 
 
 def has_kremenchuk_city(text):
     normalized = normalize_text(text)
 
-    if any(
-        pattern in normalized
-        for pattern in KREMENCHUK_CITY_PATTERNS
-    ):
-        return True
-
     return any(
         pattern in normalized
-        for pattern in MONITOR_KREMENCHUK_TYPOS
+        for pattern in KREMENCHUK_VARIANTS
     )
 
 
@@ -2589,6 +2619,17 @@ def has_impact(text):
         pattern in normalized
         for pattern in IMPACT_PATTERNS
     )
+
+
+def has_cruise_missile(text):
+    normalized = normalize_text(text)
+
+    if any(pattern in normalized for pattern in CRUISE_MISSILE_PATTERNS):
+        return True
+
+    # "КР" — только как отдельное сокращение, чтобы не ловить
+    # случайные сочетания букв внутри других слов.
+    return re.search(r"\bкр\b", normalized) is not None
 
 
 def has_high_speed_threat(text):
@@ -2657,16 +2698,11 @@ def is_post_event_report(text):
 
 KREMENCHUK_VARIANTS = (
     "кременчук",
-    "кременчука",
     "кременчуці",
     "кременчуг",
-    "кременчуга",
-    "кременчуге",
     "кремечук",
-    "кремечука",
     "кремечуці",
     "кремычук",
-    "кремычука",
     "кремычуці",
 )
 
@@ -2692,6 +2728,8 @@ KREMENCHUK_DIRECT_ALERT_PATTERNS = (
     "в бік кременчуга",
     "прямує до кременчука",
     "прямують до кременчука",
+    "по кременчуку",
+    "по кременчуга",
     "рухається на кременчук",
     "рухаються на кременчук",
     "летить на кременчук",
@@ -2713,7 +2751,7 @@ KREMENCHUK_DIRECT_ALERT_REGEX = (
     r"рухається\s+на|рухаються\s+на|летить\s+на|летять\s+на|"
     r"ціль\s*(?:—|-|:)?\s*"
     r")"
-    r"(?:кременчук(?:а|у|ом|ці)?|кременчуг(?:а|у|ом|е)?)"
+    r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|кремечук(?:а|у|ом)?|кремечуці|кремычук(?:а|у|ом)?|кремычуці)"
 )
 
 # Отдельная форма официального сообщения: город указан первым,
@@ -2723,7 +2761,8 @@ KREMENCHUK_DIRECT_ALERT_REGEX = (
 # прямой угрозы, которая раньше выпадала из фильтра.
 KREMENCHUK_CITY_FIRST_TARGET_REGEX = (
     r"(?:^|[^\w])\s*"
-    r"(?:кременчук(?:а|у|ом|ці)?|кременчуг(?:а|у|ом|е)?)"
+    r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|"
+    r"кремечук(?:а|у|ом)?|кремечуці|кремычук(?:а|у|ом)?|кремычуці)"
     r"\s*[-—:]\s*"
     r"(?=[^\n]{0,120}\bбпла\b)"
     r"[^\n]{0,120}\bна\s+місто\b"
@@ -3045,20 +3084,7 @@ def has_monitor_direct_kremenchuk_binding(text):
     # Разделяем короткие локальные сегменты по /, чтобы запись
     # другого города в той же строке не привязывала его цель к Кременчугу.
     segments = re.split(r"\s*/\s*|\n+", normalized)
-    kremenchuk_terms = (
-        "кременчук",
-        "кременчука",
-        "кременчуці",
-        "кременчуг",
-        "кременчуга",
-        "кременчуге",
-        "кремечук",
-        "кремечука",
-        "кремечуці",
-        "кремычук",
-        "кремычука",
-        "кремычуці",
-    )
+    kremenchuk_terms = KREMENCHUK_CITY_PATTERNS
 
     for segment in segments:
         if not any(term in segment for term in kremenchuk_terms):
@@ -3069,11 +3095,25 @@ def has_monitor_direct_kremenchuk_binding(text):
         # Самого упоминания города недостаточно: конструкции
         # «Циркон довкола Кременчука» / «Бандероль через Кременчук»
         # не должны становиться тревогой.
-        city_pattern = r"(?:кременчук(?:а|у|ом|ці)?|кременчуг(?:а|у|ом|е)?|кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)"
+        city_pattern = r"(?:" + "|".join(
+            re.escape(pattern) for pattern in KREMENCHUK_CITY_PATTERNS
+        ) + r")"
         target_pattern = "|".join(
             re.escape(pattern)
             for pattern in HIGH_SPEED_PATTERNS
-        ) + r"|бандерол(?:ь|і|лю)?"
+        ) + "|" + "|".join(
+            re.escape(pattern)
+            for pattern in CRUISE_MISSILE_PATTERNS
+        ) + r"|\bкр\b|\bбр\b|бандерол(?:ь|і|лю)?"
+        # Упоминание города как точки пролёта/обхода не считается
+        # прямой угрозой: «повз Кременчук», «через Кременчук»,
+        # «довкола Кременчука».
+        if re.search(
+            r"(?:повз|через|довкола|довкола)\s+" + city_pattern,
+            segment,
+        ):
+            continue
+
         local_target = re.search(
             city_pattern + r".{0,50}(?:" + target_pattern + r")",
             segment,
@@ -3105,7 +3145,15 @@ def classify_monitor_strict_message(text):
 
     normalized = normalize_text(text)
 
-    has_allowed_target = has_high_speed_threat(text) or has_banderol(text)
+    # Дорозвідка не является новой угрозой для отправки тревоги.
+    if "дорозвідка" in normalized:
+        return "IGNORE"
+
+    has_allowed_target = (
+        has_high_speed_threat(text)
+        or has_cruise_missile(text)
+        or has_banderol(text)
+    )
     has_operational_marker = has_monitor_operational_marker(text)
 
     if not (has_allowed_target or has_operational_marker):
@@ -3114,20 +3162,9 @@ def classify_monitor_strict_message(text):
     if not has_monitor_direct_kremenchuk_binding(text):
         return "IGNORE"
 
-    # Для Бандероли сохраняем строгую защиту от «через/повз/довкола
-    # Кременчука», если нет прямой конструкции цели.
-    if has_banderol(text):
-        if has_direct_kremenchuk_target(text):
-            return "ALERT"
-
-        segments = re.split(r"\s*/\s*|\n+", normalized)
-        for segment in segments:
-            if "кременчук" in segment or "кременчуга" in segment or "кременчуці" in segment:
-                # Локальная запись «Кременчук 1х Бандероль на місто».
-                if re.search(r"кременч(?:ук|уга|ука|уці).{0,50}бандерол", segment):
-                    return "ALERT"
-        return "IGNORE"
-
+    # Если строгая проверка уже установила прямую привязку разрешённой
+    # цели к городу, отправляем тревогу. Это одинаково относится к
+    # баллистике, скоростным/крылатым целям и «Бандероли».
     return "ALERT"
 
 
