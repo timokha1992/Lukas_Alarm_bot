@@ -446,7 +446,10 @@ CRUISE_MISSILE_PATTERNS = (
     "крилата ракета",
     "крилаті ракети",
     "крилатих ракет",
+    "крилатої ракети",
     "крилатою ракетою",
+    "крылатых ракет",
+    "крылатой ракеты",
     "крылатая ракета",
     "крылатые ракеты",
     "крылатых ракет",
@@ -2740,6 +2743,14 @@ KREMENCHUK_DIRECT_ALERT_PATTERNS = (
     "ціль - кременчук",
     "цілі — кременчук",
     "цілі - кременчук",
+    "вектор кременчук",
+    "вектором кременчук",
+    "вектор на кременчук",
+    "вектором на кременчук",
+    "вектор кременчуг",
+    "вектором кременчуг",
+    "вектор на кременчуг",
+    "вектором на кременчуг",
 )
 
 # Варианты для явного указания Кременчуга как цели/направления,
@@ -2747,7 +2758,7 @@ KREMENCHUK_DIRECT_ALERT_PATTERNS = (
 KREMENCHUK_DIRECT_ALERT_REGEX = (
     r"(?:"
     r"на|до|у\s+бік|в\s+бік|у\s+напрямку|в\s+напрямку|"
-    r"курс\s+на|прямує\s+до|прямують\s+до|"
+    r"курс\s+на|вектор(?:ом)?(?:\s+на)?|прямує\s+до|прямують\s+до|"
     r"рухається\s+на|рухаються\s+на|летить\s+на|летять\s+на|"
     r"ціль\s*(?:—|-|:)?\s*"
     r")"
@@ -2766,6 +2777,20 @@ KREMENCHUK_CITY_FIRST_TARGET_REGEX = (
     r"\s*[-—:]\s*"
     r"(?=[^\n]{0,120}\bбпла\b)"
     r"[^\n]{0,120}\bна\s+місто\b"
+)
+
+# ПСЗСУ: отдельные городские формы немедленной угрозы.
+# Они не используются фильтром MONITOR.
+KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX = (
+    r"(?:^|[^\w])\s*"
+    r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|"
+    r"кремечук(?:а|у|ом)?|кремечуці|кремычук(?:а|у|ом)?|кремычуці)"
+    r"\s*[-—:]?\s*"
+    r"[^\n]{0,160}?"
+    r"(?:в\s+укриття|терміново\s+в\s+укриття|"
+    r"над\s+містом|в\s+районі\s+міста|"
+    r"в\s+напрямку\s+міста|у\s+напрямку\s+міста|"
+    r"курс(?:ом)?\s+(?:на\s+)?місто|на\s+місто)"
 )
 
 KREMENCHUK_ARCHIVE_HIGH_LOCATION_PATTERNS = (
@@ -2891,22 +2916,49 @@ def has_kremenchuk_impact_location(text):
 def has_direct_kremenchuk_target(text):
     normalized = normalize_text(text)
 
+    # «повз/через/довкола Кременчук» сами по себе НЕ являются
+    # прямой целью. При этом отдельная последующая конструкция
+    # «на Кременчук» в том же сообщении всё равно может дать ALERT.
+    pass_by_city = re.compile(
+        r"(?:повз|через|довкола)\\s+"
+        r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|"
+        r"кремечук(?:а|у|ом)?|кремечуці|кремычук(?:а|у|ом)?|кремычуці)"
+    )
+
     if any(
         pattern in normalized
         for pattern in KREMENCHUK_DIRECT_ALERT_PATTERNS
     ):
-        return True
+        # Не блокируем сообщение, если в нём есть отдельная явная
+        # целевая конструкция после упоминания прохода.
+        if not pass_by_city.search(normalized):
+            return True
 
     if re.search(
         KREMENCHUK_DIRECT_ALERT_REGEX,
         normalized,
     ) is not None:
+        # «повз Кременчук» не должен превращаться в цель.
+        if not pass_by_city.search(normalized):
+            return True
+
+    # Если город упомянут как точка прохода, проверяем остальной текст
+    # отдельно, чтобы «повз Кременчук, курс на ...» не стал целью города.
+    cleaned = pass_by_city.sub(" ", normalized)
+
+    if re.search(KREMENCHUK_DIRECT_ALERT_REGEX, cleaned) is not None:
+        return True
+    if any(pattern in cleaned for pattern in KREMENCHUK_DIRECT_ALERT_PATTERNS):
         return True
 
-    # Закрываем конкретную форму:
-    # «Кременчук — ударний БпЛА на місто зі сходу».
+    # ПСЗСУ: «Кременчук — ударний БпЛА на місто зі сходу».
+    if re.search(KREMENCHUK_CITY_FIRST_TARGET_REGEX, normalized) is not None:
+        return True
+
+    # ПСЗСУ: «Кременчук — в укриття», «Кременчук — над містом БпЛА»,
+    # «Кременчук — БпЛА в напрямку міста» и аналогичные городские формы.
     return re.search(
-        KREMENCHUK_CITY_FIRST_TARGET_REGEX,
+        KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX,
         normalized,
     ) is not None
 
@@ -2920,8 +2972,25 @@ def has_archive_high_location(text):
     ):
         return True
 
-    return re.search(
+    if re.search(
         KREMENCHUK_ARCHIVE_HIGH_TYPO_REGEX,
+        normalized,
+    ) is not None:
+        return True
+
+    # Любой город ↔ Кременчук. Это архивная конструкция, не ALERT.
+    # Нам важна именно форма «між ... та/і/й Кременчуком» и обратная.
+    krem = (
+        r"кременчук(?:а|у|ом)?|кременчуці|"
+        r"кременчуг(?:а|у|ом|е)?|кремечук(?:а|у|ом)?|кремечуці|"
+        r"кремычук(?:а|у|ом)?|кремычуці"
+    )
+    return re.search(
+        r"між\s+(?!" + krem + r"\b)[^,;\n]{1,80}?\s+"
+        r"(?:та|і|й)\s+(?:" + krem + r")"
+        r"|"
+        r"між\s+(?:" + krem + r")\s+(?:та|і|й)\s+"
+        r"(?!" + krem + r"\b)[^,;\n]{1,80}",
         normalized,
     ) is not None
 
@@ -2962,8 +3031,8 @@ def classify_kremenchuk_message(text):
         или направление.
 
     ARCHIVE_HIGH:
-      - сообщение о группах между Полтавой и Кременчуком
-        с указанным курсом/направлением.
+      - конструкция «між [любой город] та/і/й Кременчуком»
+        или обратная; это картотека повышенного внимания.
 
     ARCHIVE_NORMAL:
       - сообщение о положении севернее/южнее/восточнее/
@@ -3014,10 +3083,7 @@ def classify_kremenchuk_message(text):
     # --------------------------------------------------------
     # 3. ARCHIVE_HIGH — между Полтавой и Кременчугом + курс.
     # --------------------------------------------------------
-    if (
-        has_archive_high_location(text)
-        and has_course_or_direction(text)
-    ):
+    if has_archive_high_location(text):
         return "ARCHIVE_HIGH"
 
     # --------------------------------------------------------
