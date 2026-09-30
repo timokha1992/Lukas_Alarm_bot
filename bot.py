@@ -149,27 +149,12 @@ MESSAGES = {
     # время публикации исходного поста, источник, уровень внимания,
     # ID исходного сообщения, прямую ссылку на исходный пост
     # и текст самого сообщения.
-    "archive_high_body": (
-        "🔴 КАРТОТЕКА — ПОВЫШЕННОЕ ВНИМАНИЕ\n"
+    "archive_body": (
+        "📚 КАРТОТЕКА\n"
         "\n"
         "🕐 Получено ботом: {received_at}\n"
         "🕐 Время сообщения: {published_at}\n"
         "📡 Источник: {source_name}\n"
-        "🎯 Тип: 🔴 повышенное внимание\n"
-        "🆔 ID исходного сообщения: {post_id}\n"
-        '<a href="{post_link}">🔗 Оригинальное сообщение</a>\n'
-        "\n"
-        "📝 Сообщение:\n"
-        "<blockquote>{escaped_text}</blockquote>"
-    ),
-
-    "archive_normal_body": (
-        "🟡 КАРТОТЕКА — ОБЫЧНОЕ ВНИМАНИЕ\n"
-        "\n"
-        "🕐 Получено ботом: {received_at}\n"
-        "🕐 Время сообщения: {published_at}\n"
-        "📡 Источник: {source_name}\n"
-        "🎯 Тип: 🟡 обычное внимание\n"
         "🆔 ID исходного сообщения: {post_id}\n"
         '<a href="{post_link}">🔗 Оригинальное сообщение</a>\n'
         "\n"
@@ -421,6 +406,45 @@ BANDEROL_PATTERNS = (
     "бандероль",
     "бандеролі",
     "бандероллю",
+    "s8000",
+    "s-8000",
+    "s 8000",
+)
+
+# MONITOR: БпЛА/дрони для обязательного архивного сбора.
+# Эти признаки НЕ являются оперативными целями. Любое сообщение MONITOR,
+# содержащее БпЛА/дрон + Кременчук, отправляется в приватную картотеку
+# для последующего анализа, независимо от строгого ALERT-фильтра.
+MONITOR_UAV_ARCHIVE_PATTERNS = (
+    "бпла",
+    "бплa",
+    "беспілотник",
+    "беспілотники",
+    "безпілотник",
+    "безпілотники",
+    "беспилотник",
+    "беспилотники",
+    "дрон",
+    "дрони",
+    "дрона",
+    "дронів",
+    "дронов",
+    "ударний дрон",
+    "ударные дроны",
+    "камікадзе-дрон",
+    "камикадзе-дрон",
+    "безпілотний літальний апарат",
+    "беспилотный летательный аппарат",
+    "fpv",
+    "шахед",
+    "shahed",
+    "герань",
+    "geran",
+    "гербера",
+    "gerbera",
+    "ланцет",
+    "lancet",
+    "uav",
 )
 
 HIGH_SPEED_PATTERNS = (
@@ -435,6 +459,19 @@ HIGH_SPEED_PATTERNS = (
     "циркон",
     "3м22",
     "х-47м2",
+    "kn-23",
+    "kn23",
+    "кн-23",
+    "кн23",
+    "kn-24",
+    "kn24",
+    "кн-24",
+    "кн24",
+    "hwasong-11",
+    "hwasong 11",
+    "іскандер",
+    "искандер",
+    "9м723",
     "швидкісна ціль",
     "швидкісні цілі",
 )
@@ -468,10 +505,15 @@ CRUISE_MISSILE_PATTERNS = (
     "калібр",
     "калибр",
     "3м14",
-    "іскандер-к",
-    "іскандер к",
-    "искандер-к",
-    "искандер к",
+    "онікс",
+    "оникс",
+    "п-800",
+    "п800",
+    "p-800",
+    "p800",
+    "яхонт",
+    "ss-n-26",
+    "strobile",
     "9м727",
     "9м729",
     "р-500",
@@ -2685,15 +2727,14 @@ def is_post_event_report(text):
 #
 # Результаты классификации:
 #   ALERT          -> только основной рабочий чат
-#   ARCHIVE_HIGH   -> только картотека
-#   ARCHIVE_NORMAL -> только картотека
+#   ARCHIVE        -> только картотека
 #   IGNORE         -> никуда
 #
 # ВАЖНО:
 # 1. Текст для анализа берётся только из текущего сообщения.
 #    Reply/quote/forward-контекст Telegram не анализируется.
 #    Это защищает от повторных пересылок и ответов на старые посты.
-# 2. Приоритет строгий: ALERT > ARCHIVE_HIGH > ARCHIVE_NORMAL > IGNORE.
+# 2. Приоритет строгий: ALERT > ARCHIVE > IGNORE.
 # 3. Подтверждённое событие/удар по Кременчугу или Кременчугскому
 #    району сохраняется как ALERT — это существующая рабочая логика.
 # 4. Для обычной новой угрозы ALERT требует явного указания
@@ -2997,7 +3038,6 @@ def has_archive_high_location(text):
 
 def has_course_or_direction(text):
     normalized = normalize_text(text)
-
     return re.search(
         COURSE_DIRECTION_REGEX,
         normalized,
@@ -3021,7 +3061,7 @@ def has_archive_normal_location(text):
 
 def classify_kremenchuk_message(text):
     """
-    Основная четырёхуровневая классификация.
+    Основная классификация.
 
     ALERT:
       - подтверждённое событие/удар с упоминанием Кременчуга
@@ -3030,14 +3070,9 @@ def classify_kremenchuk_message(text):
       - либо новая угроза, где Кременчуг явно указан как цель
         или направление.
 
-    ARCHIVE_HIGH:
-      - конструкция «між [любой город] та/і/й Кременчуком»
-        или обратная; это картотека повышенного внимания.
-
-    ARCHIVE_NORMAL:
-      - сообщение о положении севернее/южнее/восточнее/
-        западнее Кременчуга (или аналогичная конструкция)
-        с указанным движением/курсом/направлением.
+    ARCHIVE:
+      - любая предусмотренная архивная география; отдельного
+        уровня «повышенное/обычное внимание» больше нет.
 
     IGNORE:
       - всё остальное, включая одно только упоминание
@@ -3081,19 +3116,19 @@ def classify_kremenchuk_message(text):
     )
 
     # --------------------------------------------------------
-    # 3. ARCHIVE_HIGH — между Полтавой и Кременчугом + курс.
+    # 3. ARCHIVE — предусмотренная архивная география.
     # --------------------------------------------------------
     if has_archive_high_location(text):
-        return "ARCHIVE_HIGH"
+        return "ARCHIVE"
 
     # --------------------------------------------------------
-    # 4. ARCHIVE_NORMAL — пограничная география + курс.
+    # 4. ARCHIVE — пограничная география + курс.
     # --------------------------------------------------------
     if (
         has_archive_normal_location(text)
         and has_course_or_direction(text)
     ):
-        return "ARCHIVE_NORMAL"
+        return "ARCHIVE"
 
     # Водохранилище без явного направления сюда попадает.
     if reservoir_only:
@@ -3116,6 +3151,63 @@ def has_monitor_kremenchuk_binding(text):
     normalized = normalize_text(text)
 
     return text_has_kremenchuk_variant(normalized)
+
+
+def has_monitor_uav_archive_marker(text):
+    """Проверяет наличие общего признака БпЛА/дрона для архивного сбора MONITOR."""
+    normalized = normalize_text(text)
+    return any(pattern in normalized for pattern in MONITOR_UAV_ARCHIVE_PATTERNS)
+
+
+def has_monitor_archive_target_binding(text):
+    """
+    Контрольный архив MONITOR.
+
+    ARCHIVE_MONITOR не является копией всех сообщений с Кременчуком.
+    Он собирает потенциально значимые цели, которые прямо связаны
+    с Кременчуком, но пока не распознаны строгим ALERT-фильтром.
+
+    БпЛА не являются отдельным условием архива: обычный БпЛА
+    попадёт сюда только при прямой целевой/направленной связи
+    с Кременчуком — так же, как неизвестная новая цель.
+    """
+    normalized = normalize_text(text)
+
+    if not has_monitor_kremenchuk_binding(text):
+        return False
+    if is_post_event_report(text):
+        return False
+    if "дорозвідка" in normalized:
+        return False
+
+    city_pattern = (
+        r"(?:"
+        + "|".join(re.escape(pattern) for pattern in KREMENCHUK_CITY_PATTERNS)
+        + r")"
+    )
+
+    direct_relation = re.compile(
+        r"(?:"
+        r"(?:курс(?:ом)?|вектор(?:ом)?)\s+(?:на\s+)?" + city_pattern
+        + r"|(?:на|до)\s+" + city_pattern
+        + r"|(?:у|в)\s+(?:напрямку|направлении|бік|сторону)\s+" + city_pattern
+        + r"|(?:ціль|цілі|об'єкт|об’єкт|объект)[^\n]{0,100}" + city_pattern
+        + r"|(?:рухається|рухаються|летить|летять|прямує|прямують|йде|йдуть)[^\n]{0,100}" + city_pattern
+        + r"|" + city_pattern + r"[^\n]{0,100}(?:ціль|цілі|об'єкт|об’єкт|объект|над\s+містом)"
+        + r"|[^\n]{0,100}(?:->|→|➜|➝|➡)[^\n]{0,30}" + city_pattern
+        + r")"
+    )
+
+    pass_by = re.compile(r"(?:повз|через|довкола)\s+" + city_pattern)
+    if pass_by.search(normalized):
+        cleaned = pass_by.sub(" ", normalized)
+        if not direct_relation.search(cleaned):
+            return False
+
+    if not direct_relation.search(normalized):
+        return False
+
+    return True
 
 
 def has_monitor_operational_marker(text):
@@ -3170,7 +3262,10 @@ def has_monitor_direct_kremenchuk_binding(text):
         ) + "|" + "|".join(
             re.escape(pattern)
             for pattern in CRUISE_MISSILE_PATTERNS
-        ) + r"|\bкр\b|\bбр\b|бандерол(?:ь|і|лю)?"
+        ) + "|" + "|".join(
+            re.escape(pattern)
+            for pattern in BANDEROL_PATTERNS
+        ) + r"|\bкр\b|\bбр\b"
         # Упоминание города как точки пролёта/обхода не считается
         # прямой угрозой: «повз Кременчук», «через Кременчук»,
         # «довкола Кременчука».
@@ -3388,10 +3483,7 @@ def build_archive_text(
         quote=False,
     )
 
-    if classification == "ARCHIVE_HIGH":
-        template = MESSAGES["archive_high_body"]
-    else:
-        template = MESSAGES["archive_normal_body"]
+    template = MESSAGES["archive_body"]
 
     return template.format(
         received_at=format_time(received_at),
@@ -3425,10 +3517,9 @@ def send_archive(
     published_at,
     received_at=None,
 ):
-    """Отправляет только ARCHIVE_HIGH / ARCHIVE_NORMAL в картотеку."""
+    """Отправляет архивные сообщения в приватную картотеку."""
     if classification not in (
-        "ARCHIVE_HIGH",
-        "ARCHIVE_NORMAL",
+        "ARCHIVE",
         "ARCHIVE_MONITOR",
     ):
         return False
@@ -3701,6 +3792,8 @@ def check_source(
             # Кременчук, оно отправляется ТОЛЬКО в картотеку.
 
             if is_monitor:
+                # MONITOR: сначала действует строгий оперативный фильтр.
+                # Если сообщение уже распознано как тревога — только ALERT.
                 monitor_classification = classify_monitor_strict_message(text)
 
                 if monitor_classification == "ALERT":
@@ -3713,13 +3806,12 @@ def check_source(
                     )
                     continue
 
-                # Сводки/постфактумные отчёты исключаются полностью.
-                if is_post_event_report(text):
-                    continue
-
-                # Всё, что не прошло строгий тревожный фильтр, но
-                # содержит именно город Кременчук, идёт ТОЛЬКО в картотеку.
-                if has_monitor_kremenchuk_binding(text):
+                # Если ALERT не сработал, в картотеку попадает не любое
+                # упоминание Кременчуга, а только потенциально значимая
+                # цель с прямой связью с городом. Это контроль качества
+                # фильтра: неизвестные типы целей можно обнаружить и
+                # позже добавить в словарь ALERT.
+                if has_monitor_archive_target_binding(text):
                     send_archive(
                         source_name=source_name,
                         source_link=source_link,
@@ -3754,10 +3846,7 @@ def check_source(
                 )
                 continue
 
-            if classification in (
-                "ARCHIVE_HIGH",
-                "ARCHIVE_NORMAL",
-            ):
+            if classification == "ARCHIVE":
                 send_archive(
                     source_name=source_name,
                     source_link=source_link,
