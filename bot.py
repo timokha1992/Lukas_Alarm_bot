@@ -2839,6 +2839,18 @@ KREMENCHUK_CITY_FIRST_TARGET_REGEX = (
 
 # ПСЗСУ: отдельные городские формы немедленной угрозы.
 # Они не используются фильтром MONITOR.
+# ПСЗСУ: курс на Кременчук с предлогом «на» или без него.
+# Реальные формы источника: «курс Кременчук», «курсом Кременчук»,
+# «курс на Кременчук», «курсом на Кременчук».
+# Этот блок относится только к ПСЗСУ.
+KREMENCHUK_PSZSU_COURSE_TARGET_REGEX = (
+    r"\\bкурс(?:ом)?\\s+(?:на\\s+)?"
+    r"(?:кременчук(?:а|у|ом)?|кременчуці|"
+    r"кременчуг(?:а|у|ом|е)?|"
+    r"кремечук(?:а|у|ом)?|кремечуці|"
+    r"кремычук(?:а|у|ом)?|кремычуці)\\b"
+)
+
 KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX = (
     r"(?:^|[^\w])\s*"
     r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|"
@@ -3014,13 +3026,20 @@ def has_direct_kremenchuk_target(text, include_pszsu_city_first=True):
     if re.search(KREMENCHUK_CITY_FIRST_TARGET_REGEX, normalized) is not None:
         return True
 
-    # ПСЗСУ: отдельные городские формы немедленной угрозы.
+    # ПСЗСУ: курс/курсом Кременчук — отдельная форма направления.
     # Для MONITOR этот PSZSU-only блок не используется.
     if include_pszsu_city_first:
-        return re.search(
+        if re.search(
+            KREMENCHUK_PSZSU_COURSE_TARGET_REGEX,
+            normalized,
+        ) is not None:
+            return True
+
+        if re.search(
             KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX,
             normalized,
-        ) is not None
+        ) is not None:
+            return True
 
     return False
 
