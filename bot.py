@@ -2864,91 +2864,6 @@ KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX = (
     r"курс(?:ом)?\s+(?:на\s+)?місто|на\s+місто)"
 )
 
-KREMENCHUK_ARCHIVE_HIGH_LOCATION_PATTERNS = (
-    "між полтавою та кременчуком",
-    "між полтавою і кременчуком",
-    "між полтавою й кременчуком",
-    "між кременчуком та полтавою",
-    "між кременчуком і полтавою",
-    "між кременчуком й полтавою",
-    "між полтавою та кременчугом",
-    "між полтавою і кременчугом",
-    "між кременчугом та полтавою",
-    "між кременчугом і полтавою",
-)
-
-KREMENCHUK_ARCHIVE_NORMAL_DIRECTION_PATTERNS = (
-    "північніше кременчука",
-    "південніше кременчука",
-    "східніше кременчука",
-    "західніше кременчука",
-    "північніше кременчуга",
-    "південніше кременчуга",
-    "східніше кременчуга",
-    "західніше кременчуга",
-    "на північ від кременчука",
-    "на південь від кременчука",
-    "на схід від кременчука",
-    "на захід від кременчука",
-    "на північ від кременчуга",
-    "на південь від кременчуга",
-    "на схід від кременчуга",
-    "на захід від кременчуга",
-)
-
-# Для опечаток относительные конструкции проверяем через отдельные
-# regex, чтобы не расширять общий fuzzy-поиск.
-KREMENCHUK_ARCHIVE_NORMAL_TYPO_REGEX = (
-    r"(?:північніше|південніше|східніше|західніше)\s+"
-    r"(?:кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)"
-    r"|"
-    r"на\s+(?:північ|південь|схід|захід)\s+від\s+"
-    r"(?:кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)"
-)
-
-KREMENCHUK_ARCHIVE_HIGH_TYPO_REGEX = (
-    r"між\s+полтавою\s+(?:та|і|й)\s+"
-    r"(?:кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)"
-    r"|"
-    r"між\s+(?:кремечук(?:а|у|ом|ці)?|кремычук(?:а|у|ом|ці)?)\s+"
-    r"(?:та|і|й)\s+полтавою"
-)
-
-COURSE_DIRECTION_REGEX = (
-    r"(?:"
-    r"курс(?:ом)?\s+(?:на\s+)?(?:"
-    r"захід|схід|північ|південь|"
-    r"західний|східний|північний|південний|"
-    r"західному|східному|північному|південному|"
-    r"північно-західний|північно-східний|"
-    r"південно-західний|південно-східний|"
-    r"північно-західному|північно-східному|"
-    r"південно-західному|південно-східному"
-    r")"
-    r"|напрям(?:ок)?\s+(?:на\s+)?(?:"
-    r"захід|схід|північ|південь|"
-    r"західний|східний|північний|південний|"
-    r"західному|східному|північному|південному|"
-    r"північно-західний|північно-східний|"
-    r"південно-західний|південно-східний|"
-    r"північно-західному|північно-східному|"
-    r"південно-західному|південно-східному"
-    r")"
-    r"|(?:рухається|рухаються|прямує|прямують|летить|летять)\s+"
-    r"(?:на\s+)?(?:"
-    r"захід|схід|північ|південь|"
-    r"західний|східний|північний|південний|"
-    r"західному|східному|північному|південному|"
-    r"північно-західний|північно-східний|"
-    r"південно-західний|південно-східний|"
-    r"північно-західному|північно-східному|"
-    r"південно-західному|південно-східному"
-    r")"
-    r"|(?:рухається|рухаються|прямує|прямують|летить|летять)\s+"
-    r"у\s+(?:західному|східному|північному|південному)\s+напрямку"
-    r")"
-)
-
 KREMENCHUK_RESERVOIR_PATTERNS = (
     "кременчуцьке водосховище",
     "кременчуцького водосховища",
@@ -3044,139 +2959,72 @@ def has_direct_kremenchuk_target(text, include_pszsu_city_first=True):
     return False
 
 
-def has_archive_high_location(text):
+PSZSU_KREMENCHUK_CITY_REGEX = (
+    r"(?:кременчук(?:а|у|ом)?|кременчуці|"
+    r"кременчуг(?:а|у|ом|е)?|"
+    r"кремечук(?:а|у|ом)?|кремечуці|кремечуком|"
+    r"кремычук(?:а|у|ом)?|кремычуці|кремычуком)"
+)
+
+PSZSU_KREMENCHUK_MINUS_REGEX = (
+    r"(?:"
+    r"кременчуцьк(?:ий|ого|ому|им)\s+район(?:у|і|ом)?"
+    r"|кременчуцьк(?:е|ого|им)\s+водосховищ(?:е|а|ем)"
+    r"|повз\s+" + PSZSU_KREMENCHUK_CITY_REGEX
+    + r"|довкола\s+" + PSZSU_KREMENCHUK_CITY_REGEX
+    + r")"
+)
+
+PSZSU_ARCHIVE_HIGH_REGEX = (
+    r"між\s+(?!" + PSZSU_KREMENCHUK_CITY_REGEX + r"\b)[^,;\n]{1,80}?\s+"
+    + r"(?:та|і|й)\s+" + PSZSU_KREMENCHUK_CITY_REGEX
+    + r"|між\s+" + PSZSU_KREMENCHUK_CITY_REGEX + r"\s+(?:та|і|й)\s+"
+    + r"(?!" + PSZSU_KREMENCHUK_CITY_REGEX + r"\b)[^,;\n]{1,80}"
+)
+
+PSZSU_ARCHIVE_DIRECTION_REGEX = (
+    r"(?:північніше|південніше|східніше|західніше)\s+"
+    + PSZSU_KREMENCHUK_CITY_REGEX
+    + r"|на\s+(?:північ|південь|схід|захід)\s+від\s+"
+    + PSZSU_KREMENCHUK_CITY_REGEX
+)
+
+
+def normalize_pszsu_text(text):
     normalized = normalize_text(text)
-
-    if any(
-        pattern in normalized
-        for pattern in KREMENCHUK_ARCHIVE_HIGH_LOCATION_PATTERNS
-    ):
-        return True
-
-    if re.search(
-        KREMENCHUK_ARCHIVE_HIGH_TYPO_REGEX,
+    return re.sub(
+        r"(?<!\w)м\s*\.\s*(?=" + PSZSU_KREMENCHUK_CITY_REGEX + r"(?:\b|$))",
+        "",
         normalized,
-    ) is not None:
-        return True
-
-    # Любой город ↔ Кременчук. Это архивная конструкция, не ALERT.
-    # Нам важна именно форма «між ... та/і/й Кременчуком» и обратная.
-    krem = (
-        r"кременчук(?:а|у|ом)?|кременчуці|"
-        r"кременчуг(?:а|у|ом|е)?|кремечук(?:а|у|ом)?|кремечуці|"
-        r"кремычук(?:а|у|ом)?|кремычуці"
-    )
-    return re.search(
-        r"між\s+(?!" + krem + r"\b)[^,;\n]{1,80}?\s+"
-        r"(?:та|і|й)\s+(?:" + krem + r")"
-        r"|"
-        r"між\s+(?:" + krem + r")\s+(?:та|і|й)\s+"
-        r"(?!" + krem + r"\b)[^,;\n]{1,80}",
-        normalized,
-    ) is not None
-
-
-def has_course_or_direction(text):
-    normalized = normalize_text(text)
-    return re.search(
-        COURSE_DIRECTION_REGEX,
-        normalized,
-    ) is not None
-
-
-def has_archive_normal_location(text):
-    normalized = normalize_text(text)
-
-    if any(
-        pattern in normalized
-        for pattern in KREMENCHUK_ARCHIVE_NORMAL_DIRECTION_PATTERNS
-    ):
-        return True
-
-    return re.search(
-        KREMENCHUK_ARCHIVE_NORMAL_TYPO_REGEX,
-        normalized,
-    ) is not None
-
-
-def classify_kremenchuk_message(text):
-    """
-    Основная классификация.
-
-    ALERT:
-      - подтверждённое событие/удар с упоминанием Кременчуга
-        или Кременчугского района — сохраняем существующую
-        рабочую логику;
-      - либо новая угроза, где Кременчуг явно указан как цель
-        или направление.
-
-    ARCHIVE:
-      - любая предусмотренная архивная география; отдельного
-        уровня «повышенное/обычное внимание» больше нет.
-
-    IGNORE:
-      - всё остальное, включая одно только упоминание
-        Кременчуга или Кременчугского водохранилища без
-        threat-relevant направления.
-    """
-
-    normalized = normalize_text(text)
-
-    # --------------------------------------------------------
-    # 1. ALERT — подтверждённое событие.
-    # Район здесь разрешён: это сохранение старой рабочей
-    # логики monitor.
-    # --------------------------------------------------------
-    if has_kremenchuk_impact_location(text) and has_impact(text):
-        return "ALERT"
-
-    # Продолжающееся старое сообщение не создаёт новую тревогу.
-    if is_continuing_threat(text):
-        return "IGNORE"
-
-    # Пост-событийные сводки не должны превращаться в новые
-    # оперативные тревоги или карточки.
-    if is_post_event_report(text):
-        return "IGNORE"
-
-    # --------------------------------------------------------
-    # 2. ALERT — явная цель/направление на Кременчуг.
-    # --------------------------------------------------------
-    if has_direct_kremenchuk_target(text):
-        return "ALERT"
-
-    # --------------------------------------------------------
-    # Явное упоминание только водохранилища без threat-relevant
-    # конструкции — IGNORE. Проверка сделана отдельно для
-    # читаемости и защиты от случайного расширения фильтра.
-    # --------------------------------------------------------
-    reservoir_only = any(
-        pattern in normalized
-        for pattern in KREMENCHUK_RESERVOIR_PATTERNS
     )
 
-    # --------------------------------------------------------
-    # 3. ARCHIVE — предусмотренная архивная география.
-    # --------------------------------------------------------
-    if has_archive_high_location(text):
-        return "ARCHIVE"
 
-    # --------------------------------------------------------
-    # 4. ARCHIVE — пограничная география + курс.
-    # --------------------------------------------------------
-    if (
-        has_archive_normal_location(text)
-        and has_course_or_direction(text)
-    ):
-        return "ARCHIVE"
+def pszsu_has_kremenchuk_outside_minus(text):
+    normalized = normalize_pszsu_text(text)
+    cleaned = re.sub(PSZSU_KREMENCHUK_MINUS_REGEX, " ", normalized)
+    return re.search(
+        r"(?<![а-яіїєґ])" + PSZSU_KREMENCHUK_CITY_REGEX + r"(?![а-яіїєґ])",
+        cleaned,
+    ) is not None
 
-    # Водохранилище без явного направления сюда попадает.
-    if reservoir_only:
+
+def classify_pszsu_kremenchuk_message(text):
+    """PSZSU: широкий городской триггер + согласованные исключения."""
+    if is_continuing_threat(text) or is_post_event_report(text):
         return "IGNORE"
 
-    # Любое обычное упоминание города без нужной конструкции.
-    if text_has_kremenchuk_variant(normalized):
-        return "IGNORE"
+    normalized = normalize_pszsu_text(text)
+
+    # Архивная география имеет приоритет над общим городским триггером.
+    if re.search(PSZSU_ARCHIVE_HIGH_REGEX, normalized):
+        return "ARCHIVE_HIGH"
+
+    if re.search(PSZSU_ARCHIVE_DIRECTION_REGEX, normalized):
+        return "ARCHIVE_NORMAL"
+
+    # После удаления минус-конструкций остаётся самостоятельный город — ALERT.
+    if pszsu_has_kremenchuk_outside_minus(text):
+        return "ALERT"
 
     return "IGNORE"
 
@@ -3369,19 +3217,6 @@ def classify_monitor_strict_message(text):
     # цели к городу, отправляем тревогу. Это одинаково относится к
     # баллистике, скоростным/крылатым целям и «Бандероли».
     return "ALERT"
-
-
-# Обратная совместимость для участков проекта, где старое имя
-# функции ещё может использоваться во время перехода.
-def classify_monitor_message(text):
-    classification = classify_kremenchuk_message(text)
-
-    if classification == "ALERT":
-        if has_kremenchuk_impact_location(text) and has_impact(text):
-            return "IMPACT_CONFIRMED"
-        return "HIGH_SPEED_THREAT"
-
-    return "IGNORE"
 
 
 # ============================================================
@@ -3867,9 +3702,9 @@ def check_source(
                 continue
 
             # ------------------------------------------------
-            # СТАРАЯ ЛОГИКА PSZSU — НЕ МЕНЯЕМ
+            # PSZSU — широкий городской триггер + minus-фильтр
             # ------------------------------------------------
-            classification = classify_kremenchuk_message(text)
+            classification = classify_pszsu_kremenchuk_message(text)
 
             if classification == "IGNORE":
                 continue
