@@ -2605,7 +2605,7 @@ def get_post_datetime(element):
 # ============================================================
 
 def normalize_text(text):
-    return " ".join(
+    normalized = " ".join(
         text.lower()
         .replace(
             "ё",
@@ -2613,6 +2613,23 @@ def normalize_text(text):
         )
         .split()
     )
+
+    # Общее сокращение «м.» / «м .» перед Кременчуком.
+    # Нормализуем его один раз до применения отдельных фильтров
+    # ПСЗСУ и MONITOR, не смешивая их семантику.
+    kremenchuk_name = (
+        r"(?:кременчук(?:а|у|ом)?|кременчуці|"
+        r"кременчуг(?:а|у|ом|е)?|"
+        r"кремечук(?:а|у|ом)?|кремечуці|"
+        r"кремычук(?:а|у|ом)?|кремычуці)"
+    )
+    normalized = re.sub(
+        r"(?<!\w)м\s*\.\s*(?=" + kremenchuk_name + r"(?:\b|$))",
+        "",
+        normalized,
+    )
+
+    return normalized
 
 
 def has_kremenchuk(text):
@@ -2831,6 +2848,7 @@ KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX = (
     r"(?:в\s+укриття|терміново\s+в\s+укриття|"
     r"над\s+містом|в\s+районі\s+міста|"
     r"в\s+напрямку\s+міста|у\s+напрямку\s+міста|"
+    r"у\s+вашому\s+напрямку|в\s+вашому\s+напрямку|"
     r"курс(?:ом)?\s+(?:на\s+)?місто|на\s+місто)"
 )
 
@@ -2954,7 +2972,7 @@ def has_kremenchuk_impact_location(text):
     )
 
 
-def has_direct_kremenchuk_target(text):
+def has_direct_kremenchuk_target(text, include_pszsu_city_first=True):
     normalized = normalize_text(text)
 
     # «повз/через/довкола Кременчук» сами по себе НЕ являются
@@ -2996,12 +3014,15 @@ def has_direct_kremenchuk_target(text):
     if re.search(KREMENCHUK_CITY_FIRST_TARGET_REGEX, normalized) is not None:
         return True
 
-    # ПСЗСУ: «Кременчук — в укриття», «Кременчук — над містом БпЛА»,
-    # «Кременчук — БпЛА в напрямку міста» и аналогичные городские формы.
-    return re.search(
-        KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX,
-        normalized,
-    ) is not None
+    # ПСЗСУ: отдельные городские формы немедленной угрозы.
+    # Для MONITOR этот PSZSU-only блок не используется.
+    if include_pszsu_city_first:
+        return re.search(
+            KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX,
+            normalized,
+        ) is not None
+
+    return False
 
 
 def has_archive_high_location(text):
@@ -3234,7 +3255,9 @@ def has_monitor_direct_kremenchuk_binding(text):
         return False
 
     # Явные конструкции направления/цели.
-    if has_direct_kremenchuk_target(text):
+    # Явные конструкции направления/цели.
+    # PSZSU-only городские формы здесь намеренно отключены.
+    if has_direct_kremenchuk_target(text, include_pszsu_city_first=False):
         return True
 
     # Операционные сообщения вида «Кременчук 3 Циркони»,
