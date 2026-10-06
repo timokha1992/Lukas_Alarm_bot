@@ -1754,7 +1754,11 @@ def send_telegram_message(
     disable_link_preview=False,
     chat_id=None,
 ):
-    """Отправляет сообщение в указанный чат или, по умолчанию, в CHAT_ID."""
+    """
+    Отправляет сообщение. Без chat_id - в рабочий чат CHAT_ID, как всегда.
+    chat_id нужен только там, где ответ должен уйти в конкретный чат
+    (сейчас: ответ /classify в тот чат, откуда пришёл запрос).
+    """
     data = {
         "chat_id": CHAT_ID if chat_id is None else chat_id,
         "text": text,
@@ -2587,13 +2591,14 @@ def verify_status_pinned():
 # ============================================================
 
 def is_group_admin(user_id, chat_id=None):
-    """Проверяет администратора именно в том чате, где пришла команда."""
-    target_chat_id = CHAT_ID if chat_id is None else chat_id
-
+    """
+    Администратор ли пользователь в чате chat_id.
+    Без chat_id - в рабочем чате CHAT_ID (прежнее поведение).
+    """
     result = telegram_request(
         "getChatMember",
         {
-            "chat_id": target_chat_id,
+            "chat_id": CHAT_ID if chat_id is None else chat_id,
             "user_id": user_id,
         },
     )
@@ -2727,16 +2732,19 @@ def handle_classify_command(message):
     """
     /classify [pszsu|monitor] <текст> - только для администратора.
 
-    Команда разрешена в двух служебных чатах: основной рабочей группе
-    CHAT_ID и приватной картотеке ARCHIVE_CHAT_ID. Ответ всегда уходит
-    в тот же чат, откуда пришёл запрос. Реальная тревога/архивирование
-    при этом не выполняются.
+    Разрешён в двух чатах: рабочем CHAT_ID и приватной картотеке
+    ARCHIVE_CHAT_ID (если она настроена; иначе из картотеки команда
+    игнорируется, без подмены на рабочий чат). Права администратора
+    проверяются именно в том чате, откуда пришла команда, и ответ
+    уходит в тот же чат. Команда только классифицирует текст: тревогу,
+    архивную карточку, dedup и состояние она не трогает.
     """
     chat = message.get("chat", {})
     sender = message.get("from", {})
     chat_id = chat.get("id")
 
     allowed_chats = {CHAT_ID}
+
     if ARCHIVE_CHAT_ID is not None:
         allowed_chats.add(ARCHIVE_CHAT_ID)
 
@@ -2748,7 +2756,7 @@ def handle_classify_command(message):
     if not user_id:
         return
 
-    if not is_group_admin(user_id, chat_id=chat_id):
+    if not is_group_admin(user_id, chat_id):
         print(
             "Команда /classify отклонена: "
             f"пользователь {user_id} не администратор.",
