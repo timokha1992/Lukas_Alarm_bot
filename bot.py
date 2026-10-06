@@ -1752,9 +1752,11 @@ def send_telegram_message(
     text,
     parse_mode=None,
     disable_link_preview=False,
+    chat_id=None,
 ):
+    """Отправляет сообщение в указанный чат или, по умолчанию, в CHAT_ID."""
     data = {
-        "chat_id": CHAT_ID,
+        "chat_id": CHAT_ID if chat_id is None else chat_id,
         "text": text,
     }
 
@@ -2584,11 +2586,14 @@ def verify_status_pinned():
 # TELEGRAM COMMANDS
 # ============================================================
 
-def is_group_admin(user_id):
+def is_group_admin(user_id, chat_id=None):
+    """Проверяет администратора именно в том чате, где пришла команда."""
+    target_chat_id = CHAT_ID if chat_id is None else chat_id
+
     result = telegram_request(
         "getChatMember",
         {
-            "chat_id": CHAT_ID,
+            "chat_id": target_chat_id,
             "user_id": user_id,
         },
     )
@@ -2719,11 +2724,23 @@ def build_classify_reply(text, which=None):
 
 
 def handle_classify_command(message):
-    """/classify [pszsu|monitor] <текст> - только для администратора."""
+    """
+    /classify [pszsu|monitor] <текст> - только для администратора.
+
+    Команда разрешена в двух служебных чатах: основной рабочей группе
+    CHAT_ID и приватной картотеке ARCHIVE_CHAT_ID. Ответ всегда уходит
+    в тот же чат, откуда пришёл запрос. Реальная тревога/архивирование
+    при этом не выполняются.
+    """
     chat = message.get("chat", {})
     sender = message.get("from", {})
+    chat_id = chat.get("id")
 
-    if chat.get("id") != CHAT_ID:
+    allowed_chats = {CHAT_ID}
+    if ARCHIVE_CHAT_ID is not None:
+        allowed_chats.add(ARCHIVE_CHAT_ID)
+
+    if chat_id not in allowed_chats:
         return
 
     user_id = sender.get("id")
@@ -2731,7 +2748,7 @@ def handle_classify_command(message):
     if not user_id:
         return
 
-    if not is_group_admin(user_id):
+    if not is_group_admin(user_id, chat_id=chat_id):
         print(
             "Команда /classify отклонена: "
             f"пользователь {user_id} не администратор.",
@@ -2751,7 +2768,8 @@ def handle_classify_command(message):
 
     if not body.strip():
         send_telegram_message(
-            "Использование: /classify [pszsu|monitor] <текст сообщения>"
+            "Использование: /classify [pszsu|monitor] <текст сообщения>",
+            chat_id=chat_id,
         )
         return
 
@@ -2760,7 +2778,10 @@ def handle_classify_command(message):
         flush=True,
     )
 
-    send_telegram_message(build_classify_reply(body, which))
+    send_telegram_message(
+        build_classify_reply(body, which),
+        chat_id=chat_id,
+    )
 
 
 def delete_service_message(message):
