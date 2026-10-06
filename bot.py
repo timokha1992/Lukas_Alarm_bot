@@ -2,8 +2,10 @@ import os
 import time
 import html
 import json
+import queue
 import re
 import secrets
+import sys
 import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -11,6 +13,60 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request
+
+# Конфигурация фильтров вынесена в пакет filters/ (данные, без логики):
+#   filters/common.py  - только то, что реально общее для обоих источников;
+#   filters/pszsu.py   - всё, что относится к PSZSU;
+#   filters/monitor.py - всё, что относится к MONITOR.
+# Логика классификации остаётся здесь, в bot.py.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from filters.common import (
+    KEYWORD,
+    KREMENCHUK_VARIANTS,
+    POST_EVENT_PATTERNS,
+    NORMALIZE_MP_REGEX,
+    RU_ADJECTIVE_REGEX,
+    RU_ADJECTIVE_REPLACEMENT,
+)
+
+from filters.pszsu import (
+    CONTINUING_PATTERNS,
+    IMPACT_PATTERNS,
+    KREMENCHUK_PSZSU_COURSE_TARGET_REGEX,
+    KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX,
+    KREMENCHUK_RESERVOIR_PATTERNS,
+    PSZSU_KREMENCHUK_MINUS_REGEX,
+    PSZSU_ARCHIVE_HIGH_REGEX,
+    PSZSU_ARCHIVE_HIGH_STRIP_REGEX,
+    PSZSU_ARCHIVE_DIRECTION_REGEX,
+    PSZSU_CITY_WITH_OTHER_PLACE_REGEX,
+    PSZSU_DIRECT_ALARM_REGEX,
+    PSZSU_NORMALIZE_MP_REGEX,
+    PSZSU_STANDALONE_CITY_REGEX,
+)
+
+from filters.monitor import (
+    KREMENCHUK_CITY_PATTERNS,
+    BANDEROL_PATTERNS,
+    MONITOR_UAV_ARCHIVE_PATTERNS,
+    HIGH_SPEED_PATTERNS,
+    CRUISE_MISSILE_PATTERNS,
+    KREMENCHUK_DIRECT_ALERT_PATTERNS,
+    KREMENCHUK_DIRECT_ALERT_REGEX,
+    KREMENCHUK_CITY_FIRST_TARGET_REGEX,
+    MONITOR_OPERATIONAL_MARKER_REGEX,
+    MONITOR_CITY_WITH_OTHER_PLACE_REGEX,
+    MONITOR_PASS_BY_REGEX,
+    MONITOR_RECONNAISSANCE_MARKER,
+    MONITOR_CRUISE_ABBREVIATION_REGEX,
+    MONITOR_BR_REGEX,
+    MONITOR_LOCAL_TARGET_REGEX,
+    MONITOR_SEGMENT_SEPARATOR_REGEX,
+    MONITOR_SENTENCE_SPLIT_REGEX,
+    MONITOR_ARCHIVE_DIRECT_RELATION_REGEX,
+    MONITOR_LEGACY_PASS_BY_REGEX,
+)
 
 
 # ============================================================
@@ -26,9 +82,6 @@ PSZSU_LINK = "https://t.me/kpszsu"
 MONITOR_NAME = "monitor"
 MONITOR_LINK = "https://t.me/war_monitor"
 
-# Корень для всех форм Кременчуга.
-# Используется для PSZSU и для подтверждений событий monitor.
-KEYWORD = "кременч"
 
 CHECK_INTERVAL_SECONDS = 15
 STATUS_UPDATE_INTERVAL_SECONDS = 60
@@ -47,13 +100,30 @@ INTERNAL_WATCHDOG_INTERVAL_SECONDS = 20
 PROCESS_HANG_THRESHOLD_SECONDS = 120
 
 MAX_MESSAGE_AGE_MINUTES = 5
-MAX_SENT_MESSAGES = 10000  # исторический лимит; реестр не обрезается, чтобы не терять ID
 
-# Реестр уже отправленных тревог.
-# Путь можно вынести на persistent storage без изменения логики парсера.
+# Предел длины одного сообщения Telegram (символы).
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+# Единый каталог персистентного состояния (ENV STATE_DIR).
+# На Render его нужно указать на persistent disk, иначе состояние
+# пропадёт при пересоздании контейнера. Внутри — один JSON-файл
+# (реестр отправленных сообщений + ID статус-сообщения).
+STATE_DIR = os.getenv("STATE_DIR", "/tmp")
+STATE_FILE = os.path.join(STATE_DIR, "lukas_alarm_state.json")
+
+# Записи реестра старше этого срока бесполезны (посты старше
+# MAX_MESSAGE_AGE_MINUTES никогда не обрабатываются) и удаляются.
+SENT_MESSAGES_RETENTION_SECONDS = 24 * 60 * 60
+
+# Старые отдельные файлы (до Stage 3): читаются один раз для миграции,
+# если нового STATE_FILE ещё нет. Дальше не используются.
 SENT_MESSAGES_FILE = os.getenv(
     "SENT_MESSAGES_FILE",
     "/tmp/lukas_alarm_sent_messages.json",
+)
+LEGACY_STATUS_MESSAGE_FILE = os.getenv(
+    "STATUS_MESSAGE_FILE",
+    "/tmp/lukas_alarm_status_message_id",
 )
 
 REQUEST_TIMEOUT = (5, 35)
@@ -313,7 +383,10 @@ MESSAGES = {
     # своё собственное закреплённое сообщение после перезапуска.
     # Не показывается пользователю, но является частью оформления
     # закреплённого сообщения — поэтому вынесен именно сюда.
-    "status_marker": "\u200b\u200bLUKAS_STATUS_MARKER\u200b",
+    # \u0422\u043e\u043b\u044c\u043a\u043e \u043d\u0435\u0432\u0438\u0434\u0438\u043c\u044b\u0435 \u0441\u0438\u043c\u0432\u043e\u043b\u044b (zero-width), \u0431\u0435\u0437 \u0432\u0438\u0434\u0438\u043c\u044b\u0445 \u0431\u0443\u043a\u0432.
+    # \u0415\u0441\u043b\u0438 Telegram \u0438\u0445 \u043e\u0431\u0440\u0435\u0436\u0435\u0442, \u0431\u043e\u0442 \u0443\u0437\u043d\u0430\u0451\u0442 \u0441\u0432\u043e\u0451 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043f\u043e \u0444\u0440\u0430\u0437\u0430\u043c
+    # \u0448\u0430\u0431\u043b\u043e\u043d\u0430 (\u0441\u043c. is_own_status_text) \u0438 \u043f\u043e \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u043e\u043c\u0443 ID.
+    "status_marker": "\u200b\u2060\u200c\u200b\u2060\u200c\u200b",
 
     "icon_ok": "🟢",
     "icon_error": "🔴",
@@ -334,7 +407,7 @@ MESSAGES = {
     # эмодзи и формулировки можно менять здесь свободно —
     # build_status_text() лишь вычисляет значения плейсхолдеров.
     "status_body": (
-        "{last_check} 🕐 Последняя проверка   "
+        "{marker}{last_check} 🕐 Последняя проверка   "
         "{parser_icon}{telegram_icon}{pszsu_icon}{monitor_icon}\n"
         "\n"
         "{parser_icon} {parser_label}: {parser_value}\n"
@@ -358,204 +431,11 @@ MESSAGES = {
 
 
 # ============================================================
-# ФИЛЬТР MONITOR
+# ФИЛЬТРЫ
 # ============================================================
-
-# ============================================================
-# ЕДИНЫЕ ВАРИАНТЫ НАЗВАНИЯ ГОРОДА КРЕМЕНЧУК
-# ============================================================
-# Общая настройка для PSZSU и MONITOR.
-# Типичные опечатки и варианты написания города не должны
-# приводить к потере сигнала независимо от типа разрешённой угрозы.
-# Кременчуцький/Кременчугский район сюда НЕ входит.
-KREMENCHUK_CITY_PATTERNS = (
-    "кременчук",
-    "кременчука",
-    "кременчуці",
-    "кременчуком",
-    "кременчуг",
-    "кременчуга",
-    "кременчуге",
-    "кременчугом",
-    "кремечук",
-    "кремечука",
-    "кремечуці",
-    "кремечуком",
-    "кремычук",
-    "кремычука",
-    "кремычуці",
-    "кремычуком",
-)
-
-# Совместимые имена для существующего кода. Оба источника
-# используют теперь один общий набор вариантов.
-KREMENCHUK_PSZSU_TYPOS = (
-    "кремечук",
-    "кремечука",
-    "кремечуці",
-    "кремечуком",
-    "кремычук",
-    "кремычука",
-    "кремычуці",
-    "кремычуком",
-)
-MONITOR_KREMENCHUK_TYPOS = KREMENCHUK_PSZSU_TYPOS
-
-
-BANDEROL_PATTERNS = (
-    "бандероль",
-    "бандеролі",
-    "бандероллю",
-    "s8000",
-    "s-8000",
-    "s 8000",
-)
-
-# MONITOR: БпЛА/дрони для обязательного архивного сбора.
-# Эти признаки НЕ являются оперативными целями. Любое сообщение MONITOR,
-# содержащее БпЛА/дрон + Кременчук, отправляется в приватную картотеку
-# для последующего анализа, независимо от строгого ALERT-фильтра.
-MONITOR_UAV_ARCHIVE_PATTERNS = (
-    "бпла",
-    "бплa",
-    "беспілотник",
-    "беспілотники",
-    "безпілотник",
-    "безпілотники",
-    "беспилотник",
-    "беспилотники",
-    "дрон",
-    "дрони",
-    "дрона",
-    "дронів",
-    "дронов",
-    "ударний дрон",
-    "ударные дроны",
-    "камікадзе-дрон",
-    "камикадзе-дрон",
-    "безпілотний літальний апарат",
-    "беспилотный летательный аппарат",
-    "fpv",
-    "шахед",
-    "shahed",
-    "герань",
-    "geran",
-    "гербера",
-    "gerbera",
-    "ланцет",
-    "lancet",
-    "uav",
-)
-
-HIGH_SPEED_PATTERNS = (
-    "балістик",
-    "балістична ракета",
-    "балістичні ракети",
-    "балістичне озброєння",
-    "аеробалістик",
-    "аеробалістична",
-    "аеробалістичні",
-    "кинжал",
-    "циркон",
-    "3м22",
-    "х-47м2",
-    "kn-23",
-    "kn23",
-    "кн-23",
-    "кн23",
-    "kn-24",
-    "kn24",
-    "кн-24",
-    "кн24",
-    "hwasong-11",
-    "hwasong 11",
-    "іскандер",
-    "искандер",
-    "9м723",
-    "швидкісна ціль",
-    "швидкісні цілі",
-)
-
-# Крилаті ракети / КР для MONITOR.
-# Позначення типу самі по собі не є тривогою — потрібна пряма
-# прив'язка саме до міста Кременчук.
-CRUISE_MISSILE_PATTERNS = (
-    "крилата ракета",
-    "крилаті ракети",
-    "крилатих ракет",
-    "крилатої ракети",
-    "крилатою ракетою",
-    "крылатых ракет",
-    "крылатой ракеты",
-    "крылатая ракета",
-    "крылатые ракеты",
-    "крылатых ракет",
-    "х-101",
-    "х101",
-    "х-55",
-    "х55",
-    "х-59",
-    "х59",
-    "х-69",
-    "х69",
-    "х-22",
-    "х22",
-    "х-32",
-    "х32",
-    "калібр",
-    "калибр",
-    "3м14",
-    "онікс",
-    "оникс",
-    "п-800",
-    "п800",
-    "p-800",
-    "p800",
-    "яхонт",
-    "ss-n-26",
-    "strobile",
-    "9м727",
-    "9м729",
-    "р-500",
-    "р500",
-)
-
-BR_PATTERN = "бр"
-
-CONTINUING_PATTERNS = (
-    "загроза балістики триває",
-    "триває загроза балістики",
-    "загроза балістична триває",
-    "триває загроза",
-)
-
-POST_EVENT_PATTERNS = (
-    "#зведення",
-    "зведення",
-    "у ніч на",
-    "в ніч на",
-    "за ніч",
-    "за останню ніч",
-    "згідно зі звітом",
-    "згідно зі звітом повітряних сил",
-    "підсумки",
-    "після атаки",
-    "загалом було запущено",
-    "загалом було застосовано",
-    "всього було застосовано",
-    "всього знищено",
-    "знешкоджено",
-)
-
-IMPACT_PATTERNS = (
-    "вибух",
-    "вибухи",
-    "вибух пролунав",
-    "вибухи пролунали",
-    "пролунав вибух",
-    "пролунали вибухи",
-    "лунали вибухи",
-)
+# Данные фильтров (списки слов, regex) вынесены в пакет filters/
+# (см. импорты вверху файла: common / pszsu / monitor). В этом файле
+# остаётся только логика классификации.
 
 
 # ============================================================
@@ -566,9 +446,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID_RAW = os.getenv("CHAT_ID")
 EXTERNAL_CHECK_TOKEN = os.getenv("EXTERNAL_CHECK_TOKEN")
 
-# Отдельная тихая группа-картотека. Архивные сообщения НИКОГДА
-# не отправляются в основной рабочий чат CHAT_ID.
-ARCHIVE_CHAT_ID = -1003795112075
+# Отдельная тихая группа-картотека (ENV ARCHIVE_CHAT_ID). Архивные
+# сообщения НИКОГДА не отправляются в основной рабочий чат CHAT_ID.
+ARCHIVE_CHAT_ID_RAW = os.getenv("ARCHIVE_CHAT_ID")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_TOKEN")
@@ -580,6 +460,86 @@ try:
     CHAT_ID = int(CHAT_ID_RAW)
 except ValueError:
     raise RuntimeError("CHAT_ID должен быть числом")
+
+# Ошибка конфигурации картотеки НЕ валит бот: тревоги работают,
+# архив просто не отправляется (и ошибка явно пишется в лог).
+ARCHIVE_CHAT_ID = None
+ARCHIVE_CONFIG_ERROR = None
+
+if not ARCHIVE_CHAT_ID_RAW or not ARCHIVE_CHAT_ID_RAW.strip():
+    ARCHIVE_CONFIG_ERROR = "переменная ARCHIVE_CHAT_ID не задана"
+else:
+    try:
+        ARCHIVE_CHAT_ID = int(ARCHIVE_CHAT_ID_RAW.strip())
+    except ValueError:
+        ARCHIVE_CONFIG_ERROR = "ARCHIVE_CHAT_ID должен быть целым числом"
+
+if ARCHIVE_CHAT_ID is not None and ARCHIVE_CHAT_ID == CHAT_ID:
+    ARCHIVE_CHAT_ID = None
+    ARCHIVE_CONFIG_ERROR = (
+        "ARCHIVE_CHAT_ID совпадает с CHAT_ID: картотека не должна "
+        "быть рабочим чатом"
+    )
+
+
+# ============================================================
+# ОЧИСТКА СЕКРЕТОВ (токен бота не должен попадать ни в логи, ни в HTTP)
+# ============================================================
+#
+# Исключения requests содержат полный URL запроса, а в нём Bot Token:
+# https://api.telegram.org/bot<TOKEN>/getMe
+# Единый механизм: sanitize_secrets() маскирует токен в любой строке.
+# Весь вывод модуля идёт через print() ниже (он пропускает строки через
+# sanitize_secrets), а всё, что уходит в HTTP-ответы, очищается явно.
+
+_BOT_URL_TOKEN_RE = re.compile(r"(/bot)[^/\s'\"<>)]+")
+_BOT_TOKEN_SHAPE_RE = re.compile(r"\bbot\d{6,}:[A-Za-z0-9_-]{20,}")
+
+
+def sanitize_secrets(value):
+    text = str(value)
+
+    for secret in (TELEGRAM_TOKEN, EXTERNAL_CHECK_TOKEN):
+        if secret:
+            text = text.replace(secret, "***")
+
+    text = _BOT_URL_TOKEN_RE.sub(r"\1***", text)
+    text = _BOT_TOKEN_SHAPE_RE.sub("bot***", text)
+
+    return text
+
+
+_builtin_print = print
+
+
+def print(*args, **kwargs):  # noqa: A001 - намеренная замена print модуля
+    _builtin_print(
+        *(
+            sanitize_secrets(arg) if isinstance(arg, str) else arg
+            for arg in args
+        ),
+        **kwargs,
+    )
+
+
+def _safe_threading_excepthook(args):
+    # Необработанное исключение потока тоже может содержать URL с токеном.
+    import traceback
+
+    print(
+        f"Необработанное исключение в потоке {args.thread.name if args.thread else '?'}: "
+        + "".join(
+            traceback.format_exception(
+                args.exc_type,
+                args.exc_value,
+                args.exc_traceback,
+            )
+        ),
+        flush=True,
+    )
+
+
+threading.excepthook = _safe_threading_excepthook
 
 
 # ============================================================
@@ -666,64 +626,208 @@ session.headers.update({
 # DEDUP
 # ============================================================
 
+# Единое персистентное состояние (STATE_FILE в STATE_DIR):
+#   sent_messages       - реестр уже обработанных постов (ключ -> время);
+#   status_message_id   - ID собственного статус-сообщения.
+# Реестр отвечает ТОЛЬКО на вопрос «этот пост уже обработан?».
+# Он НЕ влияет на срок актуальности: возраст поста проверяется
+# отдельно (MAX_MESSAGE_AGE_MINUTES) и до классификации, поэтому
+# отсутствие post_id в реестре не может оживить старую тревогу.
+
 sent_messages = set()
+sent_messages_ts = {}
 sent_messages_lock = threading.Lock()
+state_file_lock = threading.Lock()
+persisted_status_message_id = None
+
+
+def _parse_state_payload(data):
+    """Разбирает содержимое state-файла -> (реестр {ключ: время}, status_id)."""
+    now_ts = time.time()
+    sent = {}
+    status_id = None
+
+    if isinstance(data, list):
+        # Старый формат: просто список ключей.
+        for item in data:
+            if isinstance(item, str):
+                sent[item] = now_ts
+
+        return sent, None
+
+    if not isinstance(data, dict):
+        raise ValueError("неожиданная структура state-файла")
+
+    raw = data.get("sent_messages", {})
+
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(key, str):
+                try:
+                    sent[key] = float(value)
+                except (TypeError, ValueError):
+                    sent[key] = now_ts
+
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                sent[item] = now_ts
+
+    raw_status = data.get("status_message_id")
+
+    if isinstance(raw_status, int) and raw_status > 0:
+        status_id = raw_status
+
+    return sent, status_id
+
+
+def _read_legacy_state():
+    """Одноразовая миграция из старых отдельных файлов (если есть)."""
+    sent = {}
+    status_id = None
+
+    try:
+        with open(SENT_MESSAGES_FILE, "r", encoding="utf-8") as f:
+            sent, _ = _parse_state_payload(json.load(f))
+    except Exception:
+        sent = {}
+
+    try:
+        with open(LEGACY_STATUS_MESSAGE_FILE, "r", encoding="utf-8") as f:
+            value = int(f.read().strip())
+
+        status_id = value if value > 0 else None
+    except Exception:
+        status_id = None
+
+    return sent, status_id
+
+
+def read_state_file():
+    """
+    Читает state-файл -> (реестр, status_id).
+    Нет файла - не ошибка (пробуем старые файлы, иначе пусто).
+    Повреждённый файл не валит бот: он откладывается в сторону
+    (.corrupt-<время>), бот стартует с пустым состоянием.
+    """
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        return _parse_state_payload(data)
+
+    except FileNotFoundError:
+        return _read_legacy_state()
+
+    except Exception as e:
+        print(
+            "Ошибка загрузки состояния, файл будет отложен: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+        try:
+            os.replace(
+                STATE_FILE,
+                f"{STATE_FILE}.corrupt-{int(time.time())}",
+            )
+        except Exception:
+            pass
+
+        return {}, None
 
 
 def load_sent_messages():
-    """Загружает реестр уже отправленных тревог из JSON-файла."""
+    """Совместимость: множество ключей реестра из state-файла."""
+    return set(read_state_file()[0])
+
+
+def load_state():
+    """Загружает состояние с диска в память (вызывается при старте)."""
+    global persisted_status_message_id
+
+    sent, status_id = read_state_file()
+
+    with sent_messages_lock:
+        sent_messages.clear()
+        sent_messages.update(sent)
+        sent_messages_ts.clear()
+        sent_messages_ts.update(sent)
+        persisted_status_message_id = status_id
+
+
+def persist_state():
+    """
+    Безопасно сохраняет состояние: временный файл -> fsync ->
+    atomic replace. Ошибка записи логируется и бот не останавливает.
+    """
     try:
-        with open(SENT_MESSAGES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if not isinstance(data, list):
-            return set()
-
-        return {
-            str(item)
-            for item in data
-            if isinstance(item, str)
-        }
-
-    except FileNotFoundError:
-        return set()
-    except Exception as e:
-        print(
-            "Ошибка загрузки реестра отправленных тревог: "
-            f"{type(e).__name__}: {e}",
-            flush=True,
-        )
-        return set()
-
-
-def save_sent_messages():
-    """Атомарно сохраняет реестр уже отправленных тревог."""
-    try:
-        directory = os.path.dirname(SENT_MESSAGES_FILE)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-
-        tmp_file = f"{SENT_MESSAGES_FILE}.tmp"
+        cutoff = time.time() - SENT_MESSAGES_RETENTION_SECONDS
 
         with sent_messages_lock:
-            data = sorted(sent_messages)
+            for key in [
+                k for k, t in sent_messages_ts.items()
+                if t < cutoff or k not in sent_messages
+            ]:
+                sent_messages_ts.pop(key, None)
+                sent_messages.discard(key)
 
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
+            for key in sent_messages:
+                sent_messages_ts.setdefault(key, time.time())
 
-        os.replace(tmp_file, SENT_MESSAGES_FILE)
+            payload = {
+                "version": 1,
+                "sent_messages": {
+                    key: sent_messages_ts[key]
+                    for key in sorted(sent_messages)
+                },
+                "status_message_id": persisted_status_message_id,
+            }
+
+        with state_file_lock:
+            os.makedirs(STATE_DIR, exist_ok=True)
+
+            tmp_file = f"{STATE_FILE}.tmp"
+
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_file, STATE_FILE)
 
     except Exception as e:
         print(
-            "Ошибка сохранения реестра отправленных тревог: "
+            "Ошибка сохранения состояния: "
             f"{type(e).__name__}: {e}",
             flush=True,
         )
 
 
-sent_messages.update(load_sent_messages())
+def register_sent(key):
+    """Фиксирует ключ как обработанный и сохраняет состояние."""
+    with sent_messages_lock:
+        sent_messages.add(key)
+        sent_messages_ts[key] = time.time()
+
+    persist_state()
+
+
+load_state()
+
+if STATE_DIR.startswith("/tmp"):
+    print(
+        "ВНИМАНИЕ: STATE_DIR находится в /tmp - состояние не переживёт "
+        "пересоздание контейнера. Укажите STATE_DIR на persistent disk.",
+        flush=True,
+    )
+
+if ARCHIVE_CONFIG_ERROR:
+    print(
+        "ОШИБКА КОНФИГУРАЦИИ: картотека отключена - "
+        f"{ARCHIVE_CONFIG_ERROR}. Тревоги продолжают работать.",
+        flush=True,
+    )
 
 
 # ============================================================
@@ -800,6 +904,37 @@ def write_parser_heartbeat():
         state["parser_heartbeat"] = now
 
 
+PARSER_THREAD_NAME = "telegram-monitor"
+PARSER_BEAT_MIN_INTERVAL_SECONDS = 1.0
+_last_parser_beat = 0.0
+
+
+def parser_progress_beat():
+    """
+    Heartbeat «парсер жив и продвигается», а не только «цикл завершён».
+
+    Вызывается из мест, где поток парсера может надолго блокироваться
+    (запросы к Telegram с retry/429, загрузка источников, обработка
+    постов). Срабатывает ТОЛЬКО в потоке парсера: вызовы
+    telegram_request() из status/commands/watchdog-потоков heartbeat
+    не обновляют, поэтому реальное зависание или гибель парсера
+    по-прежнему видны (heartbeat перестаёт обновляться). Пороги
+    watchdog не менялись.
+    """
+    global _last_parser_beat
+
+    if threading.current_thread().name != PARSER_THREAD_NAME:
+        return
+
+    now_monotonic = time.monotonic()
+
+    if now_monotonic - _last_parser_beat < PARSER_BEAT_MIN_INTERVAL_SECONDS:
+        return
+
+    _last_parser_beat = now_monotonic
+    write_parser_heartbeat()
+
+
 def get_parser_heartbeat_age():
     try:
         mtime = os.path.getmtime(PARSER_HEARTBEAT_FILE)
@@ -850,7 +985,7 @@ def health():
     )
 
     return (
-        f"NOT OK: {reason}",
+        f"NOT OK: {sanitize_secrets(reason)}",
         503,
     )
 
@@ -901,7 +1036,16 @@ def telegram_api_fast_check():
         with state_lock:
             state["telegram_api_ok"] = False
 
-        return False, f"{type(e).__name__}: {e}"
+        # Полный текст исключения содержит URL с токеном бота, поэтому
+        # наружу (в причину для /health) уходит только тип ошибки;
+        # очищенный подробный текст пишется в лог.
+        print(
+            "Telegram API fast check: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+        return False, f"{type(e).__name__} (Telegram API unavailable)"
 
 
 def perform_external_self_check():
@@ -1074,7 +1218,7 @@ def external_check():
 
     payload = {
         "ok": ok,
-        "reason": reason,
+        "reason": sanitize_secrets(reason),
         "checked_at": now_utc().astimezone(
             KYIV_TZ
         ).isoformat(),
@@ -1490,7 +1634,9 @@ def external_recovered():
 
         return jsonify({
             "ok": False,
-            "reason": f"internal error: {type(e).__name__}: {e}",
+            "reason": sanitize_secrets(
+                f"internal error: {type(e).__name__}"
+            ),
         }), 500
 
     finally:
@@ -1514,12 +1660,16 @@ def telegram_request(method, data=None, retries=3):
     last_error = "неизвестная ошибка"
 
     for attempt in range(retries):
+        parser_progress_beat()
+
         try:
             response = session.post(
                 url,
                 data=data,
                 timeout=REQUEST_TIMEOUT,
             )
+
+            parser_progress_beat()
 
             if response.status_code == 429:
                 try:
@@ -1629,35 +1779,6 @@ def send_telegram_message(
 
     except Exception:
         return None
-
-
-def edit_telegram_message(
-    message_id,
-    text,
-):
-    if not message_id:
-        return False
-
-    result = telegram_request(
-        "editMessageText",
-        {
-            "chat_id": CHAT_ID,
-            "message_id": message_id,
-            "text": text,
-            "parse_mode": "HTML",
-        },
-    )
-
-    return result is not None
-
-
-def test_telegram_api():
-    result = telegram_request(
-        "getMe",
-        {},
-    )
-
-    return result is not None
 
 
 # ============================================================
@@ -2014,7 +2135,54 @@ def watchdog_loop():
 # ============================================================
 
 
-def get_pinned_message_id():
+# Раз в столько итераций status_loop (по STATUS_UPDATE_INTERVAL_SECONDS)
+# проверяется, что собственное статус-сообщение всё ещё закреплено.
+STATUS_PIN_CHECK_EVERY = 10
+
+
+def load_status_message_id():
+    """ID собственного статус-сообщения из единого состояния (или None)."""
+    with sent_messages_lock:
+        return persisted_status_message_id
+
+
+def save_status_message_id(message_id):
+    """Сохраняет (или стирает при None) ID собственного статус-сообщения."""
+    global persisted_status_message_id
+
+    with sent_messages_lock:
+        persisted_status_message_id = (
+            int(message_id) if message_id else None
+        )
+
+    persist_state()
+
+
+def is_own_status_text(text):
+    """Наше ли это статус-сообщение: по маркеру или по фразам шаблона."""
+    text = str(text or "")
+
+    if MESSAGES["status_marker"] in text:
+        return True
+
+    # Пробелы и переносы строк не должны влиять на распознавание.
+    normalized_text = " ".join(text.split()).lower()
+
+    return (
+        "последняя проверка" in normalized_text
+        and "отслеживание угроз для города кременчуг"
+        in normalized_text
+    )
+
+
+def inspect_pinned_message():
+    """
+    Возвращает (вид, message_id):
+      "error"   - getChat не удался, ничего нельзя утверждать;
+      "none"    - в чате нет закреплённого сообщения;
+      "foreign" - закреплено чужое сообщение (НЕ наш статус);
+      "own"     - закреплено наше статус-сообщение.
+    """
     result = telegram_request(
         "getChat",
         {
@@ -2023,59 +2191,22 @@ def get_pinned_message_id():
     )
 
     if not result:
-        return None
+        return "error", None
 
     try:
-        pinned = (
-            result["result"]
-            .get("pinned_message")
-        )
+        pinned = result["result"].get("pinned_message")
 
         if not pinned:
-            return None
+            return "none", None
 
-        message_id = pinned.get(
-            "message_id"
-        )
+        message_id = pinned.get("message_id")
 
-        text = pinned.get(
-            "text",
-            "",
-        ) or pinned.get(
-            "caption",
-            "",
-        )
+        text = pinned.get("text", "") or pinned.get("caption", "")
 
-        # Сначала пытаемся точно распознать наше сообщение состояния.
-        # Пробелы и переносы строк не должны влиять на распознавание.
-        normalized_text = " ".join(
-            str(text).split()
-        ).lower()
+        if is_own_status_text(text):
+            return "own", message_id
 
-        status_phrase = (
-            "последняя проверка" in normalized_text
-            and "отслеживание угроз для города кременчуг"
-            in normalized_text
-        )
-
-        if (
-            MESSAGES["status_marker"] in str(text)
-            or status_phrase
-        ):
-            return message_id
-
-        # В нашей рабочей группе закреплено именно сообщение состояния.
-        # Если Telegram вернул закреплённое сообщение, но его текст по
-        # какой-либо причине не распознался (например, после изменения
-        # форматирования), НЕ создаём новое сообщение. Используем уже
-        # существующее закрепление. Это предотвращает дублирование и
-        # повторное закрепление при перезапуске Render.
-        print(
-            "Закреплённое сообщение найдено, но его текст не распознан. "
-            "Используется существующее сообщение без создания нового.",
-            flush=True,
-        )
-        return message_id
+        return "foreign", message_id
 
     except Exception as e:
         print(
@@ -2084,7 +2215,14 @@ def get_pinned_message_id():
             flush=True,
         )
 
-    return None
+    return "error", None
+
+
+def get_pinned_message_id():
+    """ID закреплённого сообщения, только если это наш статус."""
+    kind, message_id = inspect_pinned_message()
+
+    return message_id if kind == "own" else None
 
 
 def build_status_text():
@@ -2199,19 +2337,156 @@ def build_status_text():
     )
 
 
-def ensure_status_message():
-    existing_id = (
-        get_pinned_message_id()
+def edit_status_message_raw(message_id, text):
+    """
+    Одна попытка editMessageText для статус-сообщения.
+    Возвращает:
+      "ok" / "not_modified" - сообщение на месте (текст принят или
+                              не изменился);
+      "gone"                - сообщения больше нет / оно недоступно
+                              для редактирования;
+      "error"               - временная ошибка (сеть, 5xx, 429...).
+    "message is not modified" - не сбой Telegram API и не должно
+    переводить telegram_api_ok в False.
+    """
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/editMessageText"
     )
 
-    if existing_id:
-        with state_lock:
-            state["status_message_id"] = (
-                existing_id
-            )
+    try:
+        response = session.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "HTML",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
 
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+
+        if response.status_code == 200 and payload.get("ok"):
+            with state_lock:
+                state["telegram_api_ok"] = True
+
+            return "ok"
+
+        description = str(payload.get("description", "")).lower()
+
+        if "message is not modified" in description:
+            with state_lock:
+                state["telegram_api_ok"] = True
+
+            return "not_modified"
+
+        if (
+            "message to edit not found" in description
+            or "message_id_invalid" in description
+            or "message can't be edited" in description
+        ):
+            with state_lock:
+                state["telegram_api_ok"] = True
+
+            return "gone"
+
+        if response.status_code >= 500 or response.status_code == 429:
+            with state_lock:
+                state["telegram_api_ok"] = False
+
+        print(
+            "Не удалось отредактировать сообщение состояния: "
+            f"HTTP {response.status_code}; {description}",
+            flush=True,
+        )
+
+        return "error"
+
+    except Exception as e:
+        with state_lock:
+            state["telegram_api_ok"] = False
+
+        print(
+            "Не удалось отредактировать сообщение состояния: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+        return "error"
+
+
+def _adopt_status_message(message_id):
+    with state_lock:
+        state["status_message_id"] = message_id
+
+    save_status_message_id(message_id)
+
+
+def _pin_status_message(message_id):
+    return telegram_request(
+        "pinChatMessage",
+        {
+            "chat_id": CHAT_ID,
+            "message_id": message_id,
+            "disable_notification": True,
+        },
+    )
+
+
+def ensure_status_message():
+    """
+    Гарантирует одно актуальное собственное статус-сообщение.
+
+    1. Закреплено наше сообщение  -> используем его.
+    2. getChat не удался          -> НЕ создаём новое (иначе дубли),
+                                     повторим на следующем проходе.
+    3. Закреплено чужое/ничего    -> пробуем сохранённый ID нашего
+                                     сообщения (оно могло быть
+                                     откреплено); чужое закрепление
+                                     за статус не принимается.
+    4. Нашего сообщения нет       -> создаём и закрепляем новое.
+    """
+    kind, pinned_id = inspect_pinned_message()
+
+    if kind == "error":
+        print(
+            "Не удалось проверить закреплённое сообщение - "
+            "новое сообщение состояния не создаётся, "
+            "повтор на следующем проходе.",
+            flush=True,
+        )
+        return False
+
+    if kind == "own":
+        _adopt_status_message(pinned_id)
         update_status_message()
         return True
+
+    stored_id = load_status_message_id()
+
+    if stored_id:
+        result = edit_status_message_raw(stored_id, build_status_text())
+
+        if result in ("ok", "not_modified"):
+            _adopt_status_message(stored_id)
+
+            # Своё сообщение найдено, но закреплено не оно (ничего или
+            # чужое сообщение): возвращаем собственный статус в закреп.
+            if kind in ("none", "foreign"):
+                _pin_status_message(stored_id)
+
+            return True
+
+        if result == "error":
+            return False
+
+        # "gone": прежнее сообщение удалено - создаём новое ниже.
+        save_status_message_id(None)
 
     text = build_status_text()
 
@@ -2228,19 +2503,9 @@ def ensure_status_message():
         )
         return False
 
-    with state_lock:
-        state["status_message_id"] = (
-            message_id
-        )
+    _adopt_status_message(message_id)
 
-    pin_result = telegram_request(
-        "pinChatMessage",
-        {
-            "chat_id": CHAT_ID,
-            "message_id": message_id,
-            "disable_notification": True,
-        },
-    )
+    pin_result = _pin_status_message(message_id)
 
     if not pin_result:
         print(
@@ -2263,17 +2528,56 @@ def update_status_message():
 
     text = build_status_text()
 
-    success = edit_telegram_message(
+    result = edit_status_message_raw(
         message_id,
         text,
     )
 
-    if not success:
+    if result in ("ok", "not_modified"):
+        return
+
+    if result == "gone":
+        # Статус удалён: забываем ID, status_loop создаст новый.
         print(
-            "Не удалось обновить "
-            "сообщение состояния.",
+            "Сообщение состояния удалено - будет создано новое.",
             flush=True,
         )
+
+        with state_lock:
+            state["status_message_id"] = None
+
+        save_status_message_id(None)
+        return
+
+    print(
+        "Не удалось обновить "
+        "сообщение состояния.",
+        flush=True,
+    )
+
+
+def verify_status_pinned():
+    """
+    Если наше статус-сообщение не является актуальным закреплённым
+    (откреплено или поверх закреплено чужое), закрепляет его заново.
+    """
+    with state_lock:
+        message_id = state["status_message_id"]
+
+    if not message_id:
+        return
+
+    kind, _ = inspect_pinned_message()
+
+    # «none» - открепили совсем, «foreign» - поверх закреплено чужое.
+    # В обоих случаях актуальным закреплённым должен быть наш статус.
+    if kind in ("none", "foreign"):
+        print(
+            "Сообщение состояния не закреплено "
+            f"({kind}) - закрепляю снова.",
+            flush=True,
+        )
+        _pin_status_message(message_id)
 
 
 # ============================================================
@@ -2351,6 +2655,112 @@ def handle_test_command(message):
     send_telegram_message(
         MESSAGES["test_command_response"]
     )
+
+
+def build_classify_reply(text, which=None):
+    """
+    Диагностический разбор текста: решение, правило, признак архива и
+    основные сработавшие признаки. Ничего не отправляет, состояние
+    (реестр, dedup) не меняет. which: None (оба) / "pszsu" / "monitor".
+    """
+    lines = [
+        "🔎 /classify - диагностика (тревога и архив НЕ отправляются)",
+    ]
+
+    if which in (None, "pszsu"):
+        decision, rule = classify_pszsu_with_rule(text)
+        final = "ARCHIVE" if decision.startswith("ARCHIVE") else decision
+        lines.append(
+            f"PSZSU: decision={final} rule={rule} "
+            f"archive={'yes' if final == 'ARCHIVE' else 'no'}"
+        )
+
+    if which in (None, "monitor"):
+        decision, rule = classify_monitor_with_rule(text)
+        lines.append(
+            f"MONITOR: decision={decision} rule={rule} "
+            f"archive={'yes' if decision == 'ARCHIVE' else 'no'}"
+        )
+
+    features = []
+
+    if has_kremenchuk(text):
+        features.append("город Кременчук")
+
+    if pszsu_city_with_other_place(text):
+        features.append("Кременчук + другой город")
+
+    if is_post_event_report(text):
+        features.append("сводка/post-event")
+
+    if is_continuing_threat(text):
+        features.append("«триває загроза»")
+
+    if has_high_speed_threat(text):
+        features.append("high-speed цель")
+
+    if has_cruise_missile(text):
+        features.append("крылатая ракета")
+
+    if has_banderol(text):
+        features.append("Бандероль")
+
+    if has_monitor_operational_marker(text):
+        features.append("маркер ціль/вихід")
+
+    if has_monitor_uav_archive_marker(text):
+        features.append("БпЛА-признак")
+
+    lines.append(
+        "Признаки: " + (", ".join(features) if features else "нет")
+    )
+
+    return "\n".join(lines)
+
+
+def handle_classify_command(message):
+    """/classify [pszsu|monitor] <текст> - только для администратора."""
+    chat = message.get("chat", {})
+    sender = message.get("from", {})
+
+    if chat.get("id") != CHAT_ID:
+        return
+
+    user_id = sender.get("id")
+
+    if not user_id:
+        return
+
+    if not is_group_admin(user_id):
+        print(
+            "Команда /classify отклонена: "
+            f"пользователь {user_id} не администратор.",
+            flush=True,
+        )
+        return
+
+    parts = str(message.get("text", "")).split(None, 1)
+    body = parts[1] if len(parts) > 1 else ""
+
+    which = None
+    first = body.split(None, 1)
+
+    if first and first[0].lower() in ("pszsu", "monitor"):
+        which = first[0].lower()
+        body = first[1] if len(first) > 1 else ""
+
+    if not body.strip():
+        send_telegram_message(
+            "Использование: /classify [pszsu|monitor] <текст сообщения>"
+        )
+        return
+
+    print(
+        f"Команда /classify от администратора {user_id}.",
+        flush=True,
+    )
+
+    send_telegram_message(build_classify_reply(body, which))
 
 
 def delete_service_message(message):
@@ -2509,6 +2919,16 @@ def telegram_command_listener():
                         message
                     )
 
+                if (
+                    command == "/classify"
+                    or command.startswith(
+                        "/classify@"
+                    )
+                ):
+                    handle_classify_command(
+                        message
+                    )
+
         except Exception as e:
             print(
                 "Ошибка обработчика "
@@ -2535,8 +2955,12 @@ def status_loop():
     # Теперь именно status_loop отвечает за создание
     # и обновление закреплённого сообщения.
     # Основной parser от этой функции не зависит.
+    iteration = 0
+
     while True:
         try:
+            iteration += 1
+
             with state_lock:
                 status_message_id = (
                     state["status_message_id"]
@@ -2547,6 +2971,10 @@ def status_loop():
 
             else:
                 update_status_message()
+
+                # Открепление статуса не должно оставаться незамеченным.
+                if iteration % STATUS_PIN_CHECK_EVERY == 0:
+                    verify_status_pinned()
 
         except Exception as e:
             print(
@@ -2617,15 +3045,20 @@ def normalize_text(text):
     # Общее сокращение «м.» / «м .» перед Кременчуком.
     # Нормализуем его один раз до применения отдельных фильтров
     # ПСЗСУ и MONITOR, не смешивая их семантику.
-    kremenchuk_name = (
-        r"(?:кременчук(?:а|у|ом)?|кременчуці|"
-        r"кременчуг(?:а|у|ом|е)?|"
-        r"кремечук(?:а|у|ом)?|кремечуці|"
-        r"кремычук(?:а|у|ом)?|кремычуці)"
-    )
     normalized = re.sub(
-        r"(?<!\w)м\s*\.\s*(?=" + kremenchuk_name + r"(?:\b|$))",
+        NORMALIZE_MP_REGEX,
         "",
+        normalized,
+    )
+
+    # Русское прилагательное «кременчугский/кременчугского/...»
+    # (район, водохранилище) — не город. Приводим его к украинской
+    # основе «кременчуцьк…», которая городом уже не считается
+    # (как «Кременчуцький район»), чтобы подстрочное «кременчуг»
+    # не давало городскую привязку. Сам «Кременчуг» не затрагивается.
+    normalized = re.sub(
+        RU_ADJECTIVE_REGEX,
+        RU_ADJECTIVE_REPLACEMENT,
         normalized,
     )
 
@@ -2691,7 +3124,7 @@ def has_cruise_missile(text):
 
     # "КР" — только как отдельное сокращение, чтобы не ловить
     # случайные сочетания букв внутри других слов.
-    return re.search(r"\bкр\b", normalized) is not None
+    return re.search(MONITOR_CRUISE_ABBREVIATION_REGEX, normalized) is not None
 
 
 def has_high_speed_threat(text):
@@ -2707,9 +3140,7 @@ def has_high_speed_threat(text):
 
     return (
         re.search(
-            r"\b"
-            + re.escape(BR_PATTERN)
-            + r"\b",
+            MONITOR_BR_REGEX,
             normalized,
         )
         is not None
@@ -2757,121 +3188,6 @@ def is_post_event_report(text):
 # 4. Для обычной новой угрозы ALERT требует явного указания
 #    направления/цели на Кременчуг.
 
-KREMENCHUK_VARIANTS = (
-    "кременчук",
-    "кременчуці",
-    "кременчуг",
-    "кремечук",
-    "кремечуці",
-    "кремычук",
-    "кремычуці",
-)
-
-KREMENCHUK_DIRECT_ALERT_PATTERNS = (
-    "на кременчук",
-    "на кременчука",
-    "на кременчуг",
-    "у напрямку кременчука",
-    "в напрямку кременчука",
-    "у напрямку кременчук",
-    "в напрямку кременчук",
-    "у напрямку кременчуга",
-    "в напрямку кременчуга",
-    "курс на кременчук",
-    "курс на кременчук",
-    "для кременчука",
-    "для кременчуга",
-    "до кременчука",
-    "до кременчуга",
-    "у бік кременчука",
-    "в бік кременчука",
-    "у бік кременчуга",
-    "в бік кременчуга",
-    "прямує до кременчука",
-    "прямують до кременчука",
-    "по кременчуку",
-    "по кременчуга",
-    "рухається на кременчук",
-    "рухаються на кременчук",
-    "летить на кременчук",
-    "летять на кременчук",
-    "ціль на кременчук",
-    "цілі на кременчук",
-    "ціль — кременчук",
-    "ціль - кременчук",
-    "цілі — кременчук",
-    "цілі - кременчук",
-    "вектор кременчук",
-    "вектором кременчук",
-    "вектор на кременчук",
-    "вектором на кременчук",
-    "вектор кременчуг",
-    "вектором кременчуг",
-    "вектор на кременчуг",
-    "вектором на кременчуг",
-)
-
-# Варианты для явного указания Кременчуга как цели/направления,
-# включая частые падежные формы и русское написание.
-KREMENCHUK_DIRECT_ALERT_REGEX = (
-    r"(?:"
-    r"на|до|у\s+бік|в\s+бік|у\s+напрямку|в\s+напрямку|"
-    r"курс\s+на|вектор(?:ом)?(?:\s+на)?|прямує\s+до|прямують\s+до|"
-    r"рухається\s+на|рухаються\s+на|летить\s+на|летять\s+на|"
-    r"ціль\s*(?:—|-|:)?\s*"
-    r")"
-    r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|кремечук(?:а|у|ом)?|кремечуці|кремычук(?:а|у|ом)?|кремычуці)"
-)
-
-# Отдельная форма официального сообщения: город указан первым,
-# после него объект и уже затем назначение «на місто».
-# Например: «Кременчук — ударний БпЛА на місто зі сходу».
-# Это не меняет общую логику ПСЗСУ, а закрывает конкретную форму
-# прямой угрозы, которая раньше выпадала из фильтра.
-KREMENCHUK_CITY_FIRST_TARGET_REGEX = (
-    r"(?:^|[^\w])\s*"
-    r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|"
-    r"кремечук(?:а|у|ом)?|кремечуці|кремычук(?:а|у|ом)?|кремычуці)"
-    r"\s*[-—:]\s*"
-    r"(?=[^\n]{0,120}\bбпла\b)"
-    r"[^\n]{0,120}\bна\s+місто\b"
-)
-
-# ПСЗСУ: отдельные городские формы немедленной угрозы.
-# Они не используются фильтром MONITOR.
-# ПСЗСУ: курс на Кременчук с предлогом «на» или без него.
-# Реальные формы источника: «курс Кременчук», «курсом Кременчук»,
-# «курс на Кременчук», «курсом на Кременчук».
-# Этот блок относится только к ПСЗСУ.
-KREMENCHUK_PSZSU_COURSE_TARGET_REGEX = (
-    r"\\bкурс(?:ом)?\\s+(?:на\\s+)?"
-    r"(?:кременчук(?:а|у|ом)?|кременчуці|"
-    r"кременчуг(?:а|у|ом|е)?|"
-    r"кремечук(?:а|у|ом)?|кремечуці|"
-    r"кремычук(?:а|у|ом)?|кремычуці)\\b"
-)
-
-KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX = (
-    r"(?:^|[^\w])\s*"
-    r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|"
-    r"кремечук(?:а|у|ом)?|кремечуці|кремычук(?:а|у|ом)?|кремычуці)"
-    r"\s*[-—:]?\s*"
-    r"[^\n]{0,160}?"
-    r"(?:в\s+укриття|терміново\s+в\s+укриття|"
-    r"над\s+містом|в\s+районі\s+міста|"
-    r"в\s+напрямку\s+міста|у\s+напрямку\s+міста|"
-    r"у\s+вашому\s+напрямку|в\s+вашому\s+напрямку|"
-    r"курс(?:ом)?\s+(?:на\s+)?місто|на\s+місто)"
-)
-
-KREMENCHUK_RESERVOIR_PATTERNS = (
-    "кременчуцьке водосховище",
-    "кременчуцького водосховища",
-    "кременчуцьким водосховищем",
-    "кременчугское водохранилище",
-    "кременчугского водохранилища",
-)
-
 
 def text_has_kremenchuk_variant(normalized):
     return any(
@@ -2905,11 +3221,7 @@ def has_direct_kremenchuk_target(text, include_pszsu_city_first=True):
     # «повз/через/довкола Кременчук» сами по себе НЕ являются
     # прямой целью. При этом отдельная последующая конструкция
     # «на Кременчук» в том же сообщении всё равно может дать ALERT.
-    pass_by_city = re.compile(
-        r"(?:повз|через|довкола)\\s+"
-        r"(?:кременчук(?:а|у|ом)?|кременчуці|кременчуг(?:а|у|ом|е)?|"
-        r"кремечук(?:а|у|ом)?|кремечуці|кремычук(?:а|у|ом)?|кремычуці)"
-    )
+    pass_by_city = MONITOR_LEGACY_PASS_BY_REGEX
 
     if any(
         pattern in normalized
@@ -2959,41 +3271,34 @@ def has_direct_kremenchuk_target(text, include_pszsu_city_first=True):
     return False
 
 
-PSZSU_KREMENCHUK_CITY_REGEX = (
-    r"(?:кременчук(?:а|у|ом)?|кременчуці|"
-    r"кременчуг(?:а|у|ом|е)?|"
-    r"кремечук(?:а|у|ом)?|кремечуці|кремечуком|"
-    r"кремычук(?:а|у|ом)?|кремычуці|кремычуком)"
-)
+def pszsu_city_with_other_place(text):
+    return re.search(PSZSU_CITY_WITH_OTHER_PLACE_REGEX, text) is not None
 
-PSZSU_KREMENCHUK_MINUS_REGEX = (
-    r"(?:"
-    r"кременчуцьк(?:ий|ого|ому|им)\s+район(?:у|і|ом)?"
-    r"|кременчуцьк(?:е|ого|им)\s+водосховищ(?:е|а|ем)"
-    r"|повз\s+" + PSZSU_KREMENCHUK_CITY_REGEX
-    + r"|довкола\s+" + PSZSU_KREMENCHUK_CITY_REGEX
-    + r")"
-)
 
-PSZSU_ARCHIVE_HIGH_REGEX = (
-    r"між\s+(?!" + PSZSU_KREMENCHUK_CITY_REGEX + r"\b)[^,;\n]{1,80}?\s+"
-    + r"(?:та|і|й)\s+" + PSZSU_KREMENCHUK_CITY_REGEX
-    + r"|між\s+" + PSZSU_KREMENCHUK_CITY_REGEX + r"\s+(?:та|і|й)\s+"
-    + r"(?!" + PSZSU_KREMENCHUK_CITY_REGEX + r"\b)[^,;\n]{1,80}"
-)
+def pszsu_has_independent_alarm_basis(text):
+    """
+    Есть ли у сообщения самостоятельное основание для ALERT, помимо
+    перечисления «Кременчук та <другой город>»: направление/цель на
+    город, городская тревожная форма или отдельное упоминание
+    Кременчука вне перечисления.
+    """
+    normalized = normalize_pszsu_text(text)
 
-PSZSU_ARCHIVE_DIRECTION_REGEX = (
-    r"(?:північніше|південніше|східніше|західніше)\s+"
-    + PSZSU_KREMENCHUK_CITY_REGEX
-    + r"|на\s+(?:північ|південь|схід|захід)\s+від\s+"
-    + PSZSU_KREMENCHUK_CITY_REGEX
-)
+    if re.search(PSZSU_DIRECT_ALARM_REGEX, normalized):
+        return True
+
+    if re.search(KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX, normalized):
+        return True
+
+    remainder = re.sub(PSZSU_CITY_WITH_OTHER_PLACE_REGEX, " ", text)
+
+    return pszsu_has_kremenchuk_outside_minus(remainder)
 
 
 def normalize_pszsu_text(text):
     normalized = normalize_text(text)
     return re.sub(
-        r"(?<!\w)м\s*\.\s*(?=" + PSZSU_KREMENCHUK_CITY_REGEX + r"(?:\b|$))",
+        PSZSU_NORMALIZE_MP_REGEX,
         "",
         normalized,
     )
@@ -3003,30 +3308,64 @@ def pszsu_has_kremenchuk_outside_minus(text):
     normalized = normalize_pszsu_text(text)
     cleaned = re.sub(PSZSU_KREMENCHUK_MINUS_REGEX, " ", normalized)
     return re.search(
-        r"(?<![а-яіїєґ])" + PSZSU_KREMENCHUK_CITY_REGEX + r"(?![а-яіїєґ])",
+        PSZSU_STANDALONE_CITY_REGEX,
         cleaned,
     ) is not None
 
 
-def classify_pszsu_kremenchuk_message(text):
-    """PSZSU: широкий городской триггер + согласованные исключения."""
-    if is_continuing_threat(text) or is_post_event_report(text):
-        return "IGNORE"
+def classify_pszsu_with_rule(text):
+    """
+    PSZSU: широкий городской триггер + согласованные исключения.
+    Возвращает (решение, правило). Решение: ALERT / ARCHIVE_HIGH /
+    ARCHIVE_NORMAL / IGNORE (ARCHIVE_* - внутренние значения,
+    check_source() приводит их к единому ARCHIVE). Правило - короткое
+    имя сработавшей ветки для диагностики.
+    """
+    if is_continuing_threat(text):
+        return "IGNORE", "ignore:continuing_threat"
+
+    if is_post_event_report(text):
+        return "IGNORE", "ignore:post_event_report"
 
     normalized = normalize_pszsu_text(text)
 
-    # Архивная география имеет приоритет над общим городским триггером.
-    if re.search(PSZSU_ARCHIVE_HIGH_REGEX, normalized):
-        return "ARCHIVE_HIGH"
+    archive_high = re.search(PSZSU_ARCHIVE_HIGH_REGEX, normalized)
+    archive_direction = re.search(PSZSU_ARCHIVE_DIRECTION_REGEX, normalized)
 
-    if re.search(PSZSU_ARCHIVE_DIRECTION_REGEX, normalized):
-        return "ARCHIVE_NORMAL"
+    if archive_high or archive_direction:
+        # Архивная география не должна «съедать» отдельное основание
+        # для ALERT: убираем её из текста и смотрим, остался ли
+        # самостоятельный Кременчук («на північ від Кременчука,
+        # курс на Кременчук» -> ALERT). Если нет — это архив.
+        remainder = re.sub(PSZSU_ARCHIVE_HIGH_STRIP_REGEX, " ", normalized)
+        remainder = re.sub(PSZSU_ARCHIVE_DIRECTION_REGEX, " ", remainder)
+
+        if pszsu_has_kremenchuk_outside_minus(remainder):
+            return "ALERT", "alert:independent_city_beside_archive_geography"
+
+        if archive_high:
+            return "ARCHIVE_HIGH", "archive:between_cities"
+
+        return "ARCHIVE_NORMAL", "archive:direction_from_city"
 
     # После удаления минус-конструкций остаётся самостоятельный город — ALERT.
     if pszsu_has_kremenchuk_outside_minus(text):
-        return "ALERT"
+        # «Кременчук та <другой город>» без самостоятельного основания
+        # для тревоги — не ALERT, а ARCHIVE.
+        if pszsu_city_with_other_place(text):
+            if pszsu_has_independent_alarm_basis(text):
+                return "ALERT", "alert:city_with_other_place_independent_basis"
 
-    return "IGNORE"
+            return "ARCHIVE_NORMAL", "archive:city_with_other_place"
+
+        return "ALERT", "alert:city_outside_minus"
+
+    return "IGNORE", "ignore:no_independent_city"
+
+
+def classify_pszsu_kremenchuk_message(text):
+    """Совместимость: только решение из classify_pszsu_with_rule()."""
+    return classify_pszsu_with_rule(text)[0]
 
 
 def has_monitor_kremenchuk_binding(text):
@@ -3051,7 +3390,7 @@ def has_monitor_archive_target_binding(text):
     """
     Контрольный архив MONITOR.
 
-    ARCHIVE_MONITOR не является копией всех сообщений с Кременчуком.
+    Архив MONITOR не является копией всех сообщений с Кременчуком.
     Он собирает потенциально значимые цели, которые прямо связаны
     с Кременчуком, но пока не распознаны строгим ALERT-фильтром.
 
@@ -3065,28 +3404,12 @@ def has_monitor_archive_target_binding(text):
         return False
     if is_post_event_report(text):
         return False
-    if "дорозвідка" in normalized:
+    if MONITOR_RECONNAISSANCE_MARKER in normalized:
         return False
 
-    city_pattern = (
-        r"(?:"
-        + "|".join(re.escape(pattern) for pattern in KREMENCHUK_CITY_PATTERNS)
-        + r")"
-    )
+    pass_by = MONITOR_PASS_BY_REGEX
+    direct_relation = MONITOR_ARCHIVE_DIRECT_RELATION_REGEX
 
-    direct_relation = re.compile(
-        r"(?:"
-        r"(?:курс(?:ом)?|вектор(?:ом)?)\s+(?:на\s+)?" + city_pattern
-        + r"|(?:на|до)\s+" + city_pattern
-        + r"|(?:у|в)\s+(?:напрямку|направлении|бік|сторону)\s+" + city_pattern
-        + r"|(?:ціль|цілі|об'єкт|об’єкт|объект)[^\n]{0,100}" + city_pattern
-        + r"|(?:рухається|рухаються|летить|летять|прямує|прямують|йде|йдуть)[^\n]{0,100}" + city_pattern
-        + r"|" + city_pattern + r"[^\n]{0,100}(?:ціль|цілі|об'єкт|об’єкт|объект|над\s+містом)"
-        + r"|[^\n]{0,100}(?:->|→|➜|➝|➡)[^\n]{0,30}" + city_pattern
-        + r")"
-    )
-
-    pass_by = re.compile(r"(?:повз|через|довкола)\s+" + city_pattern)
     if pass_by.search(normalized):
         cleaned = pass_by.sub(" ", normalized)
         if not direct_relation.search(cleaned):
@@ -3098,17 +3421,89 @@ def has_monitor_archive_target_binding(text):
     return True
 
 
+def has_monitor_city_with_other_place(text):
+    """
+    MONITOR: Кременчук перечислен вместе с другим населённым пунктом
+    («Кременчук та Полтава») в одной строке/сегменте. Само по себе это
+    не ALERT (ALERT проверяется раньше и по строгим правилам MONITOR),
+    а материал для ручного анализа - ARCHIVE.
+    Строки берутся из исходного текста: для распознавания «другого
+    города» нужен регистр букв.
+    """
+    for line in re.split(MONITOR_SEGMENT_SEPARATOR_REGEX, text):
+        if re.search(MONITOR_CITY_WITH_OTHER_PLACE_REGEX, line):
+            return True
+
+    return False
+
+
 def has_monitor_operational_marker(text):
-    """Оперативные маркеры, достаточные для тревоги при привязке к Кременчугу."""
+    """
+    Оперативные маркеры, достаточные для тревоги при привязке к Кременчугу:
+    «ціль», «цілі», «вихід», «виходи» — как отдельные слова.
+    «виходить» / «цільова» маркерами не являются.
+    """
     normalized = normalize_text(text)
-    return (
-        "ціль" in normalized
-        or "цілі" in normalized
-        or "вихід" in normalized
-        or "виходи" in normalized
-        or "швидкісна ціль" in normalized
-        or "швидкісні цілі" in normalized
-    )
+    return MONITOR_OPERATIONAL_MARKER_REGEX.search(normalized) is not None
+
+
+def split_monitor_segments(text):
+    """
+    Логические сегменты сообщения MONITOR (уже нормализованные):
+    разделители — перевод строки, «/», «;» и точка с пробелом
+    (многоточие «...» разделителем не считается).
+    Цель из одного сегмента не привязывается к городу из другого.
+    Для настоящего деления по строкам сюда нужно передавать текст
+    с сохранёнными переводами строк (см. extract_message_lines_text).
+    """
+    segments = []
+
+    for line in re.split(MONITOR_SEGMENT_SEPARATOR_REGEX, text):
+        normalized = normalize_text(line)
+
+        if not normalized:
+            continue
+
+        for part in re.split(MONITOR_SENTENCE_SPLIT_REGEX, normalized):
+            if part.strip():
+                segments.append(part)
+
+    return segments
+
+
+def has_monitor_uav_archive_binding(text):
+    """
+    Архивный отбор MONITOR для БпЛА/дронов: БпЛА-признак и Кременчук
+    в одном сегменте, вне конструкций «повз/через/довкола».
+    Это только решение «сохранить для ручного анализа» (ARCHIVE);
+    ALERT-фильтр MONITOR остаётся строгим и от этой функции не зависит.
+    """
+    if not has_monitor_kremenchuk_binding(text):
+        return False
+
+    if is_post_event_report(text):
+        return False
+
+    if MONITOR_RECONNAISSANCE_MARKER in normalize_text(text):
+        return False
+
+    pass_by_city = MONITOR_PASS_BY_REGEX
+
+    for segment in split_monitor_segments(text):
+        remainder = pass_by_city.sub(" ", segment)
+
+        if not any(
+            term in remainder for term in KREMENCHUK_CITY_PATTERNS
+        ):
+            continue
+
+        if any(
+            pattern in remainder
+            for pattern in MONITOR_UAV_ARCHIVE_PATTERNS
+        ):
+            return True
+
+    return False
 
 
 def has_monitor_direct_kremenchuk_binding(text):
@@ -3131,45 +3526,55 @@ def has_monitor_direct_kremenchuk_binding(text):
     # «Кременчук — спуск балістики», «Кременчук — вихід» и т.п.
     # Разделяем короткие локальные сегменты по /, чтобы запись
     # другого города в той же строке не привязывала его цель к Кременчугу.
-    segments = re.split(r"\s*/\s*|\n+", normalized)
+    # Сегменты делятся по строкам, «/», «;» и точкам (normalized уже
+    # схлопнул переводы строк, поэтому делим исходный text), чтобы
+    # запись другого города/другой фразы не привязывала свою цель
+    # к Кременчугу.
+    segments = split_monitor_segments(text)
     kremenchuk_terms = KREMENCHUK_CITY_PATTERNS
+
+    # Локальная запись вида «Кременчук 3 Циркони»,
+    # «Кременчук — спуск балістики» или «Кременчук 1х Бандероль».
+    # Самого упоминания города недостаточно: конструкции
+    # «Циркон довкола Кременчука» / «Бандероль через Кременчук»
+    # не должны становиться тревогой.
+    # Упоминание города как точки пролёта/обхода не считается
+    # прямой угрозой: «повз Кременчук», «через Кременчук»,
+    # «довкола Кременчука».
+    pass_by_city = MONITOR_PASS_BY_REGEX
+
+    def local_binding(piece):
+        if not any(term in piece for term in kremenchuk_terms):
+            return False
+
+        local_target = MONITOR_LOCAL_TARGET_REGEX.search(piece)
+        return (
+            local_target is not None
+            or has_monitor_operational_marker(piece)
+        )
 
     for segment in segments:
         if not any(term in segment for term in kremenchuk_terms):
             continue
 
-        # Локальная запись вида «Кременчук 3 Циркони»,
-        # «Кременчук — спуск балістики» или «Кременчук 1х Бандероль».
-        # Самого упоминания города недостаточно: конструкции
-        # «Циркон довкола Кременчука» / «Бандероль через Кременчук»
-        # не должны становиться тревогой.
-        city_pattern = r"(?:" + "|".join(
-            re.escape(pattern) for pattern in KREMENCHUK_CITY_PATTERNS
-        ) + r")"
-        target_pattern = "|".join(
-            re.escape(pattern)
-            for pattern in HIGH_SPEED_PATTERNS
-        ) + "|" + "|".join(
-            re.escape(pattern)
-            for pattern in CRUISE_MISSILE_PATTERNS
-        ) + "|" + "|".join(
-            re.escape(pattern)
-            for pattern in BANDEROL_PATTERNS
-        ) + r"|\bкр\b|\bбр\b"
-        # Упоминание города как точки пролёта/обхода не считается
-        # прямой угрозой: «повз Кременчук», «через Кременчук»,
-        # «довкола Кременчука».
-        if re.search(
-            r"(?:повз|через|довкола|довкола)\s+" + city_pattern,
-            segment,
-        ):
+        if pass_by_city.search(segment):
+            # Сегмент целиком не отбрасываем, если в нём есть
+            # отдельная (через запятую) часть с самостоятельной
+            # привязкой к Кременчугу: «Кременчук 3 Циркони,
+            # 1 Циркон повз Кременчук». Часть с «повз/через/
+            # довкола» сама по себе тревогой не является.
+            parts = [p for p in segment.split(",") if p.strip()]
+
+            if len(parts) > 1 and any(
+                local_binding(p)
+                for p in parts
+                if not pass_by_city.search(p)
+            ):
+                return True
+
             continue
 
-        local_target = re.search(
-            city_pattern + r".{0,50}(?:" + target_pattern + r")",
-            segment,
-        )
-        if local_target is not None or has_monitor_operational_marker(segment):
+        if local_binding(segment):
             return True
 
     return False
@@ -3197,7 +3602,7 @@ def classify_monitor_strict_message(text):
     normalized = normalize_text(text)
 
     # Дорозвідка не является новой угрозой для отправки тревоги.
-    if "дорозвідка" in normalized:
+    if MONITOR_RECONNAISSANCE_MARKER in normalized:
         return "IGNORE"
 
     has_allowed_target = (
@@ -3219,6 +3624,52 @@ def classify_monitor_strict_message(text):
     return "ALERT"
 
 
+def classify_monitor_with_rule(text):
+    """
+    MONITOR: итоговое решение (ALERT / ARCHIVE / IGNORE) и правило.
+    Порядок тот же, что был в check_source(): строгий ALERT-фильтр,
+    затем архивные условия, иначе IGNORE. Классификаторы не менялись.
+    """
+    if classify_monitor_strict_message(text) == "ALERT":
+        kinds = []
+
+        if has_high_speed_threat(text):
+            kinds.append("high_speed")
+
+        if has_cruise_missile(text):
+            kinds.append("cruise")
+
+        if has_banderol(text):
+            kinds.append("banderol")
+
+        if has_monitor_operational_marker(text):
+            kinds.append("operational_marker")
+
+        return "ALERT", "alert:strict:" + "+".join(kinds or ["target"])
+
+    if has_monitor_archive_target_binding(text):
+        return "ARCHIVE", "archive:target_binding"
+
+    if has_monitor_uav_archive_binding(text):
+        return "ARCHIVE", "archive:uav_segment"
+
+    if not has_monitor_kremenchuk_binding(text):
+        return "IGNORE", "ignore:no_city"
+
+    if is_post_event_report(text):
+        return "IGNORE", "ignore:post_event_report"
+
+    if MONITOR_RECONNAISSANCE_MARKER in normalize_text(text):
+        return "IGNORE", "ignore:reconnaissance"
+
+    # Кременчук + другой город без самостоятельного основания для
+    # ALERT (строгий фильтр уже отработал выше) -> ARCHIVE.
+    if has_monitor_city_with_other_place(text):
+        return "ARCHIVE", "archive:city_with_other_place"
+
+    return "IGNORE", "ignore:no_allowed_target_or_binding"
+
+
 # ============================================================
 # ОТПРАВКА ОПЕРАТИВНОГО СООБЩЕНИЯ
 # ============================================================
@@ -3230,13 +3681,6 @@ def build_alert_text(
     original_text,
     classification,
 ):
-    safe_text = original_text[:3500]
-
-    escaped_text = html.escape(
-        safe_text,
-        quote=False,
-    )
-
     if classification == "IMPACT_CONFIRMED":
         title = MESSAGES["alert_title_impact_confirmed"]
 
@@ -3251,10 +3695,48 @@ def build_alert_text(
         # Запасной вариант для уже существующих/тестовых источников.
         source_label = html.escape(source_name, quote=False)
 
+    safe_post_link = html.escape(post_link, quote=True)
+
+    # Лимит считается по итоговой строке ПОСЛЕ экранирования:
+    # оригинальный текст -> escape -> бюджет длины -> безопасное
+    # ограничение. Шаблон без текста даёт размер служебной части.
+    overhead = len(
+        MESSAGES["alert_body"].format(
+            source_label=source_label,
+            title=title,
+            post_link=safe_post_link,
+            escaped_text="",
+        )
+    )
+
+    budget = max(0, TELEGRAM_MAX_MESSAGE_LENGTH - overhead - 1)
+
+    escaped_parts = []
+    used = 0
+    truncated = False
+
+    for char in original_text:
+        escaped_char = html.escape(char, quote=False)
+
+        if used + len(escaped_char) > budget:
+            truncated = True
+            break
+
+        escaped_parts.append(escaped_char)
+        used += len(escaped_char)
+
+    if truncated and escaped_parts:
+        # Убираем целый последний символ (не часть сущности &amp;),
+        # чтобы освободить место под многоточие.
+        escaped_parts.pop()
+        escaped_parts.append("…")
+
+    escaped_text = "".join(escaped_parts)
+
     return MESSAGES["alert_body"].format(
         source_label=source_label,
         title=title,
-        post_link=html.escape(post_link, quote=True),
+        post_link=safe_post_link,
         escaped_text=escaped_text,
     )
 
@@ -3298,36 +3780,9 @@ def send_alert(
     if not message_id:
         return False
 
-    with sent_messages_lock:
-        sent_messages.add(
-            dedup_key
-        )
-
-        # ID фиксируем только после успешной доставки.
-        # Изменение текста того же поста уже не создаст вторую тревогу.
-        sent_messages_to_save = sorted(sent_messages)
-
-    try:
-        directory = os.path.dirname(SENT_MESSAGES_FILE)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-
-        tmp_file = f"{SENT_MESSAGES_FILE}.tmp"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(
-                sent_messages_to_save,
-                f,
-                ensure_ascii=False,
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_file, SENT_MESSAGES_FILE)
-    except Exception as e:
-        print(
-            "Ошибка сохранения ID отправленного сообщения: "
-            f"{type(e).__name__}: {e}",
-            flush=True,
-        )
+    # ID фиксируем только после успешной доставки.
+    # Изменение текста того же поста уже не создаст вторую тревогу.
+    register_sent(dedup_key)
 
     with state_lock:
         state["last_alert"] = now_utc()
@@ -3339,7 +3794,6 @@ def send_alert(
     )
 
     return True
-
 
 
 def build_archive_text(
@@ -3394,11 +3848,16 @@ def send_archive(
     published_at,
     received_at=None,
 ):
-    """Отправляет архивные сообщения в приватную картотеку."""
-    if classification not in (
-        "ARCHIVE",
-        "ARCHIVE_MONITOR",
-    ):
+    """
+    Отправляет архивные сообщения в единую приватную картотеку.
+    Архив один и без типов: принимается только ARCHIVE, формат
+    карточки не зависит ни от источника, ни от причины попадания.
+    """
+    if classification != "ARCHIVE":
+        return False
+
+    if ARCHIVE_CHAT_ID is None:
+        _log_archive_config_error()
         return False
 
     dedup_key = f"archive:{source_name}:{post_id}"
@@ -3484,7 +3943,19 @@ def send_archive(
 
     message_ids = []
 
-    for part in archive_parts:
+    # Многочастная карточка: каждая успешно отправленная часть
+    # фиксируется отдельно, чтобы повтор после частичного сбоя
+    # досылал только недостающие части, а не дублировал отправленные.
+    multipart = len(archive_parts) > 1
+
+    for index, part in enumerate(archive_parts):
+        part_key = f"{dedup_key}:part{index}"
+
+        if multipart:
+            with sent_messages_lock:
+                if part_key in sent_messages:
+                    continue
+
         data = {
             "chat_id": ARCHIVE_CHAT_ID,
             "text": part,
@@ -3506,27 +3977,10 @@ def send_archive(
 
         message_ids.append(message_id)
 
-    with sent_messages_lock:
-        sent_messages.add(dedup_key)
-        sent_messages_to_save = sorted(sent_messages)
+        if multipart:
+            register_sent(part_key)
 
-    try:
-        directory = os.path.dirname(SENT_MESSAGES_FILE)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-
-        tmp_file = f"{SENT_MESSAGES_FILE}.tmp"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(sent_messages_to_save, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_file, SENT_MESSAGES_FILE)
-    except Exception as e:
-        print(
-            "Ошибка сохранения ID архивного сообщения: "
-            f"{type(e).__name__}: {e}",
-            flush=True,
-        )
+    register_sent(dedup_key)
 
     print(
         f"ОТПРАВЛЕНО В КАРТОТЕКУ: {source_name}; "
@@ -3537,8 +3991,102 @@ def send_archive(
     return True
 
 
-def extract_current_message_text(post):
-    """Возвращает только текст текущего Telegram-сообщения."""
+_archive_config_error_logged = False
+
+
+def _log_archive_config_error():
+    global _archive_config_error_logged
+
+    if _archive_config_error_logged:
+        return
+
+    _archive_config_error_logged = True
+
+    print(
+        "ОШИБКА КОНФИГУРАЦИИ: архивное сообщение не отправлено - "
+        f"{ARCHIVE_CONFIG_ERROR or 'ARCHIVE_CHAT_ID не настроен'}.",
+        flush=True,
+    )
+
+
+# Архив отправляется отдельным фоновым потоком, чтобы медленная или
+# недоступная картотека не задерживала обработку следующих постов и
+# источников (ALERT всегда отправляется парсером синхронно и первым).
+archive_queue = queue.Queue()
+archive_pending = set()
+archive_pending_lock = threading.Lock()
+_archive_worker_thread = None
+_archive_worker_lock = threading.Lock()
+
+
+def _archive_worker():
+    while True:
+        key, kwargs = archive_queue.get()
+
+        try:
+            send_archive(**kwargs)
+
+        except Exception as e:
+            print(
+                "Ошибка отправки в картотеку: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+        finally:
+            with archive_pending_lock:
+                archive_pending.discard(key)
+
+            archive_queue.task_done()
+
+
+def _ensure_archive_worker():
+    global _archive_worker_thread
+
+    with _archive_worker_lock:
+        if (
+            _archive_worker_thread is None
+            or not _archive_worker_thread.is_alive()
+        ):
+            _archive_worker_thread = threading.Thread(
+                target=_archive_worker,
+                name="archive-sender",
+                daemon=True,
+            )
+            _archive_worker_thread.start()
+
+
+def enqueue_archive(**kwargs):
+    """
+    Ставит архивную карточку в очередь отправки. Пост, который уже
+    в очереди или уже отправлен, повторно не ставится. Если отправка
+    не удалась, на следующем цикле (пока пост в окне актуальности)
+    карточка будет поставлена снова.
+    """
+    if ARCHIVE_CHAT_ID is None:
+        _log_archive_config_error()
+        return False
+
+    key = f"archive:{kwargs['source_name']}:{kwargs['post_id']}"
+
+    with sent_messages_lock:
+        if key in sent_messages:
+            return False
+
+    with archive_pending_lock:
+        if key in archive_pending:
+            return False
+
+        archive_pending.add(key)
+
+    _ensure_archive_worker()
+    archive_queue.put((key, kwargs))
+
+    return True
+
+
+def _current_message_text_element(post):
+    """Элемент с текстом текущего сообщения (без reply/forward-контекста)."""
     text_element = post.select_one(
         ".tgme_widget_message_bubble > .tgme_widget_message_text"
     )
@@ -3560,9 +4108,10 @@ def extract_current_message_text(post):
             text_element = candidate
             break
 
-    if text_element is None:
-        return ""
+    return text_element
 
+
+def _clean_text_soup(text_element):
     clean_soup = BeautifulSoup(
         str(text_element),
         "html.parser",
@@ -3574,15 +4123,146 @@ def extract_current_message_text(post):
     ):
         context.decompose()
 
-    return clean_soup.get_text(
+    return clean_soup
+
+
+def extract_current_message_text(post):
+    """Возвращает только текст текущего Telegram-сообщения."""
+    text_element = _current_message_text_element(post)
+
+    if text_element is None:
+        return ""
+
+    return _clean_text_soup(text_element).get_text(
         "\n",
         strip=True,
+    )
+
+
+def extract_message_lines_text(post):
+    """
+    Тот же текст, но с настоящими переводами строк (<br>) и без
+    «переводов строк» между соседними inline-тегами (<b>, <a>, <i>).
+    Используется ТОЛЬКО для классификации MONITOR (деление на
+    сегменты); в тревогу и архив по-прежнему идёт extract_current_message_text().
+    """
+    text_element = _current_message_text_element(post)
+
+    if text_element is None:
+        return ""
+
+    clean_soup = _clean_text_soup(text_element)
+
+    for br in clean_soup.find_all("br"):
+        br.replace_with("\n")
+
+    raw = clean_soup.get_text("")
+
+    return "\n".join(
+        line.strip()
+        for line in raw.split("\n")
+        if line.strip()
     )
 
 
 # ============================================================
 # ПРОВЕРКА ОДНОГО ИСТОЧНИКА
 # ============================================================
+
+_source_state_log = {}
+
+
+def log_source_state(source_name, status):
+    """
+    Диагностика состояния источника. Пишется только при СМЕНЕ
+    состояния (без спама каждые 15 секунд). Тишина канала
+    (валидная структура, нет свежих постов) - это рабочий источник.
+    """
+    if _source_state_log.get(source_name) == status:
+        return
+
+    _source_state_log[source_name] = status
+
+    print(
+        f"source={source_name} state={status}",
+        flush=True,
+    )
+
+
+_logged_decisions = set()
+
+
+def log_decision(source, post_id, decision, rule, text):
+    """
+    Почему пост получил решение: source / decision / rule / post.
+    Текст поста не логируется. IGNORE пишется только если в тексте
+    упомянут Кременчук (иначе это шум), и по одному разу на пост.
+    """
+    if decision == "IGNORE" and KEYWORD not in normalize_text(text):
+        return
+
+    key = (source, post_id, decision, rule)
+
+    if key in _logged_decisions:
+        return
+
+    if len(_logged_decisions) > 5000:
+        _logged_decisions.clear()
+
+    _logged_decisions.add(key)
+
+    print(
+        f"source={source} decision={decision} rule={rule} post={post_id}",
+        flush=True,
+    )
+
+
+# Backoff при технической недоступности источника: после
+# SOURCE_BACKOFF_AFTER_FAILURES подряд неудачных проверок источник
+# опрашивается реже (SOURCE_BACKOFF_STEPS_SECONDS, максимум 60 с);
+# первая же успешная проверка возвращает обычный интервал.
+# Для каждого источника счётчик свой.
+SOURCE_BACKOFF_AFTER_FAILURES = 3
+SOURCE_BACKOFF_STEPS_SECONDS = (30, 60)
+
+source_failure_count = {}
+source_retry_at = {}
+
+
+def source_backoff_active(source_name):
+    return time.monotonic() < source_retry_at.get(source_name, 0.0)
+
+
+def source_record_result(source_name, ok):
+    if ok:
+        if source_failure_count.get(source_name):
+            print(
+                f"source={source_name} backoff=reset (источник снова доступен)",
+                flush=True,
+            )
+
+        source_failure_count[source_name] = 0
+        source_retry_at.pop(source_name, None)
+        return
+
+    failures = source_failure_count.get(source_name, 0) + 1
+    source_failure_count[source_name] = failures
+
+    if failures >= SOURCE_BACKOFF_AFTER_FAILURES:
+        step = min(
+            failures - SOURCE_BACKOFF_AFTER_FAILURES,
+            len(SOURCE_BACKOFF_STEPS_SECONDS) - 1,
+        )
+        delay = SOURCE_BACKOFF_STEPS_SECONDS[step]
+
+        source_retry_at[source_name] = time.monotonic() + delay
+
+        print(
+            f"source={source_name} backoff={delay}s "
+            f"(подряд неудач: {failures})",
+            flush=True,
+        )
+
 
 def check_source(
     source_url,
@@ -3591,16 +4271,19 @@ def check_source(
     is_monitor=False,
 ):
     try:
+        parser_progress_beat()
+
         response = session.get(
             source_url,
             timeout=SOURCE_REQUEST_TIMEOUT,
         )
 
+        parser_progress_beat()
+
         if response.status_code != 200:
-            print(
-                f"{source_name}: "
-                f"HTTP {response.status_code}",
-                flush=True,
+            log_source_state(
+                source_name,
+                f"unavailable:http_{response.status_code}",
             )
 
             return False
@@ -3615,7 +4298,36 @@ def check_source(
         )
 
         if not posts:
-            return True
+            # Пустая лента у живого канала не бывает; HTTP 200 без
+            # структуры канала (заглушка, капча, редирект на превью)
+            # означает, что парсер фактически «ослеп».
+            if soup.select_one(
+                ".tgme_channel_history, .tgme_channel_info"
+            ) is not None:
+                log_source_state(
+                    source_name,
+                    "ok:valid_channel_structure_no_posts",
+                )
+                return True
+
+            log_source_state(
+                source_name,
+                "unavailable:http_200_without_channel_structure",
+            )
+
+            return False
+
+        # Посты есть, но ни у одного не читается время публикации —
+        # разметка изменилась, фильтр по возрасту работать не сможет.
+        if not any(
+            get_post_datetime(post) for post in posts
+        ):
+            log_source_state(
+                source_name,
+                "unavailable:posts_without_readable_time",
+            )
+
+            return False
 
         current_time = now_utc()
 
@@ -3623,6 +4335,8 @@ def check_source(
         posts = list(
             reversed(posts)
         )
+
+        fresh_count = 0
 
         for post in posts:
             post_datetime = (
@@ -3645,6 +4359,8 @@ def check_source(
                 > MAX_MESSAGE_AGE_MINUTES * 60
             ):
                 break
+
+            fresh_count += 1
 
             text = extract_current_message_text(
                 post
@@ -3669,11 +4385,22 @@ def check_source(
             # Кременчук, оно отправляется ТОЛЬКО в картотеку.
 
             if is_monitor:
-                # MONITOR: сначала действует строгий оперативный фильтр.
-                # Если сообщение уже распознано как тревога — только ALERT.
-                monitor_classification = classify_monitor_strict_message(text)
+                # Для классификации MONITOR используется текст с
+                # сохранёнными строками; в тревогу/архив идёт `text`.
+                classify_text = (
+                    extract_message_lines_text(post) or text
+                )
 
-                if monitor_classification == "ALERT":
+                # ALERT > ARCHIVE > IGNORE. Строгий оперативный фильтр
+                # MONITOR первым; архивные условия MONITOR свои, но
+                # архив единый: любой архивный результат -> ARCHIVE.
+                decision, rule = classify_monitor_with_rule(classify_text)
+
+                log_decision(
+                    "MONITOR", post_id, decision, rule, classify_text,
+                )
+
+                if decision == "ALERT":
                     send_alert(
                         source_name=source_name,
                         source_link=source_link,
@@ -3683,18 +4410,13 @@ def check_source(
                     )
                     continue
 
-                # Если ALERT не сработал, в картотеку попадает не любое
-                # упоминание Кременчуга, а только потенциально значимая
-                # цель с прямой связью с городом. Это контроль качества
-                # фильтра: неизвестные типы целей можно обнаружить и
-                # позже добавить в словарь ALERT.
-                if has_monitor_archive_target_binding(text):
-                    send_archive(
+                if decision == "ARCHIVE":
+                    enqueue_archive(
                         source_name=source_name,
                         source_link=source_link,
                         post_id=post_id,
                         original_text=text,
-                        classification="ARCHIVE_MONITOR",
+                        classification="ARCHIVE",
                         published_at=post_datetime,
                         received_at=now_utc(),
                     )
@@ -3704,7 +4426,15 @@ def check_source(
             # ------------------------------------------------
             # PSZSU — широкий городской триггер + minus-фильтр
             # ------------------------------------------------
-            classification = classify_pszsu_kremenchuk_message(text)
+            classification, rule = classify_pszsu_with_rule(text)
+
+            log_decision(
+                "PSZSU",
+                post_id,
+                "ARCHIVE" if classification.startswith("ARCHIVE") else classification,
+                rule,
+                text,
+            )
 
             if classification == "IGNORE":
                 continue
@@ -3723,17 +4453,33 @@ def check_source(
                 )
                 continue
 
-            if classification == "ARCHIVE":
-                send_archive(
+            # ARCHIVE_HIGH / ARCHIVE_NORMAL — внутренние значения
+            # классификатора PSZSU. Архив единый и без типов, поэтому
+            # оба превращаются в одно действие ARCHIVE.
+            if classification in (
+                "ARCHIVE",
+                "ARCHIVE_HIGH",
+                "ARCHIVE_NORMAL",
+            ):
+                enqueue_archive(
                     source_name=source_name,
                     source_link=source_link,
                     post_id=post_id,
                     original_text=text,
-                    classification=classification,
+                    classification="ARCHIVE",
                     published_at=post_datetime,
                     received_at=now_utc(),
                 )
                 continue
+
+        log_source_state(
+            source_name,
+            (
+                f"ok:valid_channel_structure_fresh_posts={fresh_count}"
+                if fresh_count
+                else "ok:valid_channel_structure_no_fresh_posts"
+            ),
+        )
 
         return True
 
@@ -3742,6 +4488,11 @@ def check_source(
             f"Ошибка проверки {source_name}: "
             f"{type(e).__name__}: {e}",
             flush=True,
+        )
+
+        log_source_state(
+            source_name,
+            f"unavailable:exception_{type(e).__name__}",
         )
 
         return False
@@ -3764,51 +4515,72 @@ def check_updates():
     # PSZSU
     # --------------------------------------------------------
 
-    try:
-        pszsu_ok = check_source(
-            source_url=PSZSU_URL,
-            source_name=PSZSU_NAME,
-            source_link=PSZSU_LINK,
-            is_monitor=False,
-        )
+    if source_backoff_active(PSZSU_NAME):
+        # Backoff: источник недавно подряд не отвечал. Состояние
+        # pszsu_ok остаётся неисправным (watchdog его видит), запрос
+        # пропускается до конца паузы.
+        pszsu_checked = False
 
-    except Exception as e:
-        pszsu_ok = False
+    else:
+        pszsu_checked = True
 
-        print(
-            "ИСКЛЮЧЕНИЕ ПРИ ПРОВЕРКЕ PSZSU: "
-            f"{type(e).__name__}: {e}",
-            flush=True,
-        )
+        try:
+            pszsu_ok = check_source(
+                source_url=PSZSU_URL,
+                source_name=PSZSU_NAME,
+                source_link=PSZSU_LINK,
+                is_monitor=False,
+            )
 
-    with state_lock:
-        state["pszsu_ok"] = pszsu_ok
-        state["last_pszsu_check"] = now_utc()
+        except Exception as e:
+            pszsu_ok = False
+
+            print(
+                "ИСКЛЮЧЕНИЕ ПРИ ПРОВЕРКЕ PSZSU: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+        source_record_result(PSZSU_NAME, pszsu_ok)
+
+    if pszsu_checked:
+        with state_lock:
+            state["pszsu_ok"] = pszsu_ok
+            state["last_pszsu_check"] = now_utc()
 
     # --------------------------------------------------------
     # MONITOR
     # --------------------------------------------------------
 
-    try:
-        monitor_ok = check_source(
-            source_url=MONITOR_URL,
-            source_name=MONITOR_NAME,
-            source_link=MONITOR_LINK,
-            is_monitor=True,
-        )
+    if source_backoff_active(MONITOR_NAME):
+        monitor_checked = False
 
-    except Exception as e:
-        monitor_ok = False
+    else:
+        monitor_checked = True
 
-        print(
-            "ИСКЛЮЧЕНИЕ ПРИ ПРОВЕРКЕ MONITOR: "
-            f"{type(e).__name__}: {e}",
-            flush=True,
-        )
+        try:
+            monitor_ok = check_source(
+                source_url=MONITOR_URL,
+                source_name=MONITOR_NAME,
+                source_link=MONITOR_LINK,
+                is_monitor=True,
+            )
 
-    with state_lock:
-        state["monitor_ok"] = monitor_ok
-        state["last_monitor_check"] = now_utc()
+        except Exception as e:
+            monitor_ok = False
+
+            print(
+                "ИСКЛЮЧЕНИЕ ПРИ ПРОВЕРКЕ MONITOR: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+        source_record_result(MONITOR_NAME, monitor_ok)
+
+    if monitor_checked:
+        with state_lock:
+            state["monitor_ok"] = monitor_ok
+            state["last_monitor_check"] = now_utc()
 
     # --------------------------------------------------------
     # ЗАВЕРШЕНИЕ ПОЛНОГО ЦИКЛА
@@ -3848,7 +4620,12 @@ def run_bot():
     )
 
     print(
-        f"Картотека: {ARCHIVE_CHAT_ID}",
+        "Картотека: "
+        + (
+            "настроена"
+            if ARCHIVE_CHAT_ID is not None
+            else f"ОТКЛЮЧЕНА ({ARCHIVE_CONFIG_ERROR})"
+        ),
         flush=True,
     )
 
@@ -4109,7 +4886,7 @@ def internal_process_watchdog_loop():
 
 parser_thread = threading.Thread(
     target=run_bot,
-    name="telegram-monitor",
+    name=PARSER_THREAD_NAME,
     daemon=True,
 )
 
