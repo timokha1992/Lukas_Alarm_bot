@@ -360,6 +360,61 @@ MESSAGES = {
         "telegram": "Telegram Bot API снова доступен.",
     },
 
+    # Служебные сообщения инцидентов (этап A): одно сообщение на
+    # инцидент, при восстановлении оно же редактируется. {source_label}
+    # подставляется кодом (кликабельное название источника, HTML).
+    "incident_failure": {
+        "pszsu": (
+            "🔴 ВНИМАНИЕ!\n"
+            "\n"
+            "Проблема источника {source_label}\n"
+            "\n"
+            "⚠️ Получение информации от источника недоступно!"
+        ),
+        "monitor": (
+            "🔴 ВНИМАНИЕ!\n"
+            "\n"
+            "Проблема источника {source_label}\n"
+            "\n"
+            "⚠️ Получение информации от источника недоступно!"
+        ),
+        "parser": (
+            "🔴 ВНИМАНИЕ!\n"
+            "\n"
+            "Проблема системы Lukas Alarm\n"
+            "\n"
+            "⚠️ Получение и обработка новых сообщений недоступны!"
+        ),
+    },
+
+    # {recovered_at} и {since} - HH:MM по Киеву.
+    "incident_recovery": {
+        "pszsu": (
+            "🟢 ИСТОЧНИК ВОССТАНОВЛЕН ({recovered_at})\n"
+            "\n"
+            "Проблема источника {source_label} "
+            "(зафиксированная в {since}) — устранена.\n"
+            "\n"
+            "✅ Получение информации восстановлено."
+        ),
+        "monitor": (
+            "🟢 ИСТОЧНИК ВОССТАНОВЛЕН ({recovered_at})\n"
+            "\n"
+            "Проблема источника {source_label} "
+            "(зафиксированная в {since}) — устранена.\n"
+            "\n"
+            "✅ Получение информации восстановлено."
+        ),
+        "parser": (
+            "🟢 СИСТЕМА ВОССТАНОВЛЕНА ({recovered_at})\n"
+            "\n"
+            "Проблема системы Lukas Alarm "
+            "(зафиксированная в {since}) — устранена.\n"
+            "\n"
+            "✅ Получение и обработка сообщений восстановлены."
+        ),
+    },
+
     "watchdog_failure_reasons": {
         "parser": "Парсер не обновляет heartbeat.",
         "pszsu": (
@@ -640,6 +695,15 @@ sent_messages_lock = threading.Lock()
 state_file_lock = threading.Lock()
 persisted_status_message_id = None
 
+# Инциденты внутреннего watchdog (этап A): по одному слоту на тип.
+#   {тип: {"since": ts, "message_id": int|None,
+#          "recovered_at": ts|None, "ambiguous": int}}
+# Хранятся в state.json (ключ "incidents") и защищены sent_messages_lock.
+# message_id None - событие зафиксировано без сообщения (тип telegram).
+INCIDENT_TYPES = ("parser", "pszsu", "monitor", "telegram")
+INCIDENT_EDIT_MAX_AMBIGUOUS = 3
+incidents_store = {}
+
 
 def _parse_state_payload(data):
     """Разбирает содержимое state-файла -> (реестр {ключ: время}, status_id)."""
@@ -784,6 +848,14 @@ def persist_state():
                 "status_message_id": persisted_status_message_id,
             }
 
+            # Ключ появляется только пока есть открытые инциденты:
+            # без них формат файла совпадает с прежним.
+            if incidents_store:
+                payload["incidents"] = {
+                    key: dict(value)
+                    for key, value in incidents_store.items()
+                }
+
         with state_file_lock:
             os.makedirs(STATE_DIR, exist_ok=True)
 
@@ -813,7 +885,110 @@ def register_sent(key):
     persist_state()
 
 
+def load_incidents():
+    """
+    Инциденты из state.json (ключ "incidents"). Старые файлы без ключа
+    читаются как пустые. Ошибка чтения только логируется: состояние не
+    очищается и сообщения не создаются.
+    """
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    except FileNotFoundError:
+        return {}
+
+    except Exception as e:
+        print(
+            "Инциденты: не удалось прочитать state-файл: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+        return {}
+
+    raw = data.get("incidents") if isinstance(data, dict) else None
+
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded = {}
+
+    for key, value in raw.items():
+        if key not in INCIDENT_TYPES or not isinstance(value, dict):
+            continue
+
+        try:
+            since = float(value["since"])
+
+            if since <= 0:
+                continue
+
+            message_id = value.get("message_id")
+            message_id = (
+                int(message_id)
+                if isinstance(message_id, int) and message_id > 0
+                else None
+            )
+
+            recovered_at = value.get("recovered_at")
+            recovered_at = (
+                float(recovered_at)
+                if isinstance(recovered_at, (int, float))
+                and recovered_at > 0
+                else None
+            )
+
+            ambiguous = value.get("ambiguous", 0)
+            ambiguous = (
+                int(ambiguous)
+                if isinstance(ambiguous, int) and ambiguous >= 0
+                else 0
+            )
+
+        except Exception:
+            continue
+
+        loaded[key] = {
+            "since": since,
+            "message_id": message_id,
+            "recovered_at": recovered_at,
+            "ambiguous": ambiguous,
+        }
+
+    return loaded
+
+
+def restore_incidents():
+    """
+    Переносит открытые инциденты из файла в хранилище и в существующие
+    флаги watchdog (<тип>_failure_since / _notified). Вызывается при
+    импорте, до первой проверки watchdog (в нём ещё идёт стартовый
+    период), поэтому после перезапуска дубликатов сообщений нет.
+    """
+    loaded = load_incidents()
+
+    with sent_messages_lock:
+        incidents_store.clear()
+        incidents_store.update(loaded)
+
+    with state_lock:
+        for key, value in loaded.items():
+            state[f"{key}_failure_since"] = datetime.fromtimestamp(
+                value["since"],
+                timezone.utc,
+            )
+            state[f"{key}_failure_notified"] = True
+
+    if loaded:
+        print(
+            "Восстановлены инциденты: "
+            + ", ".join(sorted(loaded)),
+            flush=True,
+        )
+
+
 load_state()
+restore_incidents()
 
 if STATE_DIR.startswith("/tmp"):
     print(
@@ -1861,6 +2036,250 @@ def clear_failure_state(
     }
 
 
+def build_incident_source_label(failure_type):
+    """Кликабельное название источника (HTML) для сообщений инцидента."""
+    if failure_type == "pszsu":
+        return (
+            "🇺🇦 <a href=\""
+            + html.escape(PSZSU_LINK, quote=True)
+            + "\">ПОВІТРЯНІ СИЛИ ЗСУ</a>"
+        )
+
+    if failure_type == "monitor":
+        return (
+            "🛰️ <a href=\""
+            + html.escape(MONITOR_LINK, quote=True)
+            + "\">MONITOR</a>"
+        )
+
+    return ""
+
+
+def build_incident_failure_text(failure_type):
+    return MESSAGES["incident_failure"][failure_type].format(
+        source_label=build_incident_source_label(failure_type),
+    )
+
+
+def build_incident_recovery_text(failure_type, since_ts, recovered_ts):
+    return MESSAGES["incident_recovery"][failure_type].format(
+        source_label=build_incident_source_label(failure_type),
+        since=format_time_hm(
+            datetime.fromtimestamp(since_ts, timezone.utc)
+        ),
+        recovered_at=format_time_hm(
+            datetime.fromtimestamp(recovered_ts, timezone.utc)
+        ),
+    )
+
+
+def _incident_open(failure_type, since, message_id):
+    """Фиксирует открытый инцидент и сразу сохраняет его в state.json."""
+    with sent_messages_lock:
+        incidents_store[failure_type] = {
+            "since": since.timestamp(),
+            "message_id": message_id,
+            "recovered_at": None,
+            "ambiguous": 0,
+        }
+
+    persist_state()
+
+
+def _incident_update(failure_type, **fields):
+    with sent_messages_lock:
+        record = incidents_store.get(failure_type)
+
+        if record is not None:
+            record.update(fields)
+
+    persist_state()
+
+
+def _incident_reset_recovery(failure_type):
+    """
+    Сбрасывает отметку незавершённого восстановления (recovered_at и
+    счётчик неоднозначных попыток), если источник снова упал до
+    успешной правки сообщения: следующее восстановление получит свою
+    отметку времени.
+    """
+    with sent_messages_lock:
+        record = incidents_store.get(failure_type)
+        stale = bool(
+            record
+            and (record.get("recovered_at") or record.get("ambiguous"))
+        )
+
+        if stale:
+            record["recovered_at"] = None
+            record["ambiguous"] = 0
+
+    if stale:
+        persist_state()
+
+
+def _incident_close(failure_type, note):
+    """Закрывает инцидент: запись удаляется, флаги watchdog сбрасываются."""
+    with sent_messages_lock:
+        incidents_store.pop(failure_type, None)
+
+    persist_state()
+    clear_failure_state(failure_type)
+
+    print(
+        f"ИНЦИДЕНТ ЗАКРЫТ: {failure_type}; {note}",
+        flush=True,
+    )
+
+
+def edit_service_message(message_id, text):
+    """
+    Одна попытка editMessageText для служебного сообщения инцидента.
+    Возвращает:
+      "ok" / "not_modified" - сообщение на месте;
+      "gone"      - подтверждено, что сообщения нет (удалено);
+      "ambiguous" - редактирование невозможно по неясной причине
+                    (в т.ч. "message can't be edited"): факт удаления
+                    не подтверждён;
+      "error"     - временная ошибка (сеть, 5xx, 429), повтор позже.
+    """
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/editMessageText"
+    )
+
+    try:
+        response = session.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "link_preview_options": json.dumps({
+                    "is_disabled": True,
+                }),
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+
+        if response.status_code == 200 and payload.get("ok"):
+            with state_lock:
+                state["telegram_api_ok"] = True
+
+            return "ok"
+
+        description = str(payload.get("description", "")).lower()
+
+        if "message is not modified" in description:
+            with state_lock:
+                state["telegram_api_ok"] = True
+
+            return "not_modified"
+
+        if (
+            "message to edit not found" in description
+            or "message_id_invalid" in description
+        ):
+            with state_lock:
+                state["telegram_api_ok"] = True
+
+            return "gone"
+
+        if response.status_code >= 500 or response.status_code == 429:
+            with state_lock:
+                state["telegram_api_ok"] = False
+
+            print(
+                "Не удалось отредактировать сообщение инцидента: "
+                f"HTTP {response.status_code}; {description}",
+                flush=True,
+            )
+
+            return "error"
+
+        print(
+            "Редактирование сообщения инцидента неоднозначно: "
+            f"HTTP {response.status_code}; {description}",
+            flush=True,
+        )
+
+        return "ambiguous"
+
+    except Exception as e:
+        with state_lock:
+            state["telegram_api_ok"] = False
+
+        print(
+            "Не удалось отредактировать сообщение инцидента: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+        return "error"
+
+
+def _incident_recover(failure_type):
+    """
+    Восстановление инцидента: правка исходного сообщения (новое не
+    отправляется). recovered_at фиксируется при первой попытке и при
+    повторах не пересчитывается.
+    """
+    with sent_messages_lock:
+        record = incidents_store.get(failure_type)
+        record = dict(record) if record else None
+
+    if record is None or not record.get("message_id"):
+        _incident_close(
+            failure_type,
+            "без сообщения (событие зафиксировано в состоянии)",
+        )
+        return
+
+    recovered_ts = record.get("recovered_at")
+
+    if not recovered_ts:
+        recovered_ts = time.time()
+        _incident_update(failure_type, recovered_at=recovered_ts)
+
+    text = build_incident_recovery_text(
+        failure_type,
+        record["since"],
+        recovered_ts,
+    )
+
+    result = edit_service_message(record["message_id"], text)
+
+    if result in ("ok", "not_modified"):
+        _incident_close(failure_type, "сообщение отредактировано")
+
+    elif result == "gone":
+        _incident_close(
+            failure_type,
+            "исходное сообщение удалено (подтверждено Telegram)",
+        )
+
+    elif result == "ambiguous":
+        attempts = record.get("ambiguous", 0) + 1
+
+        if attempts >= INCIDENT_EDIT_MAX_AMBIGUOUS:
+            _incident_close(
+                failure_type,
+                "неопределённый результат редактирования после "
+                f"{attempts} попыток, повторы прекращены",
+            )
+
+        else:
+            _incident_update(failure_type, ambiguous=attempts)
+
+    # "error": временная ошибка, повтор на следующем проходе watchdog.
+
+
 def watchdog_send_failure(
     failure_type,
     reason,
@@ -1879,6 +2298,11 @@ def watchdog_send_failure(
         last_check = state["last_check"]
 
     if since is None or already_notified:
+        if already_notified and failure_type in INCIDENT_TYPES:
+            # Источник снова в сбое при открытом инциденте: отметка
+            # неудавшегося восстановления устарела.
+            _incident_reset_recovery(failure_type)
+
         return
 
     duration = (
@@ -1886,6 +2310,44 @@ def watchdog_send_failure(
     ).total_seconds()
 
     if duration < FAILURE_NOTIFICATION_AFTER_SECONDS:
+        return
+
+    if failure_type in INCIDENT_TYPES:
+        if failure_type == "telegram":
+            # Запоздалое сообщение о сбое Telegram API не создаётся:
+            # событие фиксируется в состоянии и журнале.
+            _incident_open(failure_type, since, None)
+
+            with state_lock:
+                state[key_notified] = True
+
+            print(
+                "ИНЦИДЕНТ TELEGRAM API зафиксирован без сообщения "
+                f"({reason})",
+                flush=True,
+            )
+
+            return
+
+        message_id = send_telegram_message(
+            build_incident_failure_text(failure_type),
+            parse_mode="HTML",
+            disable_link_preview=True,
+        )
+
+        if message_id:
+            # message_id сохраняется сразу, до установки флага.
+            _incident_open(failure_type, since, message_id)
+
+            with state_lock:
+                state[key_notified] = True
+
+            print(
+                "ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О СБОЕ: "
+                f"{failure_type}",
+                flush=True,
+            )
+
         return
 
     failure_title = MESSAGES["watchdog_failure_titles"].get(
@@ -1953,6 +2415,10 @@ def watchdog_check_recovery(
                 failure_type
             )
 
+        return
+
+    if failure_type in INCIDENT_TYPES:
+        _incident_recover(failure_type)
         return
 
     duration = (
