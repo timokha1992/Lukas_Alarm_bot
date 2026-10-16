@@ -44,6 +44,11 @@ from filters.pszsu import (
     PSZSU_DIRECT_ALARM_REGEX,
     PSZSU_NORMALIZE_MP_REGEX,
     PSZSU_STANDALONE_CITY_REGEX,
+    PSZSU_POSITION_LOCATIVE_REGEX,
+    PSZSU_COURSE_PHRASE_REGEXES,
+    PSZSU_DIRECTION_WORD_REGEX,
+    PSZSU_PASS_BY_CITY_REGEX,
+    PSZSU_CANCEL_REGEX,
 )
 
 from filters.monitor import (
@@ -3342,7 +3347,109 @@ def pszsu_has_kremenchuk_outside_minus(text):
     ) is not None
 
 
-def classify_pszsu_with_rule(text):
+def _pszsu_sides(phrase):
+    """Компоненты сторон света во фразе: {N,S,E,W}. «северо-западный» -> {N,W}."""
+    sides = set()
+
+    for word in re.findall(r"[а-яіїєґ]+", phrase):
+        if word.startswith("півн"):
+            sides.add("N")
+        elif word.startswith("півд"):
+            sides.add("S")
+        elif word.startswith(("схід", "сход", "східн")):
+            sides.add("E")
+        elif word.startswith("зах"):
+            sides.add("W")
+
+    return sides
+
+
+_PSZSU_OPPOSITE_SIDE = {"N": "S", "S": "N", "E": "W", "W": "E"}
+
+
+def pszsu_position_course_exclusion(text):
+    """
+    Исключение «положение + курс»: объект севернее/южнее/восточнее/западнее
+    города (предложный падеж: «на півночі від Кременчука») с ЯВНЫМ курсом,
+    который не направлен к городу. Курс «к городу» - любая сторона,
+    противоположная положению (север -> юг, восток -> запад; для
+    составных сторон проверяется каждая компонента).
+
+    Проверяется построчно (каждая строка сообщения ПС ЗСУ - отдельный
+    объект): курс из соседней строки к положению относительно Кременчука
+    не относится. Каждая строка с положением должна иметь явный курс не к
+    городу; если у такой строки курса нет или он направлен к городу -
+    исключение не применяется и действует прежняя логика.
+    """
+    checked = False
+
+    for line in text.split("\n"):
+        normalized = normalize_pszsu_text(line)
+
+        positions = set()
+
+        for m in re.finditer(PSZSU_POSITION_LOCATIVE_REGEX, normalized):
+            positions |= _pszsu_sides(m.group(1))
+
+        if not positions:
+            continue
+
+        courses = set()
+
+        for pattern in PSZSU_COURSE_PHRASE_REGEXES:
+            for m in re.finditer(pattern, normalized):
+                courses |= _pszsu_sides(m.group(1))
+
+        if not courses:
+            return False
+
+        if any(_PSZSU_OPPOSITE_SIDE[p] in courses for p in positions):
+            return False
+
+        checked = True
+
+    return checked
+
+
+def pszsu_has_direct_alarm_basis(normalized):
+    """Явное основание для тревоги: цель/курс на город или городская тревожная форма."""
+    return (
+        re.search(PSZSU_DIRECT_ALARM_REGEX, normalized) is not None
+        or re.search(KREMENCHUK_PSZSU_CITY_FIRST_ALERT_REGEX, normalized) is not None
+    )
+
+
+def pszsu_cancellation_decision(normalized):
+    """
+    Явная отмена угрозы (PSZSU_CANCEL_REGEX) в части предложений. Предложение с
+    отменой не даёт тревогу. Если в остальных предложениях нет прямого
+    основания (pszsu_has_direct_alarm_basis), а город упомянут вне
+    минус-конструкций - сообщение уходит в картотеку, не в ALERT.
+    Возвращает (решение, правило) или None (отмены нет / прямое основание
+    в другом предложении / города нет - обычная логика).
+    """
+    sentences = [
+        part for part in re.split(r"[.!?;\n]+", normalized) if part.strip()
+    ]
+
+    cancel = [
+        bool(re.search(PSZSU_CANCEL_REGEX, part)) for part in sentences
+    ]
+
+    if not any(cancel):
+        return None
+
+    for part, is_cancel in zip(sentences, cancel):
+        if not is_cancel and pszsu_has_direct_alarm_basis(part):
+            return None
+
+    if not pszsu_has_kremenchuk_outside_minus(normalized):
+        return None
+
+    return "ARCHIVE_NORMAL", "archive:threat_cancelled_city"
+
+
+def classify_pszsu_with_rule(text, _skip_continuing=False):
     """
     PSZSU: широкий городской триггер + согласованные исключения.
     Возвращает (решение, правило). Решение: ALERT / ARCHIVE_HIGH /
@@ -3350,13 +3457,36 @@ def classify_pszsu_with_rule(text):
     check_source() приводит их к единому ARCHIVE). Правило - короткое
     имя сработавшей ветки для диагностики.
     """
-    if is_continuing_threat(text):
+    if not _skip_continuing and is_continuing_threat(text):
+        # «Триває загроза…»: повтор уже поданной тревоги. Сводка исключается
+        # полностью; остальное разбираем обычной логикой (без этой ветки):
+        # город без самостоятельного основания - картотека, а не потеря;
+        # прямое основание (курс/цель на город) - ALERT; без города - IGNORE.
+        if is_post_event_report(text):
+            return "IGNORE", "ignore:continuing_threat"
+
+        decision, rule = classify_pszsu_with_rule(text, _skip_continuing=True)
+
+        if decision.startswith("ARCHIVE"):
+            return decision, rule
+
+        if decision == "ALERT":
+            if pszsu_has_direct_alarm_basis(normalize_pszsu_text(text)):
+                return "ALERT", "alert:continuing_threat_direct_basis"
+
+            return "ARCHIVE_NORMAL", "archive:continuing_threat_city"
+
         return "IGNORE", "ignore:continuing_threat"
 
     if is_post_event_report(text):
         return "IGNORE", "ignore:post_event_report"
 
     normalized = normalize_pszsu_text(text)
+
+    cancelled = pszsu_cancellation_decision(normalized)
+
+    if cancelled is not None:
+        return cancelled
 
     archive_high = re.search(PSZSU_ARCHIVE_HIGH_REGEX, normalized)
     archive_direction = re.search(PSZSU_ARCHIVE_DIRECTION_REGEX, normalized)
@@ -3377,6 +3507,20 @@ def classify_pszsu_with_rule(text):
 
         return "ARCHIVE_NORMAL", "archive:direction_from_city"
 
+    # Исключение «положение + курс» (локатив «на півночі від Кременчука»
+    # с явным курсом не к городу). Не подавляет тревогу, если есть
+    # самостоятельное основание; сообщение уходит в картотеку, не теряется.
+    if pszsu_position_course_exclusion(text):
+        remainder = re.sub(PSZSU_POSITION_LOCATIVE_REGEX, " ", normalized)
+
+        if (
+            pszsu_has_direct_alarm_basis(normalized)
+            or pszsu_has_kremenchuk_outside_minus(remainder)
+        ):
+            return "ALERT", "alert:independent_basis_beside_position_course"
+
+        return "ARCHIVE_NORMAL", "archive:position_course_not_toward_city"
+
     # После удаления минус-конструкций остаётся самостоятельный город — ALERT.
     if pszsu_has_kremenchuk_outside_minus(text):
         # «Кременчук та <другой город>» без самостоятельного основания
@@ -3388,6 +3532,11 @@ def classify_pszsu_with_rule(text):
             return "ARCHIVE_NORMAL", "archive:city_with_other_place"
 
         return "ALERT", "alert:city_outside_minus"
+
+    # «Повз/довкола Кременчука» без самостоятельного основания: не ALERT,
+    # но город упомянут - в картотеку, а не в IGNORE.
+    if re.search(PSZSU_PASS_BY_CITY_REGEX, normalized):
+        return "ARCHIVE_NORMAL", "archive:pass_by_city"
 
     return "IGNORE", "ignore:no_independent_city"
 
