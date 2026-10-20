@@ -93,7 +93,15 @@ STATUS_UPDATE_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 10
 
 PARSER_STALE_AFTER_SECONDS = 60
-FAILURE_NOTIFICATION_AFTER_SECONDS = 60
+# Задержка перед уведомлением о сбое (отсчёт от фактического начала
+# инцидента). Применяется ко всем типам инцидентов watchdog
+# (источники, парсер, Telegram API): так устроена общая логика.
+FAILURE_NOTIFICATION_AFTER_SECONDS = 90
+
+# Последняя проверка источника старше этого срока - состояние не
+# подтверждено. Запас над худшим циклом: 2 запроса по 5+15 с
+# + интервал 15 с + максимальный backoff 60 с (~115 с).
+WATCHDOG_STATE_STALE_AFTER_SECONDS = 180
 STARTUP_GRACE_SECONDS = 90
 
 # Внутренний процесс-уровневый watchdog.
@@ -356,6 +364,30 @@ MESSAGES = {
         "🔰 Диагностика системы проведена.\n"
         "\n"
         "🔰 Сообщения об угрозах доступны."
+    ),
+
+    # {sources}, {details}, {threshold_seconds}
+    # Одно сообщение, когда одновременно недоступны несколько
+    # источников (pszsu и monitor).
+    "watchdog_source_issue_multi_body": (
+        "🔴 ПРОБЛЕМА ИСТОЧНИКОВ: {sources}\n"
+        "\n"
+        "ℹ️ ДИАГНОСТИКА ИСТОЧНИКОВ\n"
+        "\n"
+        "Источники временно недоступны "
+        "или обработаны с ошибкой.\n"
+        "Сам бот продолжает работать.\n"
+        "\n"
+        "{details}\n"
+        "\n"
+        "Проблема длится более {threshold_seconds} секунд."
+    ),
+
+    # {details}: строки "<причина восстановления> Длительность сбоя: ..."
+    "watchdog_source_recovery_multi_body": (
+        "🟢 ИСТОЧНИКИ ВОССТАНОВЛЕНЫ\n"
+        "\n"
+        "{details}"
     ),
 
     "watchdog_recovery_reasons": {
@@ -1866,129 +1898,989 @@ def clear_failure_state(
     }
 
 
-def watchdog_send_failure(
-    failure_type,
-    reason,
-):
-    key_since = (
-        f"{failure_type}_failure_since"
+# --------------------------------------------------------------
+# Уведомления watchdog (правки 20.10.2026: согласованный план +
+# доработка по ТЗ «доработка watchdog»):
+#  1. решения принимаются по СВЕЖЕМУ состоянию каждого компонента,
+#     а не по снимку из начала прохода; устаревшие данные источника
+#     (давно не было проверки) не выдаются за актуальные;
+#  2. инцидент, закрытый без доставленного уведомления, пишется
+#     только в лог (запоздалых сообщений в Telegram нет);
+#  3. сбои нескольких источников (pszsu / monitor) уходят ОДНИМ
+#     сообщением, восстановления - тоже одним; состояния инцидентов
+#     (<тип>_failure_since / _notified) и история по каждому
+#     источнику (source_diag) остаются независимыми;
+#  4. порог уведомления - FAILURE_NOTIFICATION_AFTER_SECONDS (90 с),
+#     отсчёт от фактического времени первой неудачной проверки;
+#  5. отправка - одна ограниченная попытка (без серии повторов
+#     telegram_request); после первой неудачи в проходе остальные
+#     отправки откладываются на следующий проход;
+#  6. флаг notified ставится только после успешной отправки сообщения,
+#     в котором перечислен этот источник.
+# --------------------------------------------------------------
+
+# Одна попытка отправки уведомления watchdog: connect 3 с, read 8 с.
+WATCHDOG_SEND_TIMEOUT = (3, 8)
+
+# Сколько раз пытались доставить уведомление о сбое по типу (только
+# для диагностики в логе; в состояние/файл не пишется).
+watchdog_send_attempts = {}
+
+# Типы, по которым уже записано в лог «состояние устарело» (чтобы не
+# повторять строку каждые 10 секунд).
+watchdog_stale_logged = set()
+
+SOURCE_DIAG_HISTORY_LIMIT = 50
+
+
+# --------------------------------------------------------------
+# Диагностика источников: что именно произошло по каждому из них
+# --------------------------------------------------------------
+
+def _new_source_diag():
+    return {
+        "consecutive_failures": 0,
+        "consecutive_successes": 0,
+        "first_fail_at": None,      # начало текущей серии неудач
+        "last_ok_at": None,         # последняя успешная проверка
+        "last_error": None,         # dict: kind/label/class/message/...
+        "pending_error": None,      # исключение, ещё не учтённое
+        "backoff_active": False,
+        "backoff_since": None,
+        "backoff_events": 0,
+        "incident": None,           # открытый инцидент (dict)
+        "history": [],              # закрытые инциденты
+    }
+
+
+source_diag = {
+    "pszsu": _new_source_diag(),
+    "monitor": _new_source_diag(),
+}
+source_diag_lock = threading.Lock()
+
+
+def source_key(source_name):
+    return "pszsu" if source_name == PSZSU_NAME else "monitor"
+
+
+def _source_title(failure_type):
+    return "PSZSU" if failure_type == "pszsu" else "MONITOR"
+
+
+def classify_source_error(exc):
+    """
+    Тип сетевой ошибки по исключению requests. Возвращает
+    (kind, человекочитаемая метка). Первопричину (Render / сеть /
+    t.me) это не определяет, только различает виды отказа.
+    """
+    cls = type(exc).__name__
+    low = str(exc).lower()
+    rex = requests.exceptions
+
+    if isinstance(exc, rex.ConnectTimeout):
+        return "connect_timeout", f"тайм-аут соединения ({cls})"
+
+    if isinstance(exc, rex.ReadTimeout):
+        return "read_timeout", f"тайм-аут чтения ({cls})"
+
+    if isinstance(exc, rex.Timeout):
+        return "timeout", f"тайм-аут ({cls})"
+
+    if isinstance(exc, rex.SSLError):
+        return "ssl", f"ошибка SSL ({cls})"
+
+    if isinstance(exc, rex.ConnectionError):
+        if "network is unreachable" in low or "errno 101" in low:
+            return (
+                "network_unreachable",
+                f"сеть недоступна: Network is unreachable ({cls})",
+            )
+
+        if any(
+            s in low
+            for s in (
+                "name or service not known",
+                "temporary failure in name resolution",
+                "nodename nor servname",
+                "getaddrinfo failed",
+                "failed to resolve",
+            )
+        ):
+            return "dns", f"ошибка DNS ({cls})"
+
+        if "connection refused" in low:
+            return "connection_refused", f"соединение отклонено ({cls})"
+
+        if any(
+            s in low
+            for s in (
+                "connection reset",
+                "reset by peer",
+                "connection aborted",
+                "remotedisconnected",
+                "remote end closed",
+            )
+        ):
+            return "connection_reset", f"соединение сброшено ({cls})"
+
+        return "connection_error", f"ошибка соединения ({cls})"
+
+    return "other", f"ошибка {cls}"
+
+
+def _label_from_source_state(status):
+    """Метка причины для отказа без исключения (по log_source_state)."""
+    status = str(status or "")
+
+    if status.startswith("unavailable:http_200_without"):
+        return "HTTP 200 без структуры канала"
+
+    if status.startswith("unavailable:http_"):
+        return "HTTP " + status.rsplit("_", 1)[-1]
+
+    if status == "unavailable:posts_without_readable_time":
+        return "не читается время публикаций"
+
+    return status or "причина не определена"
+
+
+def _watchdog_context_text():
+    """Состояние остальных компонентов в момент ошибки (для лога:
+    различить отказ одного источника и общий сбой исходящих
+    соединений)."""
+    with state_lock:
+        return (
+            f"pszsu_ok={state['pszsu_ok']} "
+            f"monitor_ok={state['monitor_ok']} "
+            f"telegram_api_ok={state['telegram_api_ok']}"
+        )
+
+
+def source_diag_record_error(source_name, exc, elapsed):
+    """Вызывается из check_source при исключении. Не бросает."""
+    try:
+        kind, label = classify_source_error(exc)
+
+        entry = {
+            "kind": kind,
+            "label": label,
+            "class": type(exc).__name__,
+            "message": sanitize_secrets(str(exc))[:200],
+            "elapsed": elapsed,
+            "at": now_utc(),
+        }
+
+        with source_diag_lock:
+            source_diag[source_key(source_name)]["pending_error"] = entry
+
+    except Exception as e:
+        print(
+            f"Ошибка записи диагностики источника: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+
+def source_diag_record_result(source_name, ok, state_status=None):
+    """Результат очередной проверки источника (из source_record_result)."""
+    try:
+        key = source_key(source_name)
+        now = now_utc()
+        log_line = None
+
+        with source_diag_lock:
+            d = source_diag[key]
+
+            if ok:
+                had = d["consecutive_failures"]
+                d["consecutive_failures"] = 0
+                d["consecutive_successes"] += 1
+                d["first_fail_at"] = None
+                d["last_ok_at"] = now
+                d["pending_error"] = None
+
+                if had:
+                    log_line = (
+                        f"SOURCE OK source={key} "
+                        f"consecutive_ok={d['consecutive_successes']} "
+                        f"after_failures={had}"
+                    )
+            else:
+                entry = d["pending_error"]
+                d["pending_error"] = None
+
+                if entry is None:
+                    entry = {
+                        "kind": "state",
+                        "label": _label_from_source_state(state_status),
+                        "class": "",
+                        "message": str(state_status or ""),
+                        "elapsed": None,
+                        "at": now,
+                    }
+
+                d["consecutive_failures"] += 1
+                d["consecutive_successes"] = 0
+
+                if d["first_fail_at"] is None:
+                    d["first_fail_at"] = now
+
+                d["last_error"] = entry
+
+                if d["incident"] is not None:
+                    d["incident"]["failed_checks"] = (
+                        d["incident"].get("failed_checks", 0) + 1
+                    )
+
+                elapsed = entry["elapsed"]
+
+                log_line = (
+                    f"SOURCE ERROR source={key} kind={entry['kind']} "
+                    f"class={entry['class'] or '-'} "
+                    f"elapsed={'-' if elapsed is None else f'{elapsed:.1f}s'} "
+                    f"consecutive={d['consecutive_failures']} "
+                    f"backoff={d['backoff_active']} "
+                    f"msg={entry['message']!r}"
+                )
+
+        if log_line:
+            print(
+                log_line
+                + ("" if ok else " | " + _watchdog_context_text()),
+                flush=True,
+            )
+
+    except Exception as e:
+        print(
+            f"Ошибка записи диагностики источника: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+
+def source_diag_backoff(source_name, active, delay=None):
+    try:
+        key = source_key(source_name)
+
+        with source_diag_lock:
+            d = source_diag[key]
+            d["backoff_active"] = bool(active)
+
+            if active:
+                d["backoff_events"] += 1
+                d["backoff_since"] = now_utc()
+            else:
+                d["backoff_since"] = None
+
+    except Exception:
+        pass
+
+
+def _source_diag_snapshot(failure_type):
+    with source_diag_lock:
+        d = source_diag[failure_type]
+        snap = dict(d)
+        snap["incident"] = (
+            dict(d["incident"]) if d["incident"] else None
+        )
+
+    return snap
+
+
+def source_incident_open(failure_type):
+    """Фиксирует открытие инцидента источника. Возвращает фактическое
+    время начала (первая неудачная проверка серии)."""
+    with source_diag_lock:
+        d = source_diag[failure_type]
+
+        if d["incident"] is None:
+            d["incident"] = {
+                "started_at": d["first_fail_at"] or now_utc(),
+                "first_error": d["last_error"],
+                "failed_checks": d["consecutive_failures"],
+                "notify_errors": 0,
+                "notified_at": None,
+            }
+
+        started = d["incident"]["started_at"]
+        first = d["incident"]["first_error"]
+
+    print(
+        f"INCIDENT START source={failure_type} "
+        f"started={format_time(started)} "
+        f"first_error="
+        f"{first['kind'] if first else 'unknown'} | "
+        + _watchdog_context_text(),
+        flush=True,
     )
 
-    key_notified = (
-        f"{failure_type}_failure_notified"
+    return started
+
+
+def source_incident_note_notify_error(failure_type):
+    try:
+        with source_diag_lock:
+            inc = source_diag[failure_type]["incident"]
+
+            if inc is not None:
+                inc["notify_errors"] += 1
+
+    except Exception:
+        pass
+
+
+def source_incident_note_notified(failure_type):
+    try:
+        with source_diag_lock:
+            inc = source_diag[failure_type]["incident"]
+
+            if inc is not None:
+                inc["notified_at"] = now_utc()
+
+    except Exception:
+        pass
+
+
+def source_incident_close(failure_type, close_reason, duration):
+    """Закрывает инцидент источника: запись в историю и в лог."""
+    with source_diag_lock:
+        d = source_diag[failure_type]
+        inc = d["incident"]
+        d["incident"] = None
+
+        if inc is None:
+            inc = {
+                "started_at": None,
+                "first_error": None,
+                "failed_checks": 0,
+                "notify_errors": 0,
+                "notified_at": None,
+            }
+
+        record = dict(inc)
+        record["closed_at"] = now_utc()
+        record["duration"] = duration
+        record["close_reason"] = close_reason
+        d["history"].append(record)
+        del d["history"][:-SOURCE_DIAG_HISTORY_LIMIT]
+
+    first = record["first_error"]
+
+    print(
+        f"INCIDENT CLOSED source={failure_type} "
+        f"started={format_time(record['started_at'])} "
+        f"duration={format_duration(duration)} "
+        f"reason={close_reason} "
+        f"failed_checks={record['failed_checks']} "
+        f"first_error={first['kind'] if first else 'unknown'} "
+        f"notify_errors={record['notify_errors']}",
+        flush=True,
     )
+
+
+# --------------------------------------------------------------
+# Свежее состояние компонентов
+# --------------------------------------------------------------
+
+def _watchdog_component_state(failure_type):
+    """
+    'fail'  - компонент неисправен;
+    'ok'    - исправен, данные свежие;
+    'stale' - флаг «исправен», но последняя проверка источника
+              слишком давняя: состояние НЕ подтверждено.
+    """
+    if failure_type == "parser":
+        with state_lock:
+            running = state["parser_running"]
+
+        age = get_parser_heartbeat_age()
+
+        alive = bool(
+            running
+            and age is not None
+            and age <= PARSER_STALE_AFTER_SECONDS
+        )
+
+        return "ok" if alive else "fail"
+
+    if failure_type == "telegram":
+        with state_lock:
+            return "ok" if state["telegram_api_ok"] else "fail"
 
     with state_lock:
-        since = state[key_since]
-        already_notified = state[key_notified]
-        last_check = state["last_check"]
+        ok = bool(state[f"{failure_type}_ok"])
+        last_check = state[f"last_{failure_type}_check"]
 
-    if since is None or already_notified:
+    if not ok:
+        return "fail"
+
+    if last_check is None:
+        return "stale"
+
+    age = (now_utc() - last_check).total_seconds()
+
+    if age > WATCHDOG_STATE_STALE_AFTER_SECONDS:
+        return "stale"
+
+    return "ok"
+
+
+def _watchdog_component_ok(failure_type):
+    return _watchdog_component_state(failure_type) == "ok"
+
+
+def _watchdog_note_stale(failure_type, is_stale):
+    """Одна строка в лог на эпизод устаревших данных."""
+    if not is_stale:
+        watchdog_stale_logged.discard(failure_type)
         return
 
-    duration = (
-        now_utc() - since
-    ).total_seconds()
-
-    if duration < FAILURE_NOTIFICATION_AFTER_SECONDS:
+    if failure_type in watchdog_stale_logged:
         return
 
-    failure_title = MESSAGES["watchdog_failure_titles"].get(
-        failure_type,
-        MESSAGES["watchdog_failure_titles"]["default"],
+    watchdog_stale_logged.add(failure_type)
+
+    with state_lock:
+        last_check = state.get(f"last_{failure_type}_check")
+
+    age = (
+        "неизвестно"
+        if last_check is None
+        else f"{int((now_utc() - last_check).total_seconds())} с назад"
     )
 
-    detail_template = MESSAGES["watchdog_failure_details"].get(
-        failure_type
+    print(
+        f"СОСТОЯНИЕ УСТАРЕЛО: {failure_type}; последняя проверка: "
+        f"{age} (порог {WATCHDOG_STATE_STALE_AFTER_SECONDS} с); "
+        "восстановление не подтверждено, статус «работает» не выдаётся",
+        flush=True,
     )
 
-    if detail_template:
-        details = detail_template.format(
-            reason=reason,
-            last_check=format_time(last_check),
+
+def _watchdog_incident_snapshot(failure_type):
+    with state_lock:
+        return (
+            state[f"{failure_type}_failure_since"],
+            state[f"{failure_type}_failure_notified"],
         )
-    else:
-        details = reason
 
-    if failure_type in SOURCE_FAILURE_TYPES:
-        body_template = MESSAGES["watchdog_source_issue_body"]
-    else:
-        body_template = MESSAGES["watchdog_failure_body"]
 
-    text = body_template.format(
-        failure_title=failure_title,
+# --------------------------------------------------------------
+# Тексты сообщений
+# --------------------------------------------------------------
+
+def _source_reason_text(failure_type):
+    snap = _source_diag_snapshot(failure_type)
+    err = snap["last_error"]
+
+    if not err:
+        return "причина не определена"
+
+    text = err["label"]
+
+    if err.get("elapsed") is not None and err["kind"] != "state":
+        text += f", ожидание {err['elapsed']:.0f} с"
+
+    return text
+
+
+def _source_failure_line(failure_type, now):
+    since, _ = _watchdog_incident_snapshot(failure_type)
+    snap = _source_diag_snapshot(failure_type)
+
+    duration = (now - since).total_seconds() if since else 0
+
+    return (
+        f"• {_source_title(failure_type)}: недоступен с "
+        f"{format_time(since)} ({format_duration(duration)})\n"
+        f"  Причина: {_source_reason_text(failure_type)}\n"
+        f"  Неудачных проверок подряд: "
+        f"{snap['consecutive_failures']}; последняя успешная: "
+        f"{format_time(snap['last_ok_at'])}"
+    )
+
+
+def _watchdog_failure_text(failure_types, last_check):
+    """Текст уведомления о сбое: один компонент или группа источников."""
+    now = now_utc()
+
+    if len(failure_types) == 1 and (
+        failure_types[0] not in SOURCE_FAILURE_TYPES
+    ):
+        failure_type = failure_types[0]
+        reason = MESSAGES["watchdog_failure_reasons"].get(
+            failure_type, ""
+        )
+        failure_title = MESSAGES["watchdog_failure_titles"].get(
+            failure_type,
+            MESSAGES["watchdog_failure_titles"]["default"],
+        )
+        detail_template = MESSAGES["watchdog_failure_details"].get(
+            failure_type
+        )
+
+        if detail_template:
+            details = detail_template.format(
+                reason=reason,
+                last_check=format_time(last_check),
+            )
+        else:
+            details = reason
+
+        return MESSAGES["watchdog_failure_body"].format(
+            failure_title=failure_title,
+            details=details,
+            threshold_seconds=FAILURE_NOTIFICATION_AFTER_SECONDS,
+        )
+
+    lines = "\n".join(
+        _source_failure_line(t, now) for t in failure_types
+    )
+    details = "Состояние: ОТКАЗ\n" + lines
+
+    if len(failure_types) == 1:
+        failure_type = failure_types[0]
+
+        return MESSAGES["watchdog_source_issue_body"].format(
+            failure_title=MESSAGES["watchdog_failure_titles"][
+                failure_type
+            ],
+            details=details,
+            threshold_seconds=FAILURE_NOTIFICATION_AFTER_SECONDS,
+        )
+
+    names = ", ".join(_source_title(t) for t in failure_types)
+
+    return MESSAGES["watchdog_source_issue_multi_body"].format(
+        sources=names,
         details=details,
         threshold_seconds=FAILURE_NOTIFICATION_AFTER_SECONDS,
     )
 
-    message_id = send_telegram_message(
-        text,
+
+def _sources_state_line(recovered_types):
+    """Итоговое состояние: полное или частичное восстановление."""
+    pending = []
+
+    for t in SOURCE_FAILURE_TYPES:
+        if t in recovered_types:
+            continue
+
+        comp = _watchdog_component_state(t)
+
+        if comp == "fail":
+            since, _ = _watchdog_incident_snapshot(t)
+            pending.append(
+                f"{_source_title(t)} всё ещё недоступен"
+                + (f" с {format_time(since)}" if since else "")
+                + f" ({_source_reason_text(t)})"
+            )
+        elif comp == "stale":
+            pending.append(
+                f"состояние {_source_title(t)} не подтверждено "
+                "(данные устарели)"
+            )
+
+    if pending:
+        return "Состояние: ЧАСТИЧНОЕ ВОССТАНОВЛЕНИЕ. " + "; ".join(
+            pending
+        ) + "."
+
+    if len(recovered_types) > 1:
+        return "Состояние: ПОЛНОЕ ВОССТАНОВЛЕНИЕ. Оба источника доступны."
+
+    return "Состояние: ВОССТАНОВЛЕНО. Оба источника доступны."
+
+
+def _watchdog_recovery_text(items):
+    """items: [(тип, длительность_сек)]"""
+    if len(items) == 1 and items[0][0] not in SOURCE_FAILURE_TYPES:
+        failure_type, duration = items[0]
+
+        return MESSAGES["watchdog_recovery_body"].format(
+            recovery_reason=MESSAGES["watchdog_recovery_reasons"][
+                failure_type
+            ],
+            duration=format_duration(duration),
+        )
+
+    recovered_types = [t for t, _ in items]
+    state_line = _sources_state_line(recovered_types)
+
+    if len(items) == 1:
+        failure_type, duration = items[0]
+        since, _ = _watchdog_incident_snapshot(failure_type)
+
+        return MESSAGES["watchdog_source_recovery_body"].format(
+            recovery_reason=(
+                MESSAGES["watchdog_recovery_reasons"][failure_type].rstrip(".")
+                + (
+                    f" (сбой с {format_time(since)})"
+                    if since
+                    else ""
+                )
+                + ".\n"
+                + state_line
+            ),
+            duration=format_duration(duration),
+        )
+
+    lines = "\n".join(
+        MESSAGES["watchdog_recovery_reasons"][t]
+        + f" Длительность сбоя: {format_duration(d)}"
+        for t, d in items
     )
 
-    if message_id:
+    return MESSAGES["watchdog_source_recovery_multi_body"].format(
+        details=lines + "\n" + state_line,
+    )
+
+
+# --------------------------------------------------------------
+# Уведомления
+# --------------------------------------------------------------
+
+def watchdog_send_once(text):
+    """
+    Одна ограниченная попытка отправки в рабочий чат. Без повторов и
+    без telegram_request(), состояние telegram_api_ok не трогает
+    (его ведут штатные проверки). Возвращает message_id или None.
+    Токен в лог не попадает. Ошибка отправки - отдельная строка
+    WATCHDOG TELEGRAM FAILED, не путается с ошибками источников.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    try:
+        response = session.post(
+            url,
+            data={"chat_id": CHAT_ID, "text": text},
+            timeout=WATCHDOG_SEND_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            print(
+                "WATCHDOG TELEGRAM FAILED: "
+                f"HTTP {response.status_code}",
+                flush=True,
+            )
+            return None
+
+        result = response.json()
+
+        if not result.get("ok"):
+            print(
+                "WATCHDOG TELEGRAM FAILED: Bot API вернул ошибку "
+                f"(error_code={result.get('error_code')})",
+                flush=True,
+            )
+            return None
+
+        message_id = result.get("result", {}).get("message_id")
+
+        if not message_id:
+            print(
+                "WATCHDOG TELEGRAM FAILED: нет message_id в ответе",
+                flush=True,
+            )
+            return None
+
+        return message_id
+
+    except Exception as e:
+        kind, _label = classify_source_error(e)
+
+        print(
+            "WATCHDOG TELEGRAM FAILED: "
+            f"kind={kind} {type(e).__name__}: {e}",
+            flush=True,
+        )
+        return None
+
+
+def _watchdog_close_silently(failure_type):
+    """Инцидент закончился, а уведомление о сбое не доставлено."""
+    info = clear_failure_state(failure_type)
+
+    if info is None:
+        return
+
+    attempts = watchdog_send_attempts.pop(failure_type, 0)
+
+    if attempts:
+        why = (
+            f"уведомление о сбое пытались отправить {attempts} раз, "
+            "доставить не удалось"
+        )
+        close_reason = "recovered_notify_failed"
+    else:
+        why = (
+            "порог уведомления "
+            f"({FAILURE_NOTIFICATION_AFTER_SECONDS} с) не достигнут"
+        )
+        close_reason = "recovered_below_threshold"
+
+    print(
+        "ИНЦИДЕНТ ЗАКРЫТ БЕЗ УВЕДОМЛЕНИЯ: "
+        f"{failure_type}; длительность "
+        f"{format_duration(info['duration'])}; {why}",
+        flush=True,
+    )
+
+    if failure_type in SOURCE_FAILURE_TYPES:
+        source_incident_close(
+            failure_type, close_reason, info["duration"]
+        )
+
+
+def watchdog_notify_failures(failure_types):
+    """
+    Отправляет уведомления о сбоях для тех компонентов из
+    failure_types, у которых инцидент идёт не меньше порога и о нём
+    ещё не сообщено. Источники (pszsu / monitor) объединяются в одно
+    сообщение, parser и telegram - отдельные сообщения.
+    Возвращает False, если отправка не удалась (остальные отправки
+    в этом проходе нужно отложить).
+    """
+    now = now_utc()
+    due = []
+
+    for failure_type in failure_types:
+        since, notified = _watchdog_incident_snapshot(failure_type)
+
+        if since is None or notified:
+            continue
+
+        if (
+            now - since
+        ).total_seconds() < FAILURE_NOTIFICATION_AFTER_SECONDS:
+            continue
+
+        comp = _watchdog_component_state(failure_type)
+
+        if comp != "fail":
+            # Уже восстановился (или состояние не подтверждено):
+            # запоздалое сообщение о сбое не отправляется, инцидент
+            # закроет watchdog_notify_recoveries (молча, в лог).
+            _watchdog_note_stale(failure_type, comp == "stale")
+            continue
+
+        due.append(failure_type)
+
+    if not due:
+        return True
+
+    with state_lock:
+        last_check = state["last_check"]
+
+    sources = [t for t in due if t in SOURCE_FAILURE_TYPES]
+    others = [t for t in due if t not in SOURCE_FAILURE_TYPES]
+
+    groups = []
+
+    if sources:
+        groups.append(sources)
+
+    groups.extend([t] for t in others)
+
+    for group in groups:
+        text = sanitize_secrets(_watchdog_failure_text(group, last_check))
+
+        message_id = watchdog_send_once(text)
+
+        if not message_id:
+            for failure_type in group:
+                watchdog_send_attempts[failure_type] = (
+                    watchdog_send_attempts.get(failure_type, 0) + 1
+                )
+
+                if failure_type in SOURCE_FAILURE_TYPES:
+                    source_incident_note_notify_error(failure_type)
+
+            print(
+                "УВЕДОМЛЕНИЕ О СБОЕ НЕ ОТПРАВЛЕНО (повтор в следующем "
+                f"проходе): {', '.join(group)}",
+                flush=True,
+            )
+
+            return False
+
         with state_lock:
-            state[key_notified] = True
+            for failure_type in group:
+                state[f"{failure_type}_failure_notified"] = True
+
+        for failure_type in group:
+            watchdog_send_attempts.pop(failure_type, None)
+
+            if failure_type in SOURCE_FAILURE_TYPES:
+                source_incident_note_notified(failure_type)
 
         print(
             "ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О СБОЕ: "
-            f"{failure_type}",
+            f"{', '.join(group)}",
             flush=True,
         )
 
+    return True
 
-def watchdog_check_recovery(
-    failure_type,
-    recovery_reason,
-):
-    key_since = (
-        f"{failure_type}_failure_since"
-    )
 
-    key_notified = (
-        f"{failure_type}_failure_notified"
-    )
+def watchdog_notify_recoveries(failure_types):
+    """
+    Для компонентов из failure_types, которые снова исправны (данные
+    свежие): закрывает инцидент. Если о сбое было сообщено -
+    отправляет уведомление о восстановлении (источники - одним
+    сообщением), инцидент закрывается только после успешной
+    отправки. Если не сообщено - закрывается молча (с записью в
+    лог). Компонент с устаревшим состоянием не считается
+    восстановившимся. Возвращает False, если отправка не удалась.
+    """
+    now = now_utc()
+    recovered = []
 
-    with state_lock:
-        since = state[key_since]
-        notified = state[key_notified]
+    for failure_type in failure_types:
+        comp = _watchdog_component_state(failure_type)
 
-    if since is None or not notified:
-        if since is not None:
-            clear_failure_state(
-                failure_type
+        _watchdog_note_stale(failure_type, comp == "stale")
+
+        if comp != "ok":
+            continue
+
+        since, notified = _watchdog_incident_snapshot(failure_type)
+
+        if since is None:
+            continue
+
+        if not notified:
+            _watchdog_close_silently(failure_type)
+            continue
+
+        recovered.append(
+            (failure_type, (now - since).total_seconds())
+        )
+
+    if not recovered:
+        return True
+
+    sources = [
+        item for item in recovered if item[0] in SOURCE_FAILURE_TYPES
+    ]
+    others = [
+        item for item in recovered
+        if item[0] not in SOURCE_FAILURE_TYPES
+    ]
+
+    groups = []
+
+    if sources:
+        groups.append(sources)
+
+    groups.extend([item] for item in others)
+
+    for group in groups:
+        text = sanitize_secrets(_watchdog_recovery_text(group))
+
+        message_id = watchdog_send_once(text)
+
+        if not message_id:
+            for failure_type, _ in group:
+                if failure_type in SOURCE_FAILURE_TYPES:
+                    source_incident_note_notify_error(failure_type)
+
+            print(
+                "УВЕДОМЛЕНИЕ О ВОССТАНОВЛЕНИИ НЕ ОТПРАВЛЕНО (повтор в "
+                "следующем проходе): "
+                f"{', '.join(t for t, _ in group)}",
+                flush=True,
             )
 
-        return
+            return False
 
-    duration = (
-        now_utc() - since
-    ).total_seconds()
+        for failure_type, duration in group:
+            clear_failure_state(failure_type)
+            watchdog_send_attempts.pop(failure_type, None)
 
-    if failure_type in SOURCE_FAILURE_TYPES:
-        body_template = MESSAGES["watchdog_source_recovery_body"]
-    else:
-        body_template = MESSAGES["watchdog_recovery_body"]
-
-    text = body_template.format(
-        recovery_reason=recovery_reason,
-        duration=format_duration(duration),
-    )
-
-    message_id = send_telegram_message(
-        text,
-    )
-
-    if message_id:
-        clear_failure_state(
-            failure_type
-        )
+            if failure_type in SOURCE_FAILURE_TYPES:
+                source_incident_close(
+                    failure_type, "recovered_notified", duration
+                )
 
         print(
-            "ОТПРАВЛЕНО УВЕДОМЛЕНИЕ "
-            "О ВОССТАНОВЛЕНИИ: "
-            f"{failure_type}",
+            "ОТПРАВЛЕНО УВЕДОМЛЕНИЕ О ВОССТАНОВЛЕНИИ: "
+            f"{', '.join(t for t, _ in group)}",
             flush=True,
         )
+
+    return True
+
+
+def watchdog_send_failure(failure_type, reason=None):
+    """Совместимость: проход уведомления о сбое для одного типа."""
+    watchdog_notify_failures([failure_type])
+
+
+def watchdog_check_recovery(failure_type, recovery_reason=None):
+    """Совместимость: проход восстановления для одного типа."""
+    watchdog_notify_recoveries([failure_type])
+
+
+WATCHDOG_COMPONENTS = ("parser", "pszsu", "monitor", "telegram")
+
+
+def watchdog_pass():
+    """Один проход контроля: свежие флаги, фиксация инцидентов,
+    уведомления о сбоях и восстановлениях."""
+    started_now = []
+
+    # 1. Фиксация начала инцидентов по свежим флагам.
+    for failure_type in WATCHDOG_COMPONENTS:
+        comp = _watchdog_component_state(failure_type)
+
+        _watchdog_note_stale(failure_type, comp == "stale")
+
+        if comp != "fail":
+            continue
+
+        if failure_type in SOURCE_FAILURE_TYPES:
+            reason = _source_reason_text(failure_type)
+        else:
+            reason = MESSAGES["watchdog_failure_reasons"][failure_type]
+
+        if set_failure_state(failure_type, reason):
+            started_now.append(failure_type)
+
+            if failure_type in SOURCE_FAILURE_TYPES:
+                # Отсчёт порога - от фактической первой неудачной
+                # проверки серии, а не от момента, когда её заметил
+                # watchdog (шаг прохода 10 с).
+                started_at = source_incident_open(failure_type)
+
+                with state_lock:
+                    current = state[f"{failure_type}_failure_since"]
+
+                    if (
+                        current is not None
+                        and started_at is not None
+                        and started_at < current
+                    ):
+                        state[f"{failure_type}_failure_since"] = started_at
+
+    if len(started_now) >= 2:
+        print(
+            "ОБЩИЙ СБОЙ ИСХОДЯЩИХ СОЕДИНЕНИЙ (подозрение, причина не "
+            "установлена): одновременно начались инциденты: "
+            + ", ".join(started_now)
+            + " | "
+            + _watchdog_context_text(),
+            flush=True,
+        )
+
+    # 2. Уведомления о сбоях (после первой неудачи отправки в этом
+    #    проходе остальное откладывается).
+    if not watchdog_notify_failures(WATCHDOG_COMPONENTS):
+        return
+
+    # 3. Восстановления - по флагам, прочитанным заново.
+    watchdog_notify_recoveries(WATCHDOG_COMPONENTS)
 
 
 def watchdog_loop():
@@ -2002,22 +2894,6 @@ def watchdog_loop():
             now = now_utc()
 
             with state_lock:
-                parser_running = (
-                    state["parser_running"]
-                )
-
-                telegram_api_ok = (
-                    state["telegram_api_ok"]
-                )
-
-                pszsu_ok = (
-                    state["pszsu_ok"]
-                )
-
-                monitor_ok = (
-                    state["monitor_ok"]
-                )
-
                 started_at = (
                     state["started_at"]
                 )
@@ -2034,100 +2910,7 @@ def watchdog_loop():
                 )
                 continue
 
-            # ------------------------------------------------
-            # ПАРСЕР
-            # ------------------------------------------------
-
-            heartbeat_age = (
-                get_parser_heartbeat_age()
-            )
-
-            parser_alive = (
-                parser_running
-                and heartbeat_age is not None
-                and heartbeat_age
-                <= PARSER_STALE_AFTER_SECONDS
-            )
-
-            if parser_alive:
-                watchdog_check_recovery(
-                    "parser",
-                    MESSAGES["watchdog_recovery_reasons"]["parser"],
-                )
-
-            else:
-                set_failure_state(
-                    "parser",
-                    MESSAGES["watchdog_failure_reasons"]["parser"],
-                )
-
-                watchdog_send_failure(
-                    "parser",
-                    MESSAGES["watchdog_failure_reasons"]["parser"],
-                )
-
-            # ------------------------------------------------
-            # PSZSU
-            # ------------------------------------------------
-
-            if pszsu_ok:
-                watchdog_check_recovery(
-                    "pszsu",
-                    MESSAGES["watchdog_recovery_reasons"]["pszsu"],
-                )
-
-            else:
-                set_failure_state(
-                    "pszsu",
-                    MESSAGES["watchdog_failure_reasons"]["pszsu"],
-                )
-
-                watchdog_send_failure(
-                    "pszsu",
-                    MESSAGES["watchdog_failure_reasons"]["pszsu"],
-                )
-
-            # ------------------------------------------------
-            # MONITOR
-            # ------------------------------------------------
-
-            if monitor_ok:
-                watchdog_check_recovery(
-                    "monitor",
-                    MESSAGES["watchdog_recovery_reasons"]["monitor"],
-                )
-
-            else:
-                set_failure_state(
-                    "monitor",
-                    MESSAGES["watchdog_failure_reasons"]["monitor"],
-                )
-
-                watchdog_send_failure(
-                    "monitor",
-                    MESSAGES["watchdog_failure_reasons"]["monitor"],
-                )
-
-            # ------------------------------------------------
-            # TELEGRAM API
-            # ------------------------------------------------
-
-            if telegram_api_ok:
-                watchdog_check_recovery(
-                    "telegram",
-                    MESSAGES["watchdog_recovery_reasons"]["telegram"],
-                )
-
-            else:
-                set_failure_state(
-                    "telegram",
-                    MESSAGES["watchdog_failure_reasons"]["telegram"],
-                )
-
-                watchdog_send_failure(
-                    "telegram",
-                    MESSAGES["watchdog_failure_reasons"]["telegram"],
-                )
+            watchdog_pass()
 
         except Exception as e:
             print(
@@ -4412,8 +5195,16 @@ def source_backoff_active(source_name):
 
 
 def source_record_result(source_name, ok):
+    source_diag_record_result(
+        source_name,
+        ok,
+        _source_state_log.get(source_name),
+    )
+
     if ok:
         if source_failure_count.get(source_name):
+            source_diag_backoff(source_name, False)
+
             print(
                 f"source={source_name} backoff=reset (источник снова доступен)",
                 flush=True,
@@ -4434,6 +5225,7 @@ def source_record_result(source_name, ok):
         delay = SOURCE_BACKOFF_STEPS_SECONDS[step]
 
         source_retry_at[source_name] = time.monotonic() + delay
+        source_diag_backoff(source_name, True, delay)
 
         print(
             f"source={source_name} backoff={delay}s "
@@ -4448,6 +5240,8 @@ def check_source(
     source_link,
     is_monitor=False,
 ):
+    _request_started = time.monotonic()
+
     try:
         parser_progress_beat()
 
@@ -4666,6 +5460,12 @@ def check_source(
             f"Ошибка проверки {source_name}: "
             f"{type(e).__name__}: {e}",
             flush=True,
+        )
+
+        source_diag_record_error(
+            source_name,
+            e,
+            time.monotonic() - _request_started,
         )
 
         log_source_state(
