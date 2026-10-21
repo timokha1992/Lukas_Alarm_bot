@@ -5373,13 +5373,15 @@ def check_source(
                 )
 
                 if decision == "ALERT":
-                    send_alert(
+                    _alert_args = dict(
                         source_name=source_name,
                         source_link=source_link,
                         post_id=post_id,
                         original_text=text,
                         classification="HIGH_SPEED_THREAT",
                     )
+                    if send_alert(**_alert_args):
+                        map_beta_submit(**_alert_args)
                     continue
 
                 if decision == "ARCHIVE":
@@ -5412,7 +5414,7 @@ def check_source(
                 continue
 
             if classification == "ALERT":
-                send_alert(
+                _alert_args = dict(
                     source_name=source_name,
                     source_link=source_link,
                     post_id=post_id,
@@ -5423,6 +5425,8 @@ def check_source(
                         else "HIGH_SPEED_THREAT"
                     ),
                 )
+                if send_alert(**_alert_args):
+                    map_beta_submit(**_alert_args)
                 continue
 
             # ARCHIVE_HIGH / ARCHIVE_NORMAL — внутренние значения
@@ -5474,6 +5478,987 @@ def check_source(
         )
 
         return False
+
+
+# ============================================================
+# BEGIN MAP SCREENSHOT BETA
+# ============================================================
+
+import collections
+#
+# Бета-тест (20.10.2026): после УСПЕШНОЙ отправки тревоги в рабочую
+# группу бот публикует в картотеке копию тревоги с картинкой-заглушкой
+# и, получив скриншот карты от Cloudflare Worker, заменяет заглушку в
+# ТОМ ЖЕ сообщении (editMessageMedia). Под фото: время получения снимка по Киеву
+# и ссылка на карту.
+#
+# ИЗОЛЯЦИЯ:
+#  - единственная точка входа для основного кода - map_beta_submit();
+#    она вызывается в двух местах check_source() (PSZSU и MONITOR) только
+#    после того, как send_alert() вернул True. Вся её работа в парсер-
+#    потоке: проверка флага, постановка в очередь (put_nowait, без
+#    ожидания), ленивый запуск двух фоновых потоков; любое исключение
+#    гасится внутри;
+#  - свои очередь и два потока (отправка заглушки / получение снимка и
+#    замена), свои HTTP-вызовы (не telegram_request, не
+#    send_telegram_message, без heartbeat и без telegram_api_ok);
+#  - дедупликация: отдельное пространство ключей mapbeta:<источник>:<post_id>
+#    в существующем реестре sent_messages (формат STATE_FILE не меняется);
+#  - выключено по умолчанию: MAP_BETA_ENABLED=1 включает.
+#
+# ИЗВЕСТНЫЕ ОГРАНИЧЕНИЯ (первая версия):
+#  - очередь в памяти: при перезапуске Render уже отправленная заглушка
+#    остаётся без замены, события в очереди теряются; повторной
+#    публикации нет (ключ дедупликации сохранён в STATE_FILE);
+#  - в подписи «Снимок получен в ЧЧ:ММ:СС» (Киев): время из заголовка X-Shot-At
+#    Worker'а (он фиксируется ПОСЛЕ возврата снимка из Browser Run), а если
+#    заголовка нет или он недостоверен - время получения снимка ботом. Это не
+#    время съёмки;
+#  - Cloudflare Free: ~10 минут браузера в сутки, снимок может не
+#    успеть/не получиться - тогда остаётся заглушка.
+#
+# УДАЛЕНИЕ: убрать этот блок, две вставки "map_beta_submit" в
+# check_source() (и переменные _alert_args там же), файл
+# assets/map_placeholder.jpg.
+
+MAP_BETA_ENABLED = os.getenv("MAP_BETA_ENABLED", "").strip() == "1"
+
+# Контрольный запуск ТОЛЬКО в картотеке без ожидания реальной тревоги:
+# при MAP_BETA_SELFTEST=<метка> один раз через ~30 с после старта публикуется
+# тестовое сообщение (помечено как тест, не тревога) и проходит весь настоящий
+# путь: заглушка -> Worker -> замена. MAP_BETA_ENABLED для этого НЕ нужен: при
+# выключенном MAP_BETA_ENABLED реальные тревоги бету по-прежнему не запускают.
+# Метка запоминается в реестре (повторный запуск на той же метке не выполняется);
+# метка, начинающаяся с «long», проверяет вариант длинного текста. После проверки
+# переменную уберите.
+MAP_BETA_SELFTEST = os.getenv("MAP_BETA_SELFTEST", "").strip()
+MAP_BETA_SELFTEST_DELAY = 30
+
+# Необязательный секрет Worker (если на Worker задан SHOT_TOKEN).
+# Передаётся заголовком X-Shot-Token, в логи не попадает.
+MAP_BETA_SHOT_TOKEN = os.getenv("MAP_BETA_SHOT_TOKEN", "").strip()
+
+MAP_BETA_WORKER_URL = "https://map-shot-test.timokha1992.workers.dev/screenshot"
+MAP_BETA_MAP_URL = "https://map.ukrainealarm.com/onlyMap"
+MAP_BETA_PLACEHOLDER_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "assets",
+    "map_placeholder.jpg",
+)
+
+MAP_BETA_WAIT_SECONDS = 180            # ожидание снимка после публикации заглушки
+MAP_BETA_EDIT_GRACE_SECONDS = 30       # запас на замену уже полученного снимка
+MAP_BETA_CAPTION_LIMIT = 1024          # лимит подписи к фото в Telegram
+MAP_BETA_QUEUE_LIMIT = 10              # ожидающие снимка; переполнение: вытесняется САМАЯ РАННЯЯ задача
+MAP_BETA_EVENT_QUEUE_LIMIT = 50        # события, ждущие публикации заглушки (заглушка уходит за доли секунды)
+MAP_BETA_WORKER_MIN_INTERVAL = 16      # пауза между запросами к Worker (его защита 15 с)
+MAP_BETA_WORKER_READ_TIMEOUT = 75
+MAP_BETA_TG_TIMEOUT = (5, 30)
+MAP_BETA_MAX_SHOT_ATTEMPTS = 3
+MAP_BETA_MAX_EDIT_ATTEMPTS = 3
+MAP_BETA_EXPECTED_SIZE = 800
+MAP_BETA_DAILY_BROWSER_MS = 540000     # 9 из 10 бесплатных минут браузера в сутки
+MAP_BETA_ASSUMED_BROWSER_MS = 20000    # если Worker не сообщил время браузера
+
+class _MbQueue:
+    """
+    Ограниченная очередь с приоритетом новых задач: при переполнении
+    вытесняется САМАЯ РАННЯЯ ещё не взятая в работу задача (взятая в
+    работу в очереди уже не числится и не прерывается).
+    """
+
+    def __init__(self, limit):
+        self._limit = limit
+        self._items = collections.deque()
+        self._cond = threading.Condition()
+
+    def put_latest(self, item):
+        """Кладёт задачу; возвращает вытесненную (или None)."""
+        evicted = None
+
+        with self._cond:
+            if len(self._items) >= self._limit:
+                evicted = self._items.popleft()
+
+            self._items.append(item)
+            self._cond.notify()
+
+        return evicted
+
+    def get(self):
+        with self._cond:
+            while not self._items:
+                self._cond.wait()
+
+            return self._items.popleft()
+
+    def get_nowait(self):
+        with self._cond:
+            if not self._items:
+                raise queue.Empty
+
+            return self._items.popleft()
+
+    def qsize(self):
+        with self._cond:
+            return len(self._items)
+
+    def empty(self):
+        return self.qsize() == 0
+
+
+_mb_lock = threading.Lock()
+_mb_sender_queue = _MbQueue(MAP_BETA_EVENT_QUEUE_LIMIT)
+_mb_shot_queue = _MbQueue(MAP_BETA_QUEUE_LIMIT)
+_mb_threads_started = False
+_mb_inflight = set()
+_mb_logged_once = set()
+_mb_last_worker_call = {"t": None}
+_mb_budget = {"day": None, "ms": 0}
+
+
+def _mb_log(key, stage, message):
+    print(f"MAP BETA [{stage}] key={key} {message}", flush=True)
+
+
+def _mb_log_once(token, message):
+    with _mb_lock:
+        if token in _mb_logged_once:
+            return
+
+        _mb_logged_once.add(token)
+
+    print(f"MAP BETA {message}", flush=True)
+
+
+# Тонкие обёртки над вводом-выводом (в тестах подменяются).
+def _mb_http_post(url, data, files, timeout):
+    return requests.post(url, data=data, files=files, timeout=timeout)
+
+
+def _mb_http_get(url, headers, timeout):
+    return requests.get(url, headers=headers, timeout=timeout)
+
+
+def _mb_sleep(seconds):
+    time.sleep(seconds)
+
+
+def _mb_monotonic():
+    return time.monotonic()
+
+
+def _mb_wall_ms():
+    return int(time.time() * 1000)
+
+
+def _mb_caption_units(html_text):
+    """Длина подписи в единицах Telegram: текст после разбора разметки."""
+    plain = html.unescape(re.sub(r"<[^>]+>", "", html_text))
+
+    return len(plain.encode("utf-16-le")) // 2
+
+
+def _mb_jpeg_size(data):
+    """(ширина, высота) корректного JPEG или None."""
+    if (
+        not data
+        or len(data) < 4
+        or data[0] != 0xFF
+        or data[1] != 0xD8
+        or data[2] != 0xFF
+    ):
+        return None
+
+    i = 2
+
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+
+        marker = data[i + 1]
+
+        if marker == 0xFF:
+            i += 1
+            continue
+
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+
+        length = (data[i + 2] << 8) | data[i + 3]
+
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return (
+                (data[i + 7] << 8) | data[i + 8],
+                (data[i + 5] << 8) | data[i + 6],
+            )
+
+        i += 2 + length
+
+    return None
+
+
+def _mb_placeholder_bytes():
+    """Утверждённая заглушка (assets/map_placeholder.jpg) или None."""
+    try:
+        with open(MAP_BETA_PLACEHOLDER_PATH, "rb") as f:
+            data = f.read()
+
+    except Exception as e:
+        _mb_log_once(
+            "placeholder-missing",
+            f"заглушка недоступна ({type(e).__name__}); функция не работает",
+        )
+        return None
+
+    if _mb_jpeg_size(data) is None:
+        _mb_log_once(
+            "placeholder-bad",
+            "файл заглушки не является корректным JPEG; функция не работает",
+        )
+        return None
+
+    return data
+
+
+def _mb_tg(method, data, files=None):
+    """
+    Один вызов Bot API. kind: 'ok' | 'api_error' (Telegram ответил
+    ошибкой, результат известен) | 'unknown' (исключение/таймаут:
+    результат неизвестен, повторять отправку нельзя).
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+
+    try:
+        response = _mb_http_post(
+            url, data, files, MAP_BETA_TG_TIMEOUT
+        )
+
+    except Exception as e:
+        return {
+            "kind": "unknown",
+            "status": None,
+            "description": sanitize_secrets(
+                f"{type(e).__name__}"
+            )[:120],
+            "retry_after": None,
+            "result": None,
+        }
+
+    try:
+        body = response.json()
+
+    except Exception:
+        body = {}
+
+    if response.status_code == 200 and body.get("ok"):
+        return {
+            "kind": "ok",
+            "status": 200,
+            "description": "",
+            "retry_after": None,
+            "result": body.get("result"),
+        }
+
+    parameters = body.get("parameters") or {}
+
+    return {
+        "kind": "api_error",
+        "status": response.status_code,
+        "description": sanitize_secrets(
+            str(body.get("description") or "")
+        )[:200],
+        "retry_after": parameters.get("retry_after"),
+        "result": None,
+    }
+
+
+def _mb_budget_ok():
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    with _mb_lock:
+        if _mb_budget["day"] != day:
+            _mb_budget["day"] = day
+            _mb_budget["ms"] = 0
+
+        return _mb_budget["ms"] < MAP_BETA_DAILY_BROWSER_MS
+
+
+def _mb_budget_add(ms):
+    with _mb_lock:
+        _mb_budget["ms"] += max(0, int(ms))
+
+
+def _mb_header_int(headers, name):
+    try:
+        value = headers.get(name)
+
+        if value is None:
+            return None
+
+        value = str(value).strip()
+
+        return int(value) if value.isdigit() else None
+
+    except Exception:
+        return None
+
+
+def _mb_send_placeholder(key, caption, placeholder):
+    data = {
+        "chat_id": ARCHIVE_CHAT_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    files = {
+        "photo": ("map_placeholder.jpg", placeholder, "image/jpeg"),
+    }
+
+    for attempt in (1, 2):
+        r = _mb_tg("sendPhoto", data, files)
+
+        if r["kind"] == "ok":
+            try:
+                return r["result"]["message_id"]
+
+            except Exception:
+                _mb_log(key, "заглушка", "ответ без message_id")
+                return None
+
+        if r["kind"] == "unknown":
+            # Результат неизвестен: повтор мог бы создать дубль.
+            _mb_log(
+                key,
+                "заглушка",
+                f"результат отправки неизвестен ({r['description']}), "
+                "повтор не выполняется",
+            )
+            return None
+
+        delay = (
+            int(r["retry_after"] or 5)
+            if r["status"] == 429
+            else 3
+        )
+        retriable = (
+            r["status"] == 429 or (r["status"] or 0) >= 500
+        ) and delay <= 30
+
+        if attempt == 1 and retriable:
+            _mb_log(
+                key,
+                "заглушка",
+                f"HTTP {r['status']}: повтор через {delay} с",
+            )
+            _mb_sleep(delay)
+            continue
+
+        _mb_log(
+            key,
+            "заглушка",
+            f"не отправлена: HTTP {r['status']} {r['description']}",
+        )
+        return None
+
+    return None
+
+
+def _mb_send_full_text(key, alert_text, photo_message_id):
+    """Длинный текст: полный текст тревоги отдельным сообщением под фото."""
+    for attempt in (1, 2, 3):
+        r = _mb_tg(
+            "sendMessage",
+            {
+                "chat_id": ARCHIVE_CHAT_ID,
+                "text": alert_text,
+                "parse_mode": "HTML",
+                "reply_to_message_id": photo_message_id,
+                "link_preview_options": json.dumps(
+                    {"is_disabled": True}
+                ),
+            },
+        )
+
+        if r["kind"] == "ok":
+            return True
+
+        if r["kind"] == "unknown":
+            _mb_log(
+                key,
+                "текст",
+                "результат отправки полного текста неизвестен, повтор не "
+                "выполняется",
+            )
+            return False
+
+        wait = (
+            int(r["retry_after"] or 5)
+            if r["status"] == 429
+            else 2 * attempt
+        )
+
+        if attempt < 3 and (
+            r["status"] == 429 or (r["status"] or 0) >= 500
+        ) and wait <= 60:
+            _mb_sleep(wait)
+            continue
+
+        break
+
+    _mb_log(key, "текст", "полный текст не отправлен")
+    return False
+
+
+def _mb_process_send(event):
+    """Поток-отправитель: заглушка (и полный текст) сразу после тревоги."""
+    key = event["key"]
+
+    try:
+        with sent_messages_lock:
+            duplicate = key in sent_messages
+
+        if duplicate:
+            _mb_log(key, "дубль", "событие уже обработано, пропуск")
+            return
+
+        placeholder = _mb_placeholder_bytes()
+
+        if placeholder is None:
+            return
+
+        alert_text = event.get("alert_text") or build_alert_text(
+            source_name=event["source_name"],
+            source_link=event["source_link"],
+            post_link=build_source_post_link(
+                source_link=event["source_link"],
+                post_id=event["post_id"],
+            ),
+            original_text=event["original_text"],
+            classification=event["classification"],
+        )
+
+        sample_tail = (
+            "\n\nСнимок получен в 00:00:00\nКарта: " + MAP_BETA_MAP_URL
+        )
+        long_mode = (
+            _mb_caption_units(alert_text + sample_tail)
+            > MAP_BETA_CAPTION_LIMIT
+        )
+        base_caption = (
+            "🗺 Полный текст оповещения - в сообщении ниже"
+            if long_mode
+            else alert_text
+        )
+
+        # Ключ фиксируется ДО отправки: любой дальнейший исход не
+        # приводит к повторной публикации этого события.
+        register_sent(key)
+
+        message_id = _mb_send_placeholder(key, base_caption, placeholder)
+
+        if not message_id:
+            return
+
+        sent_at = _mb_monotonic()
+
+        _mb_log(
+            key,
+            "заглушка",
+            f"опубликована message_id={message_id}"
+            + (" (длинный текст)" if long_mode else ""),
+        )
+
+        if long_mode:
+            _mb_send_full_text(key, alert_text, message_id)
+
+        job = {
+            "key": key,
+            "message_id": message_id,
+            "base_caption": base_caption,
+            "deadline": sent_at + MAP_BETA_WAIT_SECONDS,
+        }
+
+        evicted = _mb_shot_queue.put_latest(job)
+
+        if evicted is not None:
+            _mb_log(
+                evicted["key"],
+                "очередь",
+                "вытеснена более новой тревогой (очередь снимков полна); "
+                "снимок не запрашивался, заглушка остаётся",
+            )
+
+    except Exception as e:
+        _mb_log(
+            key,
+            "ошибка",
+            sanitize_secrets(f"{type(e).__name__}: {e}"),
+        )
+
+    finally:
+        with _mb_lock:
+            _mb_inflight.discard(key)
+
+
+def _mb_fetch_shot(job):
+    """Снимок от Worker в пределах срока. dict или None."""
+    key = job["key"]
+    headers = {"accept": "image/jpeg"}
+
+    if MAP_BETA_SHOT_TOKEN:
+        headers["X-Shot-Token"] = MAP_BETA_SHOT_TOKEN
+
+    attempts = 0
+    reason = "нет попыток"
+
+    while attempts < MAP_BETA_MAX_SHOT_ATTEMPTS:
+        remaining = job["deadline"] - _mb_monotonic()
+
+        if remaining < 15:
+            reason = "срок ожидания исчерпан"
+            break
+
+        if not _mb_budget_ok():
+            reason = "суточный лимит времени браузера (Free) исчерпан"
+            break
+
+        with _mb_lock:
+            last_call = _mb_last_worker_call["t"]
+
+        if last_call is not None:
+            pause = MAP_BETA_WORKER_MIN_INTERVAL - (
+                _mb_monotonic() - last_call
+            )
+
+            if pause > 0:
+                if pause >= remaining - 15:
+                    reason = "пауза между запросами к Worker не укладывается в срок"
+                    break
+
+                _mb_sleep(pause)
+
+        with _mb_lock:
+            _mb_last_worker_call["t"] = _mb_monotonic()
+
+        attempts += 1
+        remaining = job["deadline"] - _mb_monotonic()
+        started_ms = _mb_wall_ms()
+
+        try:
+            response = _mb_http_get(
+                MAP_BETA_WORKER_URL,
+                headers,
+                (5, max(5, min(MAP_BETA_WORKER_READ_TIMEOUT, remaining - 2))),
+            )
+
+        except Exception as e:
+            reason = sanitize_secrets(f"{type(e).__name__}")
+            _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
+            backoff = min(5 * attempts, 20)
+
+            if job["deadline"] - _mb_monotonic() - backoff < 15:
+                break
+
+            _mb_sleep(backoff)
+            continue
+
+        received_ms = _mb_wall_ms()
+        status = response.status_code
+        browser_ms = _mb_header_int(
+            response.headers, "x-browser-ms-used"
+        )
+
+        if status == 200:
+            body = response.content
+            size = _mb_jpeg_size(body)
+
+            if browser_ms is not None:
+                _mb_budget_add(browser_ms)
+            else:
+                _mb_budget_add(MAP_BETA_ASSUMED_BROWSER_MS)
+
+            if size == (MAP_BETA_EXPECTED_SIZE, MAP_BETA_EXPECTED_SIZE):
+                shot_at = _mb_header_int(response.headers, "x-shot-at")
+
+                # Время снимка должно лежать в окне запроса.
+                if shot_at is not None and not (
+                    started_ms - 5000 <= shot_at <= received_ms + 5000
+                ):
+                    _mb_log(
+                        key,
+                        "снимок",
+                        f"X-Shot-At={shot_at} вне окна запроса, игнорируется",
+                    )
+                    shot_at = None
+
+                return {
+                    "bytes": body,
+                    "shot_at_ms": shot_at,
+                    "received_ms": received_ms,
+                    "attempts": attempts,
+                }
+
+            reason = (
+                "ответ не является JPEG 800x800 "
+                f"(размер: {size if size else 'не JPEG'})"
+            )
+            _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
+
+        elif status == 429:
+            retry_after = _mb_header_int(response.headers, "retry-after")
+            delay = retry_after if retry_after else 15
+            reason = f"HTTP 429 (Retry-After {delay} с)"
+            _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
+
+            if job["deadline"] - _mb_monotonic() - delay < 15:
+                break
+
+            _mb_sleep(delay)
+            continue
+
+        elif status in (401, 403, 404):
+            # Ошибка конфигурации: повторять бессмысленно.
+            reason = f"HTTP {status} (проверьте URL/токен Worker)"
+            _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
+            break
+
+        else:
+            if browser_ms is not None:
+                _mb_budget_add(browser_ms)
+
+            reason = f"HTTP {status}"
+            _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
+
+        backoff = min(5 * attempts, 20)
+
+        if job["deadline"] - _mb_monotonic() - backoff < 15:
+            break
+
+        _mb_sleep(backoff)
+
+    _mb_log(key, "снимок", f"не получен: {reason}; заглушка остаётся")
+    return None
+
+
+def _mb_time_line(shot):
+    """
+    Единый формат подписи: «Снимок получен в ЧЧ:ММ:СС» (по Киеву). Это НЕ
+    время съёмки: X-Shot-At Worker фиксирует после возврата готового
+    изображения из Browser Run. Берётся X-Shot-At, если он есть и достоверен
+    (лежит в окне запроса), иначе время получения снимка ботом.
+    """
+    stamp_ms = shot["shot_at_ms"]
+
+    if stamp_ms is None:
+        stamp_ms = shot["received_ms"]
+
+    moment = datetime.fromtimestamp(stamp_ms / 1000, tz=KYIV_TZ)
+
+    return "Снимок получен в " + moment.strftime("%H:%M:%S")
+
+
+def _mb_edit(job, shot):
+    """Замена заглушки снимком в том же сообщении (editMessageMedia)."""
+    key = job["key"]
+    caption = (
+        job["base_caption"]
+        + "\n\n"
+        + _mb_time_line(shot)
+        + "\nКарта: "
+        + MAP_BETA_MAP_URL
+    )
+    media = json.dumps(
+        {
+            "type": "photo",
+            "media": "attach://shot",
+            "caption": caption,
+            "parse_mode": "HTML",
+        },
+        ensure_ascii=False,
+    )
+    hard_stop = job["deadline"] + MAP_BETA_EDIT_GRACE_SECONDS
+    reason = "нет попыток"
+
+    for attempt in range(1, MAP_BETA_MAX_EDIT_ATTEMPTS + 1):
+        if attempt > 1 and _mb_monotonic() >= hard_stop:
+            reason = "срок замены исчерпан"
+            break
+
+        r = _mb_tg(
+            "editMessageMedia",
+            {
+                "chat_id": ARCHIVE_CHAT_ID,
+                "message_id": job["message_id"],
+                "media": media,
+            },
+            {"shot": ("map.jpg", shot["bytes"], "image/jpeg")},
+        )
+
+        if r["kind"] == "ok":
+            _mb_log(
+                key,
+                "замена",
+                f"выполнена message_id={job['message_id']}; "
+                f"{_mb_time_line(shot)}",
+            )
+            return True
+
+        reason = (
+            f"HTTP {r['status']} {r['description']}"
+            if r["kind"] == "api_error"
+            else f"результат неизвестен ({r['description']})"
+        )
+
+        if (
+            r["kind"] == "api_error"
+            and "message is not modified" in r["description"].lower()
+        ):
+            _mb_log(key, "замена", "уже выполнена (message is not modified)")
+            return True
+
+        if r["kind"] == "api_error" and r["status"] == 429:
+            delay = int(r["retry_after"] or 5)
+
+        elif r["kind"] == "unknown" or (r["status"] or 0) >= 500:
+            # Правка идемпотентна: повтор безопасен (дубля не будет).
+            delay = 2 * attempt
+
+        else:
+            break
+
+        if _mb_monotonic() + delay >= hard_stop:
+            reason += "; срок замены исчерпан"
+            break
+
+        _mb_log(key, "замена", f"попытка {attempt}: {reason}; повтор через {delay} с")
+        _mb_sleep(delay)
+
+    _mb_log(key, "замена", f"не выполнена: {reason}; заглушка остаётся")
+    return False
+
+
+def _mb_process_shot(job):
+    """Поток-снимок: получить снимок и заменить заглушку."""
+    key = job["key"]
+
+    try:
+        shot = _mb_fetch_shot(job)
+
+        if shot is None:
+            return
+
+        _mb_edit(job, shot)
+
+    except Exception as e:
+        _mb_log(
+            key,
+            "ошибка",
+            sanitize_secrets(f"{type(e).__name__}: {e}"),
+        )
+
+
+def _mb_sender_loop():
+    while True:
+        event = _mb_sender_queue.get()
+
+        try:
+            _mb_process_send(event)
+
+        except Exception:
+            pass
+
+
+def _mb_shot_loop():
+    while True:
+        job = _mb_shot_queue.get()
+
+        try:
+            _mb_process_shot(job)
+
+        except Exception:
+            pass
+
+
+def _mb_ensure_threads():
+    global _mb_threads_started
+
+    with _mb_lock:
+        if _mb_threads_started:
+            return
+
+        _mb_threads_started = True
+
+    threading.Thread(
+        target=_mb_sender_loop,
+        name="map-beta-sender",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_mb_shot_loop,
+        name="map-beta-shot",
+        daemon=True,
+    ).start()
+
+
+def _mb_enqueue(event):
+    """Постановка события на публикацию заглушки (общая для тревог и теста)."""
+    key = event["key"]
+
+    with _mb_lock:
+        if key in _mb_inflight:
+            return
+
+        _mb_inflight.add(key)
+
+    _mb_ensure_threads()
+
+    evicted = _mb_sender_queue.put_latest(event)
+
+    if evicted is not None:
+        with _mb_lock:
+            _mb_inflight.discard(evicted["key"])
+
+        _mb_log(
+            evicted["key"],
+            "очередь",
+            "очередь событий полна: самое раннее вытеснено до публикации "
+            "заглушки (копия в картотеке не создана)",
+        )
+
+
+def map_beta_submit(
+    source_name,
+    source_link,
+    post_id,
+    original_text,
+    classification,
+):
+    """
+    Единственная точка входа. Вызывается после успешной send_alert().
+    Не блокирует, не бросает исключений.
+    """
+    try:
+        if not MAP_BETA_ENABLED:
+            return
+
+        if ARCHIVE_CHAT_ID is None:
+            _mb_log_once(
+                "no-archive",
+                "ARCHIVE_CHAT_ID не настроен: бета-функция не работает",
+            )
+            return
+
+        _mb_enqueue(
+            {
+                "key": f"mapbeta:{source_name}:{post_id}",
+                "source_name": source_name,
+                "source_link": source_link,
+                "post_id": post_id,
+                "original_text": original_text,
+                "classification": classification,
+            }
+        )
+
+    except Exception as e:
+        try:
+            print(
+                "MAP BETA [ошибка] map_beta_submit: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+        except Exception:
+            pass
+
+
+def _mb_selftest_text(label):
+    head = (
+        "🧪 ТЕСТ бета-функции скриншотов карты\n"
+        "\n"
+        "Это контрольная проверка в картотеке, а не тревога.\n"
+        f"Метка запуска: {html.escape(label, quote=False)}"
+    )
+
+    if label.lower().startswith("long"):
+        filler = "\n".join(
+            f"Строка заполнения {i:02d}: проверка длинного текста "
+            "оповещения и переноса полного текста отдельным сообщением."
+            for i in range(1, 15)
+        )
+        return head + "\n\n" + filler
+
+    return head
+
+
+def _mb_selftest_run():
+    """Один контрольный запуск в картотеке (см. MAP_BETA_SELFTEST)."""
+    try:
+        time.sleep(MAP_BETA_SELFTEST_DELAY)
+
+        if ARCHIVE_CHAT_ID is None:
+            _mb_log_once(
+                "selftest-no-archive",
+                "[selftest] ARCHIVE_CHAT_ID не настроен: контрольный запуск "
+                "невозможен",
+            )
+            return
+
+        label = MAP_BETA_SELFTEST
+        key = f"mapbeta:SELFTEST:{label}"
+
+        with sent_messages_lock:
+            already = key in sent_messages
+
+        if already:
+            _mb_log(
+                key,
+                "selftest",
+                "метка уже использована (повторный запуск не выполняется); "
+                "уберите MAP_BETA_SELFTEST или смените метку",
+            )
+            return
+
+        _mb_log(
+            key,
+            "selftest",
+            "контрольный запуск в картотеке (реальные тревоги бету "
+            + ("ЗАПУСКАЮТ" if MAP_BETA_ENABLED else "не запускают: MAP_BETA_ENABLED выключен")
+            + ")",
+        )
+
+        _mb_enqueue(
+            {
+                "key": key,
+                "source_name": "SELFTEST",
+                "source_link": "",
+                "post_id": label,
+                "original_text": "",
+                "classification": "SELFTEST",
+                "alert_text": _mb_selftest_text(label),
+            }
+        )
+
+    except Exception as e:
+        print(
+            "MAP BETA [selftest] ошибка: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+
+if MAP_BETA_SELFTEST:
+    threading.Thread(
+        target=_mb_selftest_run,
+        name="map-beta-selftest",
+        daemon=True,
+    ).start()
+
+
+# ============================================================
+# END MAP SCREENSHOT BETA
+# ============================================================
 
 
 # ============================================================
