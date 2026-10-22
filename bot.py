@@ -5546,6 +5546,13 @@ MAP_BETA_PLACEHOLDER_PATH = os.path.join(
     "assets",
     "map_placeholder.jpg",
 )
+# Заглушка окончательной ошибки («ЗНІМОК ОТРИМАТИ НЕ ВДАЛОСЬ»): подставляется вместо заглушки ожидания после
+# исчерпания попыток. Если файла нет, меняется только подпись (editMessageCaption), заглушка ожидания остаётся.
+MAP_BETA_ERROR_PLACEHOLDER_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "assets",
+    "map_error_placeholder.jpg",
+)
 
 MAP_BETA_WAIT_SECONDS = 180            # ожидание снимка после публикации заглушки
 MAP_BETA_EDIT_GRACE_SECONDS = 30       # запас на замену уже полученного снимка
@@ -5576,6 +5583,11 @@ MAP_BETA_FAIL_REASONS = {
     "render-error": "ошибка сервера или получения изображения",
     "worker-timeout": "таймаут подготовки карты (лимит Worker)",
     "bot-timeout": "нет ответа от Worker за отведённое время",
+    "deadline": "истёк срок ожидания снимка",
+    "budget": "исчерпан суточный лимит времени браузера",
+    "rate-limit": "сервис снимков перегружен (лимит запросов)",
+    "access": "нет доступа к сервису снимков (проверьте настройки)",
+    "evicted": "задание вытеснено более новой тревогой",
     "unknown": "неизвестная ошибка",
 }
 MAP_BETA_MAX_EDIT_ATTEMPTS = 3
@@ -5750,6 +5762,53 @@ def _mb_placeholder_bytes():
         return None
 
     return data
+
+
+def _mb_error_placeholder_bytes():
+    """Заглушка окончательной ошибки (assets/map_error_placeholder.jpg) или None."""
+    try:
+        with open(MAP_BETA_ERROR_PLACEHOLDER_PATH, "rb") as f:
+            data = f.read()
+
+    except Exception as e:
+        _mb_log_once(
+            "error-placeholder-missing",
+            f"заглушка ошибки недоступна ({type(e).__name__}): при сбое меняется только подпись",
+        )
+        return None
+
+    if _mb_jpeg_size(data) is None:
+        _mb_log_once(
+            "error-placeholder-bad",
+            "файл заглушки ошибки не является корректным JPEG: при сбое меняется только подпись",
+        )
+        return None
+
+    return data
+
+
+def _mb_failure_caption(job):
+    """
+    Подпись при окончательном сбое: текст оповещения сверху, затем «⚠️ Снимок не получен: <причина>» ВМЕСТО строки
+    «Снимок получен в ЧЧ:ММ:СС». Причина берётся из подтверждённого кода (таблица MAP_BETA_FAIL_REASONS); неизвестно ->
+    «неизвестная ошибка». Укладывается в лимит подписи: при нехватке места сначала убирается строка со ссылкой на карту,
+    затем текст причины (текст оповещения не обрезается).
+    """
+    code = job.get("fail_code") or "unknown"
+    reason = html.escape(MAP_BETA_FAIL_REASONS.get(code, MAP_BETA_FAIL_REASONS["unknown"]))
+    base = job["base_caption"]
+    link = "\nКарта: " + MAP_BETA_MAP_URL
+    candidates = (
+        base + "\n\n⚠️ Снимок не получен: " + reason + link,
+        base + "\n\n⚠️ Снимок не получен: " + reason,
+        base + "\n\n⚠️ Снимок не получен",
+    )
+
+    for text in candidates:
+        if _mb_caption_units(text) <= MAP_BETA_CAPTION_LIMIT:
+            return text
+
+    return candidates[-1]
 
 
 def _mb_tg(method, data, files=None):
@@ -6042,11 +6101,13 @@ def _mb_process_send(event):
                 evicted["key"],
                 "очередь",
                 "вытеснена более новой тревогой (очередь снимков полна); "
-                "снимок не запрашивался, заглушка остаётся",
+                "снимок не запрашивался, заглушка ожидания заменяется заглушкой ошибки",
             )
+            evicted["fail_code"] = "evicted"
+            _mb_edit(evicted, None, failure=True)
             _mb_manual_done(
                 evicted, False,
-                "тест вытеснен более новой задачей (очередь снимков полна); заглушка осталась",
+                "тест вытеснен более новой задачей (очередь снимков полна)",
             )
 
     except Exception as e:
@@ -6089,10 +6150,14 @@ def _mb_fetch_shot(job):
 
         if remaining < 15:
             reason = "срок ожидания исчерпан"
+            if attempts == 0:
+                fail_code = "deadline"
             break
 
         if not _mb_budget_ok():
             reason = "суточный лимит времени браузера (Free) исчерпан"
+            if attempts == 0:
+                fail_code = "budget"
             break
 
         with _mb_lock:
@@ -6106,6 +6171,8 @@ def _mb_fetch_shot(job):
             if pause > 0:
                 if pause >= remaining - 15:
                     reason = "пауза между запросами к Worker не укладывается в срок"
+                    if attempts == 0:
+                        fail_code = "deadline"
                     break
 
                 _mb_sleep(pause)
@@ -6186,6 +6253,7 @@ def _mb_fetch_shot(job):
             retry_after = _mb_header_int(response.headers, "retry-after")
             delay = retry_after if retry_after else 15
             reason = f"HTTP 429 (Retry-After {delay} с)"
+            fail_code = "rate-limit"
             _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
 
             if job["deadline"] - _mb_monotonic() - delay < 15:
@@ -6197,6 +6265,7 @@ def _mb_fetch_shot(job):
         elif status in (401, 403, 404):
             # Ошибка конфигурации: повторять бессмысленно.
             reason = f"HTTP {status} (проверьте URL/токен Worker)"
+            fail_code = "access"
             _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
             break
 
@@ -6238,16 +6307,79 @@ def _mb_time_line(shot):
     return "Снимок получен в " + moment.strftime("%H:%M:%S")
 
 
-def _mb_edit(job, shot):
-    """Замена заглушки снимком в том же сообщении (editMessageMedia)."""
+def _mb_edit_caption_only(job, caption):
+    """Запасной путь при окончательном сбое без файла заглушки ошибки: меняется только подпись (то же сообщение)."""
     key = job["key"]
-    caption = (
-        job["base_caption"]
-        + "\n\n"
-        + _mb_time_line(shot)
-        + "\nКарта: "
-        + MAP_BETA_MAP_URL
+    r = _mb_tg(
+        "editMessageCaption",
+        {
+            "chat_id": ARCHIVE_CHAT_ID,
+            "message_id": job["message_id"],
+            "caption": caption,
+            "parse_mode": "HTML",
+            "show_caption_above_media": "true",
+        },
     )
+
+    if r["kind"] == "ok" or (
+        r["kind"] == "api_error" and "message is not modified" in r["description"].lower()
+    ):
+        job["failure_shown"] = True
+        _mb_log(key, "замена", f"подпись ошибки установлена message_id={job['message_id']} (без заглушки ошибки)")
+        return True
+
+    job["edit_fail_reason"] = f"{r['kind']} HTTP {r['status']} {r['description']}"
+    _mb_log(key, "замена", f"подпись ошибки не установлена: {job['edit_fail_reason']}; заглушка ожидания остаётся")
+    return False
+
+
+def _mb_mark_edit_done(job, shot, failure, note=""):
+    key = job["key"]
+
+    if failure:
+        job["failure_shown"] = True
+        _mb_log(
+            key,
+            "замена",
+            f"заглушка ошибки установлена message_id={job['message_id']} "
+            f"(причина: {job.get('fail_code') or 'unknown'})" + note,
+        )
+        return
+
+    job["time_line"] = _mb_time_line(shot)
+    _mb_log(
+        key,
+        "замена",
+        f"выполнена message_id={job['message_id']}; {_mb_time_line(shot)}" + note,
+    )
+
+
+def _mb_edit(job, shot, failure=False):
+    """
+    Замена заглушки ожидания в том же сообщении (editMessageMedia): снимком (failure=False) либо, при окончательном
+    сбое, заглушкой ошибки с подписью «⚠️ Снимок не получен: <причина>» вместо времени получения (failure=True).
+    """
+    key = job["key"]
+
+    if failure:
+        caption = _mb_failure_caption(job)
+        image = _mb_error_placeholder_bytes()
+        file_name = "error.jpg"
+
+        if image is None:
+            return _mb_edit_caption_only(job, caption)
+
+    else:
+        caption = (
+            job["base_caption"]
+            + "\n\n"
+            + _mb_time_line(shot)
+            + "\nКарта: "
+            + MAP_BETA_MAP_URL
+        )
+        image = shot["bytes"]
+        file_name = "map.jpg"
+
     media = json.dumps(
         {
             "type": "photo",
@@ -6273,7 +6405,7 @@ def _mb_edit(job, shot):
                 "message_id": job["message_id"],
                 "media": media,
             },
-            {"shot": ("map.jpg", shot["bytes"], "image/jpeg")},
+            {"shot": (file_name, image, "image/jpeg")},
         )
 
         if r["kind"] == "ok":
@@ -6285,13 +6417,7 @@ def _mb_edit(job, shot):
                 reason = "Telegram вернул сообщение без фото"
                 break
 
-            job["time_line"] = _mb_time_line(shot)
-            _mb_log(
-                key,
-                "замена",
-                f"выполнена message_id={job['message_id']}; "
-                f"{_mb_time_line(shot)}",
-            )
+            _mb_mark_edit_done(job, shot, failure)
             return True
 
         reason = (
@@ -6304,8 +6430,7 @@ def _mb_edit(job, shot):
             r["kind"] == "api_error"
             and "message is not modified" in r["description"].lower()
         ):
-            job["time_line"] = _mb_time_line(shot)
-            _mb_log(key, "замена", "уже выполнена (message is not modified)")
+            _mb_mark_edit_done(job, shot, failure, "; уже выполнена (message is not modified)")
             return True
 
         if r["kind"] == "api_error" and r["status"] == 429:
@@ -6325,7 +6450,12 @@ def _mb_edit(job, shot):
         _mb_log(key, "замена", f"попытка {attempt}: {reason}; повтор через {delay} с")
         _mb_sleep(delay)
 
-    job["fail_reason"] = reason
+    if failure:
+        job["edit_fail_reason"] = reason
+
+    else:
+        job["fail_reason"] = reason
+
     _mb_log(key, "замена", f"не выполнена: {reason}; заглушка остаётся")
     return False
 
@@ -6338,6 +6468,7 @@ def _mb_process_shot(job):
         shot = _mb_fetch_shot(job)
 
         if shot is None:
+            _mb_edit(job, None, failure=True)
             _mb_manual_done(job, False, "снимок не получен: " + str(job.get("fail_reason") or "причина не определена"))
             return
 
@@ -6499,7 +6630,11 @@ def _mb_manual_done(obj, ok, detail=""):
             text = (
                 "⚠️ Тест скриншота НЕ пройден: "
                 + sanitize_secrets(str(detail))[:300]
-                + "\nЗаглушка осталась в сообщении."
+                + (
+                    "\nСообщение заменено заглушкой ошибки."
+                    if obj.get("failure_shown")
+                    else "\nЗаглушка осталась в сообщении."
+                )
             )
 
         _mb_log(f"mapbeta:TEST:{run_id}", "test", "итог: " + ("успех" if ok else "неудача: " + str(detail)[:120]))
