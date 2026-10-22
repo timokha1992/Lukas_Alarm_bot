@@ -3735,6 +3735,7 @@ def telegram_command_listener():
                     handle_test_command(
                         message
                     )
+                    map_beta_test_command(message)
 
                 if (
                     command == "/classify"
@@ -5616,6 +5617,12 @@ _mb_logged_once = set()
 _mb_last_worker_call = {"t": None}
 _mb_budget = {"day": None, "ms": 0}
 
+# Ручные тесты (/test в картотеке): активные запуски и кэш имени бота.
+MAP_BETA_MANUAL_STALE_SECONDS = MAP_BETA_WAIT_SECONDS + 120
+_mb_manual_active = {}
+_mb_manual_seq = {"n": 0}
+_mb_bot_username_cache = {"v": None}
+
 
 def _mb_log(key, stage, message):
     print(f"MAP BETA [{stage}] key={key} {message}", flush=True)
@@ -5916,8 +5923,13 @@ def _mb_process_send(event):
     key = event["key"]
 
     try:
-        with sent_messages_lock:
-            duplicate = key in sent_messages
+        # Ручной тест (/test) имеет уникальный ключ на каждый запуск и НЕ
+        # пишет в реестр обработанных сообщений (состояние не меняется).
+        duplicate = False
+
+        if not event.get("manual"):
+            with sent_messages_lock:
+                duplicate = key in sent_messages
 
         if duplicate:
             _mb_log(key, "дубль", "событие уже обработано, пропуск")
@@ -5926,6 +5938,7 @@ def _mb_process_send(event):
         placeholder = _mb_placeholder_bytes()
 
         if placeholder is None:
+            _mb_manual_done(event, False, "файл заглушки недоступен (см. лог)")
             return
 
         alert_text = event.get("alert_text") or build_alert_text(
@@ -5954,11 +5967,13 @@ def _mb_process_send(event):
 
         # Ключ фиксируется ДО отправки: любой дальнейший исход не
         # приводит к повторной публикации этого события.
-        register_sent(key)
+        if not event.get("manual"):
+            register_sent(key)
 
         message_id = _mb_send_placeholder(key, base_caption, placeholder)
 
         if not message_id:
+            _mb_manual_done(event, False, "заглушку не удалось отправить в Картотеку")
             return
 
         sent_at = _mb_monotonic()
@@ -5978,6 +5993,9 @@ def _mb_process_send(event):
             "message_id": message_id,
             "base_caption": base_caption,
             "deadline": sent_at + MAP_BETA_WAIT_SECONDS,
+            "manual": event.get("manual"),
+            "run_id": event.get("run_id"),
+            "reply_to": event.get("reply_to"),
         }
 
         evicted = _mb_shot_queue.put_latest(job)
@@ -5989,6 +6007,10 @@ def _mb_process_send(event):
                 "вытеснена более новой тревогой (очередь снимков полна); "
                 "снимок не запрашивался, заглушка остаётся",
             )
+            _mb_manual_done(
+                evicted, False,
+                "тест вытеснен более новой задачей (очередь снимков полна); заглушка осталась",
+            )
 
     except Exception as e:
         _mb_log(
@@ -5996,6 +6018,7 @@ def _mb_process_send(event):
             "ошибка",
             sanitize_secrets(f"{type(e).__name__}: {e}"),
         )
+        _mb_manual_done(event, False, "внутренняя ошибка (см. лог)")
 
     finally:
         with _mb_lock:
@@ -6138,6 +6161,7 @@ def _mb_fetch_shot(job):
 
         _mb_sleep(backoff)
 
+    job["fail_reason"] = reason
     _mb_log(key, "снимок", f"не получен: {reason}; заглушка остаётся")
     return None
 
@@ -6197,6 +6221,15 @@ def _mb_edit(job, shot):
         )
 
         if r["kind"] == "ok":
+            res = r["result"]
+
+            # Если Telegram вернул сообщение, в нём должно быть фото: иначе
+            # замену нельзя считать выполненной (успех не заявляется).
+            if isinstance(res, dict) and res.get("message_id") and not res.get("photo"):
+                reason = "Telegram вернул сообщение без фото"
+                break
+
+            job["time_line"] = _mb_time_line(shot)
             _mb_log(
                 key,
                 "замена",
@@ -6215,6 +6248,7 @@ def _mb_edit(job, shot):
             r["kind"] == "api_error"
             and "message is not modified" in r["description"].lower()
         ):
+            job["time_line"] = _mb_time_line(shot)
             _mb_log(key, "замена", "уже выполнена (message is not modified)")
             return True
 
@@ -6235,6 +6269,7 @@ def _mb_edit(job, shot):
         _mb_log(key, "замена", f"попытка {attempt}: {reason}; повтор через {delay} с")
         _mb_sleep(delay)
 
+    job["fail_reason"] = reason
     _mb_log(key, "замена", f"не выполнена: {reason}; заглушка остаётся")
     return False
 
@@ -6247,9 +6282,16 @@ def _mb_process_shot(job):
         shot = _mb_fetch_shot(job)
 
         if shot is None:
+            _mb_manual_done(job, False, "снимок не получен: " + str(job.get("fail_reason") or "причина не определена"))
             return
 
-        _mb_edit(job, shot)
+        ok = _mb_edit(job, shot)
+
+        if ok:
+            _mb_manual_done(job, True, job.get("time_line") or "")
+
+        else:
+            _mb_manual_done(job, False, "замена не выполнена: " + str(job.get("fail_reason") or "причина не определена"))
 
     except Exception as e:
         _mb_log(
@@ -6257,6 +6299,7 @@ def _mb_process_shot(job):
             "ошибка",
             sanitize_secrets(f"{type(e).__name__}: {e}"),
         )
+        _mb_manual_done(job, False, "внутренняя ошибка (см. лог)")
 
 
 def _mb_sender_loop():
@@ -6326,6 +6369,7 @@ def _mb_enqueue(event):
             "очередь событий полна: самое раннее вытеснено до публикации "
             "заглушки (копия в картотеке не создана)",
         )
+        _mb_manual_done(evicted, False, "тест вытеснен из очереди событий до публикации заглушки")
 
 
 def map_beta_submit(
@@ -6368,6 +6412,193 @@ def map_beta_submit(
                 f"{type(e).__name__}: {e}",
                 flush=True,
             )
+
+        except Exception:
+            pass
+
+
+def _mb_manual_done(obj, ok, detail=""):
+    """
+    Итог ручного теста (/test): одно сообщение в Картотеку ответом на тест.
+    Успех сообщается ТОЛЬКО если замена изображения подтверждена Telegram.
+    Для остальных событий ничего не делает. Не бросает исключений.
+    """
+    try:
+        if not obj.get("manual"):
+            return
+
+        run_id = obj.get("run_id")
+
+        with _mb_lock:
+            if _mb_manual_active.pop(run_id, None) is None:
+                return  # уже завершён
+
+        if ok:
+            text = (
+                "✅ Тест скриншота пройден: заглушка заменена снимком карты "
+                "в этом сообщении."
+                + (f"\n{detail}" if detail else "")
+            )
+        else:
+            text = (
+                "⚠️ Тест скриншота НЕ пройден: "
+                + sanitize_secrets(str(detail))[:300]
+                + "\nЗаглушка осталась в сообщении."
+            )
+
+        _mb_log(f"mapbeta:TEST:{run_id}", "test", "итог: " + ("успех" if ok else "неудача: " + str(detail)[:120]))
+
+        data = {"chat_id": ARCHIVE_CHAT_ID, "text": text}
+        reply_to = obj.get("message_id") or obj.get("reply_to")
+
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+            data["allow_sending_without_reply"] = "true"
+
+        _mb_tg("sendMessage", data)
+
+    except Exception as e:
+        try:
+            print(f"MAP BETA [test] ошибка отчёта: {type(e).__name__}: {e}", flush=True)
+
+        except Exception:
+            pass
+
+
+def _mb_bot_username():
+    """Имя бота (getMe), кэшируется. None, если определить не удалось."""
+    with _mb_lock:
+        cached = _mb_bot_username_cache["v"]
+
+    if cached:
+        return cached
+
+    r = _mb_tg("getMe", {})
+
+    if r["kind"] == "ok":
+        try:
+            name = str(r["result"]["username"]).strip()
+
+        except Exception:
+            name = ""
+
+        if name:
+            with _mb_lock:
+                _mb_bot_username_cache["v"] = name
+
+            return name
+
+    return None
+
+
+def _mb_is_test_command(text):
+    """/test или /test@<имя этого бота>; всё остальное (в т.ч. /test@чужой_бот, /testing) - нет."""
+    parts = str(text or "").strip().split()
+
+    if not parts:
+        return False
+
+    first = parts[0].lower()
+
+    if first == "/test":
+        return True
+
+    if first.startswith("/test@"):
+        mine = _mb_bot_username()
+
+        if mine is None:
+            _mb_log_once(
+                "getme-failed",
+                "[test] не удалось определить имя бота (getMe): команда /test@… проигнорирована",
+            )
+            return False
+
+        return first[len("/test@"):] == mine.lower()
+
+    return False
+
+
+def map_beta_test_command(message):
+    """
+    Команда /test в чате «Картотека» (ARCHIVE_CHAT_ID): ручной запуск того же
+    конвейера, что и у бета-функции (заглушка -> Worker -> замена в том же
+    сообщении). Не зависит от MAP_BETA_ENABLED и MAP_BETA_SELFTEST. Только
+    администратор чата (существующий is_group_admin, как у /classify). Ничего не
+    отправляет в рабочий чат и не пишет в реестр/состояние. Существующий /test
+    в рабочем чате (handle_test_command) не затрагивается. Не бросает исключений.
+    """
+    try:
+        if ARCHIVE_CHAT_ID is None:
+            return
+
+        chat_id = (message.get("chat") or {}).get("id")
+
+        if chat_id != ARCHIVE_CHAT_ID:
+            return
+
+        if not _mb_is_test_command(message.get("text")):
+            return
+
+        user_id = (message.get("from") or {}).get("id")
+
+        if not user_id:
+            return
+
+        if not is_group_admin(user_id, chat_id):
+            _mb_log("mapbeta:TEST", "test", f"/test отклонена: пользователь {user_id} не администратор")
+            return
+
+        now = _mb_monotonic()
+        busy = False
+
+        with _mb_lock:
+            for rid in [r for r, t in _mb_manual_active.items() if now - t > MAP_BETA_MANUAL_STALE_SECONDS]:
+                _mb_manual_active.pop(rid, None)   # зависший запуск не блокирует навсегда
+
+            if _mb_manual_active:
+                busy = True
+
+            else:
+                _mb_manual_seq["n"] += 1
+                run_id = f"{secrets.token_hex(3)}-{_mb_manual_seq['n']}"
+                _mb_manual_active[run_id] = now
+
+        if busy:
+            _mb_tg(
+                "sendMessage",
+                {
+                    "chat_id": ARCHIVE_CHAT_ID,
+                    "text": "⏳ Тест скриншота уже выполняется, дождитесь его результата.",
+                    "reply_to_message_id": message.get("message_id"),
+                    "allow_sending_without_reply": "true",
+                },
+            )
+            return
+
+        _mb_log(f"mapbeta:TEST:{run_id}", "test", f"запуск по команде администратора {user_id}")
+
+        _mb_enqueue(
+            {
+                "key": f"mapbeta:TEST:{run_id}",
+                "manual": True,
+                "run_id": run_id,
+                "reply_to": message.get("message_id"),
+                "source_name": "TEST",
+                "source_link": "",
+                "post_id": run_id,
+                "original_text": "",
+                "classification": "TEST",
+                "alert_text": (
+                    "🧪 ТЕСТ СКРИНШОТА КАРТЫ\n"
+                    "Это тест, не реальная тревога.\n"
+                    f"Запуск: {run_id}"
+                ),
+            }
+        )
+
+    except Exception as e:
+        try:
+            print(f"MAP BETA [test] ошибка команды: {type(e).__name__}: {e}", flush=True)
 
         except Exception:
             pass
@@ -6906,4 +7137,3 @@ if __name__ == "__main__":
             )
         ),
     )
-
