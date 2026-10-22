@@ -6574,6 +6574,179 @@ def _mb_is_test_command(text):
     return False
 
 
+# ---------------------------------------------------------------------------
+# ВРЕМЕННАЯ команда /photo2text (ТЗ 22.10 «Стоп»): практическая проверка, принимает ли Telegram editMessageText для
+# сообщения С ФОТО (превращение фото в текст с тем же message_id). Только «Картотека» (ARCHIVE_CHAT_ID), только
+# администратор. Отправляет ОДНО тестовое сообщение с заглушкой, пробует заменить его текстом, пишет точный ответ
+# Telegram в журнал и в чат (ответом на тестовое сообщение). Ничего не удаляет, реальных оповещений не касается, в реестр
+# не пишет, Worker не вызывает. После получения результата команду можно удалить (этот блок целиком) или отключить:
+# MAP_BETA_PHOTO_TEXT_TEST = False.
+# ---------------------------------------------------------------------------
+MAP_BETA_PHOTO_TEXT_TEST = True
+MAP_BETA_PHOTO_TEXT_REPLACEMENT = "⚠️ Снимок не получен: тестовая ошибка."
+
+
+def _mb_is_photo_text_command(text):
+    """/photo2text или /photo2text@<имя этого бота>."""
+    parts = str(text or "").strip().split()
+
+    if not parts:
+        return False
+
+    first = parts[0].lower()
+
+    if first == "/photo2text":
+        return True
+
+    if first.startswith("/photo2text@"):
+        mine = _mb_bot_username()
+        return mine is not None and first[len("/photo2text@"):] == mine.lower()
+
+    return False
+
+
+def _mb_photo_text_report(text, reply_to):
+    data = {"chat_id": ARCHIVE_CHAT_ID, "text": text[:3500]}
+
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+        data["allow_sending_without_reply"] = "true"
+
+    _mb_tg("sendMessage", data)
+
+
+def _mb_photo_text_run(run_id):
+    """Тест: заглушка -> editMessageText. Выполняется в отдельном потоке. Не бросает исключений."""
+    key = f"mapbeta:PHOTO2TEXT:{run_id}"
+    message_id = None
+
+    try:
+        placeholder = _mb_placeholder_bytes()
+
+        if not placeholder:
+            _mb_log(key, "photo2text", "файл заглушки недоступен, тест не выполнен")
+            _mb_photo_text_report(
+                "⚠️ Тест фото→текст не выполнен: файл assets/map_placeholder.jpg недоступен.", None
+            )
+            return
+
+        caption = (
+            "🧪 ТЕСТ API (не оповещение): проверка editMessageText для сообщения с фото\n"
+            f"Запуск: {run_id}"
+        )
+        message_id = _mb_send_placeholder(key, caption, placeholder)
+
+        if not message_id:
+            _mb_log(key, "photo2text", "заглушку отправить не удалось, editMessageText не вызывался")
+            _mb_photo_text_report(
+                "⚠️ Тест фото→текст не выполнен: заглушку не удалось отправить (см. журнал).", None
+            )
+            return
+
+        _mb_log(key, "photo2text", f"sendPhoto: успех, chat_id={ARCHIVE_CHAT_ID} message_id={message_id}")
+
+        r = _mb_tg(
+            "editMessageText",
+            {
+                "chat_id": ARCHIVE_CHAT_ID,
+                "message_id": message_id,
+                "text": MAP_BETA_PHOTO_TEXT_REPLACEMENT,
+            },
+        )
+
+        if r["kind"] == "ok":
+            res = r.get("result")
+            res = res if isinstance(res, dict) else {}
+            same_id = res.get("message_id") == message_id
+            has_photo = "photo" in res
+            has_text = bool(res.get("text"))
+            _mb_log(
+                key,
+                "photo2text",
+                f"editMessageText: HTTP 200 ok=true message_id={res.get('message_id')} "
+                f"(прежний {message_id}, совпадает={same_id}) photo_в_ответе={has_photo} "
+                f"text_в_ответе={has_text}",
+            )
+            report = (
+                "🧪 Результат теста фото→текст:\n"
+                "Telegram ПРИНЯЛ editMessageText (HTTP 200, ok=true).\n"
+                f"message_id в ответе: {res.get('message_id')} (было {message_id}): "
+                f"{'тот же' if same_id else 'ДРУГОЙ'}.\n"
+                f"В ответе есть photo: {'да' if has_photo else 'нет'}; есть text: {'да' if has_text else 'нет'}.\n"
+                "Посмотрите сообщение «ТЕСТ API» выше: исчезло ли фото и есть ли там текст «"
+                + MAP_BETA_PHOTO_TEXT_REPLACEMENT
+                + "». Новых сообщений кроме этого отчёта быть не должно."
+            )
+
+        else:
+            _mb_log(
+                key,
+                "photo2text",
+                f"editMessageText: {r['kind']} HTTP {r['status']} описание={r['description']!r}",
+            )
+            report = (
+                "🧪 Результат теста фото→текст:\n"
+                "Telegram ОТКАЗАЛ или ответ неизвестен.\n"
+                f"Тип: {r['kind']}; HTTP: {r['status']}; описание Telegram: {r['description'] or '(нет)'}\n"
+                "Тестовое сообщение с фото осталось как есть (ничего не удалялось и не отправлялось заново)."
+            )
+
+        _mb_photo_text_report(report, message_id)
+
+    except Exception as e:
+        try:
+            _mb_log(key, "photo2text", sanitize_secrets(f"ошибка теста: {type(e).__name__}: {e}"))
+            _mb_photo_text_report("⚠️ Тест фото→текст прервался внутренней ошибкой (см. журнал).", message_id)
+
+        except Exception:
+            pass
+
+    finally:
+        with _mb_lock:
+            _mb_manual_active.pop(run_id, None)
+
+
+def _mb_photo_text_command(message):
+    """Диспетчер /photo2text: проверки доступа, защита от параллельного запуска, запуск теста в потоке."""
+    user_id = (message.get("from") or {}).get("id")
+
+    if not user_id:
+        return
+
+    chat_id = (message.get("chat") or {}).get("id")
+
+    if not is_group_admin(user_id, chat_id):
+        _mb_log("mapbeta:PHOTO2TEXT", "photo2text", f"/photo2text отклонена: пользователь {user_id} не администратор")
+        return
+
+    now = _mb_monotonic()
+
+    with _mb_lock:
+        for rid in [r for r, t in _mb_manual_active.items() if now - t > MAP_BETA_MANUAL_STALE_SECONDS]:
+            _mb_manual_active.pop(rid, None)
+
+        if _mb_manual_active:
+            busy = True
+            run_id = None
+
+        else:
+            busy = False
+            _mb_manual_seq["n"] += 1
+            run_id = f"{secrets.token_hex(3)}-{_mb_manual_seq['n']}"
+            _mb_manual_active[run_id] = now
+
+    if busy:
+        _mb_photo_text_report("⏳ Тест уже выполняется, дождитесь его результата.", message.get("message_id"))
+        return
+
+    threading.Thread(
+        target=_mb_photo_text_run,
+        args=(run_id,),
+        name="map-beta-photo2text",
+        daemon=True,
+    ).start()
+
+
 def map_beta_test_command(message):
     """
     Команда /test в чате «Картотека» (ARCHIVE_CHAT_ID): ручной запуск того же
@@ -6590,6 +6763,10 @@ def map_beta_test_command(message):
         chat_id = (message.get("chat") or {}).get("id")
 
         if chat_id != ARCHIVE_CHAT_ID:
+            return
+
+        if MAP_BETA_PHOTO_TEXT_TEST and _mb_is_photo_text_command(message.get("text")):
+            _mb_photo_text_command(message)
             return
 
         if not _mb_is_test_command(message.get("text")):
