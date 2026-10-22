@@ -5550,12 +5550,34 @@ MAP_BETA_PLACEHOLDER_PATH = os.path.join(
 MAP_BETA_WAIT_SECONDS = 180            # ожидание снимка после публикации заглушки
 MAP_BETA_EDIT_GRACE_SECONDS = 30       # запас на замену уже полученного снимка
 MAP_BETA_CAPTION_LIMIT = 1024          # лимит подписи к фото в Telegram
+# Длинный текст (подпись > 1024): по ТЗ 22.10 отдельное сообщение с полным текстом НЕ создаётся без отдельного
+# согласования. False: для такой тревоги бета не выполняется (запись в лог), текст не обрезается и не делится.
+# True: прежнее поведение (короткая подпись + полный текст отдельным сообщением) - включать только по решению владельца.
+MAP_BETA_SPLIT_LONG_TEXT = False
 MAP_BETA_QUEUE_LIMIT = 10              # ожидающие снимка; переполнение: вытесняется САМАЯ РАННЯЯ задача
 MAP_BETA_EVENT_QUEUE_LIMIT = 50        # события, ждущие публикации заглушки (заглушка уходит за доли секунды)
 MAP_BETA_WORKER_MIN_INTERVAL = 16      # пауза между запросами к Worker (его защита 15 с)
-MAP_BETA_WORKER_READ_TIMEOUT = 75
+# Попытка получения снимка ограничена 38 с: соединение 2 с + ожидание ответа Worker 36 с. Worker сам укладывается
+# в 33 с (worker-timeout), поэтому причина доходит до бота раньше, чем истекает его таймаут.
+MAP_BETA_WORKER_CONNECT_TIMEOUT = 2
+MAP_BETA_WORKER_READ_TIMEOUT = 36
 MAP_BETA_TG_TIMEOUT = (5, 30)
-MAP_BETA_MAX_SHOT_ATTEMPTS = 3
+# Не более 2 попыток на одно оповещение (ТЗ 22.10): серия 38 + пауза/повтор 5 + 38 = 81 с <= 92 с. Счётчик локален для
+# одного задания (job): задание берётся из очереди один раз и не возвращается в неё, ключ дедупликации в sent_messages
+# фиксируется до публикации заглушки, поэтому серия не сбрасывается повторным вызовом и параллельных попыток нет
+# (_mb_inflight).
+MAP_BETA_MAX_SHOT_ATTEMPTS = 2
+# Причины сбоя, которые Worker передаёт заголовком X-Shot-Fail-Reason (только коды, без чувствительных данных).
+# Всё, чего здесь нет, считается неизвестной ошибкой: причину не выдумываем.
+MAP_BETA_FAIL_REASONS = {
+    "prep-timeout": "таймаут подготовки карты",
+    "targets-no-data": "не удалось получить данные о целях",
+    "targets-subscribe-error": "ошибка подписки на данные целей",
+    "render-error": "ошибка сервера или получения изображения",
+    "worker-timeout": "таймаут подготовки карты (лимит Worker)",
+    "bot-timeout": "нет ответа от Worker за отведённое время",
+    "unknown": "неизвестная ошибка",
+}
 MAP_BETA_MAX_EDIT_ATTEMPTS = 3
 MAP_BETA_EXPECTED_SIZE = 800
 MAP_BETA_DAILY_BROWSER_MS = 540000     # 9 из 10 бесплатных минут браузера в сутки
@@ -5818,6 +5840,8 @@ def _mb_send_placeholder(key, caption, placeholder):
         "chat_id": ARCHIVE_CHAT_ID,
         "caption": caption,
         "parse_mode": "HTML",
+        # одно сообщение: текст сверху, изображение карты снизу
+        "show_caption_above_media": "true",
     }
     files = {
         "photo": ("map_placeholder.jpg", placeholder, "image/jpeg"),
@@ -5965,6 +5989,19 @@ def _mb_process_send(event):
             else alert_text
         )
 
+        if long_mode and not MAP_BETA_SPLIT_LONG_TEXT:
+            # Текст не помещается в подпись (1024), а второе сообщение запрещено ТЗ:
+            # не обрезаем и не делим - бета для этого оповещения не выполняется.
+            _mb_log(
+                key,
+                "длинный текст",
+                f"подпись {_mb_caption_units(alert_text + sample_tail)} > "
+                f"{MAP_BETA_CAPTION_LIMIT}: копия с картой не создаётся "
+                "(без второго сообщения и без обрезки; нужно решение владельца)",
+            )
+            _mb_manual_done(event, False, "текст длиннее подписи (1024), второе сообщение запрещено")
+            return
+
         # Ключ фиксируется ДО отправки: любой дальнейший исход не
         # приводит к повторной публикации этого события.
         if not event.get("manual"):
@@ -6025,6 +6062,16 @@ def _mb_process_send(event):
             _mb_inflight.discard(key)
 
 
+def _mb_worker_fail_code(headers):
+    """Код причины из X-Shot-Fail-Reason; неизвестное или отсутствующее значение -> unknown."""
+    try:
+        value = str(headers.get("x-shot-fail-reason") or "").strip().lower()
+    except Exception:
+        value = ""
+
+    return value if value in MAP_BETA_FAIL_REASONS and value != "bot-timeout" else "unknown"
+
+
 def _mb_fetch_shot(job):
     """Снимок от Worker в пределах срока. dict или None."""
     key = job["key"]
@@ -6035,6 +6082,7 @@ def _mb_fetch_shot(job):
 
     attempts = 0
     reason = "нет попыток"
+    fail_code = "unknown"
 
     while attempts < MAP_BETA_MAX_SHOT_ATTEMPTS:
         remaining = job["deadline"] - _mb_monotonic()
@@ -6073,11 +6121,15 @@ def _mb_fetch_shot(job):
             response = _mb_http_get(
                 MAP_BETA_WORKER_URL,
                 headers,
-                (5, max(5, min(MAP_BETA_WORKER_READ_TIMEOUT, remaining - 2))),
+                (
+                    MAP_BETA_WORKER_CONNECT_TIMEOUT,
+                    max(5, min(MAP_BETA_WORKER_READ_TIMEOUT, remaining - 2)),
+                ),
             )
 
         except Exception as e:
             reason = sanitize_secrets(f"{type(e).__name__}")
+            fail_code = "bot-timeout" if "Timeout" in type(e).__name__ else "unknown"
             _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
             backoff = min(5 * attempts, 20)
 
@@ -6123,6 +6175,7 @@ def _mb_fetch_shot(job):
                     "attempts": attempts,
                 }
 
+            fail_code = "render-error"
             reason = (
                 "ответ не является JPEG 800x800 "
                 f"(размер: {size if size else 'не JPEG'})"
@@ -6151,7 +6204,8 @@ def _mb_fetch_shot(job):
             if browser_ms is not None:
                 _mb_budget_add(browser_ms)
 
-            reason = f"HTTP {status}"
+            fail_code = _mb_worker_fail_code(response.headers)
+            reason = f"HTTP {status}; причина Worker: {MAP_BETA_FAIL_REASONS[fail_code]}"
             _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
 
         backoff = min(5 * attempts, 20)
@@ -6162,6 +6216,7 @@ def _mb_fetch_shot(job):
         _mb_sleep(backoff)
 
     job["fail_reason"] = reason
+    job["fail_code"] = fail_code
     _mb_log(key, "снимок", f"не получен: {reason}; заглушка остаётся")
     return None
 
@@ -6199,6 +6254,7 @@ def _mb_edit(job, shot):
             "media": "attach://shot",
             "caption": caption,
             "parse_mode": "HTML",
+            "show_caption_above_media": True,
         },
         ensure_ascii=False,
     )
