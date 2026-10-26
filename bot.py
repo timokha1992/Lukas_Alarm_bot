@@ -6141,6 +6141,17 @@ def _mb_worker_fail_code(headers):
     return value if value in MAP_BETA_FAIL_REASONS and value != "bot-timeout" else "unknown"
 
 
+def _mb_header_text(headers, name):
+    """Короткий диагностический текст заголовка (только безопасные символы, до 200); нет или ошибка -> пустая строка."""
+    try:
+        value = str(headers.get(name) or "").strip()
+
+        return "".join(ch for ch in value if ch.isalnum() or ch in "=;._-")[:200]
+
+    except Exception:
+        return ""
+
+
 def _mb_header_signed_int(headers, name):
     """Как _mb_header_int, но допускает знак (X-Shot-Clock-Skew-Ms бывает отрицательным); нет или не число -> None."""
     try:
@@ -6266,6 +6277,7 @@ def _mb_fetch_shot(job):
                     "radar": str(response.headers.get("x-shot-radar") or "").strip().lower(),
                     "radar_reason": str(response.headers.get("x-shot-radar-reason") or "").strip()[:60],
                     "skew_ms": _mb_header_signed_int(response.headers, "x-shot-clock-skew-ms"),
+                    "phases": _mb_header_text(response.headers, "x-shot-phases"),
                     "attempts": attempts,
                 }
 
@@ -6302,6 +6314,11 @@ def _mb_fetch_shot(job):
 
             fail_code = _mb_worker_fail_code(response.headers)
             reason = f"HTTP {status}; причина Worker: {MAP_BETA_FAIL_REASONS[fail_code]}"
+            _phases = _mb_header_text(response.headers, "x-shot-phases")
+
+            if _phases:
+                reason += f"; этапы страницы (с): {_phases}"
+
             _mb_log(key, "снимок", f"попытка {attempts}: {reason}")
 
         backoff = min(5 * attempts, 20)
@@ -6393,6 +6410,9 @@ def _mb_time_log(key, shot, published_ms):
 
         if shot.get("skew_ms") is not None:
             diag.append(f"skew/доставка отчёта = {shot['skew_ms']} мс")
+
+        if shot.get("phases"):
+            diag.append(f"этапы страницы (с): {shot['phases']}")
 
         _mb_log(
             key,
