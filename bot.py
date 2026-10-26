@@ -5382,7 +5382,7 @@ def check_source(
                         classification="HIGH_SPEED_THREAT",
                     )
                     if send_alert(**_alert_args):
-                        map_beta_submit(**_alert_args)
+                        map_beta_submit(**_alert_args, published_at=post_datetime)
                     continue
 
                 if decision == "ARCHIVE":
@@ -5427,7 +5427,7 @@ def check_source(
                     ),
                 )
                 if send_alert(**_alert_args):
-                    map_beta_submit(**_alert_args)
+                    map_beta_submit(**_alert_args, published_at=post_datetime)
                 continue
 
             # ARCHIVE_HIGH / ARCHIVE_NORMAL — внутренние значения
@@ -5511,10 +5511,12 @@ import collections
 #  - очередь в памяти: при перезапуске Render уже отправленная заглушка
 #    остаётся без замены, события в очереди теряются; повторной
 #    публикации нет (ключ дедупликации сохранён в STATE_FILE);
-#  - в подписи «Снимок получен в ЧЧ:ММ:СС» (Киев): время из заголовка X-Shot-At
-#    Worker'а (он фиксируется ПОСЛЕ возврата снимка из Browser Run), а если
-#    заголовка нет или он недостоверен - время получения снимка ботом. Это не
-#    время съёмки;
+#  - в подписи «Снимок получен через N сек | Радар: ON/OFF»: N = метка времени
+#    страницы в момент готовности карты (заголовок Worker X-Shot-Marker-At,
+#    ближайшая к съёмке; снимок делается на 1-3 с позже) минус время
+#    публикации исходного поста. X-Shot-At (возврат из Browser Run) и время
+#    получения ботом в подпись НЕ идут, только в лог. Нет достоверной метки или
+#    времени поста - «Время не определено: <причина>», время не подставляется;
 #  - Cloudflare Free: ~10 минут браузера в сутки, снимок может не
 #    успеть/не получиться - тогда остаётся заглушка.
 #
@@ -5591,6 +5593,11 @@ MAP_BETA_FAIL_REASONS = {
     "unknown": "неизвестная ошибка",
 }
 MAP_BETA_MAX_EDIT_ATTEMPTS = 3
+# Время «от публикации до снимка»: допуски проверки метки страницы (мс).
+MAP_BETA_MARKER_WINDOW_MS = 5000       # метка должна лежать в окне запроса бота +- это значение
+MAP_BETA_CLOCK_SKEW_MAX_MS = 5000      # |X-Shot-Clock-Skew-Ms| больше - расхождение часов (включает задержку доставки отчёта)
+MAP_BETA_NEG_TOLERANCE_MS = 2000       # допуск отрицательного интервала (метка Telegram с точностью до секунды)
+MAP_BETA_MAX_INTERVAL_MS = 600000      # интервал больше 10 мин считается недостоверным
 MAP_BETA_EXPECTED_SIZE = 800
 MAP_BETA_DAILY_BROWSER_MS = 540000     # 9 из 10 бесплатных минут браузера в сутки
 MAP_BETA_ASSUMED_BROWSER_MS = 20000    # если Worker не сообщил время браузера
@@ -6036,7 +6043,7 @@ def _mb_process_send(event):
         )
 
         sample_tail = (
-            "\n\nСнимок получен в 00:00:00\nКарта: " + MAP_BETA_MAP_URL
+            "\n\n" + _MB_TIME_LINE_LONGEST + "\nКарта: " + MAP_BETA_MAP_URL
         )
         long_mode = (
             _mb_caption_units(alert_text + sample_tail)
@@ -6092,6 +6099,7 @@ def _mb_process_send(event):
             "manual": event.get("manual"),
             "run_id": event.get("run_id"),
             "reply_to": event.get("reply_to"),
+            "published_ms": event.get("published_ms"),
         }
 
         evicted = _mb_shot_queue.put_latest(job)
@@ -6131,6 +6139,20 @@ def _mb_worker_fail_code(headers):
         value = ""
 
     return value if value in MAP_BETA_FAIL_REASONS and value != "bot-timeout" else "unknown"
+
+
+def _mb_header_signed_int(headers, name):
+    """Как _mb_header_int, но допускает знак (X-Shot-Clock-Skew-Ms бывает отрицательным); нет или не число -> None."""
+    try:
+        value = headers.get(name)
+
+        if value is None:
+            return None
+
+        return int(str(value).strip())
+
+    except Exception:
+        return None
 
 
 def _mb_fetch_shot(job):
@@ -6239,6 +6261,11 @@ def _mb_fetch_shot(job):
                     "bytes": body,
                     "shot_at_ms": shot_at,
                     "received_ms": received_ms,
+                    "started_ms": started_ms,
+                    "marker_ms": _mb_header_int(response.headers, "x-shot-marker-at"),
+                    "radar": str(response.headers.get("x-shot-radar") or "").strip().lower(),
+                    "radar_reason": str(response.headers.get("x-shot-radar-reason") or "").strip()[:60],
+                    "skew_ms": _mb_header_signed_int(response.headers, "x-shot-clock-skew-ms"),
                     "attempts": attempts,
                 }
 
@@ -6290,21 +6317,93 @@ def _mb_fetch_shot(job):
     return None
 
 
-def _mb_time_line(shot):
+_MB_TIME_LINE_LONGEST = (
+    "Снимок получен | Время не определено: расхождение часов браузера и Worker | Радар: OFF"
+)
+
+
+def _mb_time_reason(shot, published_ms):
     """
-    Единый формат подписи: «Снимок получен в ЧЧ:ММ:СС» (по Киеву). Это НЕ
-    время съёмки: X-Shot-At Worker фиксирует после возврата готового
-    изображения из Browser Run. Берётся X-Shot-At, если он есть и достоверен
-    (лежит в окне запроса), иначе время получения снимка ботом.
+    Причина, по которой время «от публикации до снимка» определить нельзя, либо None, если оно достоверно.
+    Только фактическая диагностика; время возврата Browser Run (X-Shot-At) и получения ботом не подставляются.
     """
-    stamp_ms = shot["shot_at_ms"]
+    if published_ms is None:
+        return "нет времени публикации источника"
 
-    if stamp_ms is None:
-        stamp_ms = shot["received_ms"]
+    marker = shot.get("marker_ms")
 
-    moment = datetime.fromtimestamp(stamp_ms / 1000, tz=KYIV_TZ)
+    if marker is None:
+        return "отсутствует метка браузера"
 
-    return "Снимок получен в " + moment.strftime("%H:%M:%S")
+    if marker <= 0 or not (
+        shot["started_ms"] - MAP_BETA_MARKER_WINDOW_MS
+        <= marker
+        <= shot["received_ms"] + MAP_BETA_MARKER_WINDOW_MS
+    ):
+        return "некорректная временная метка"
+
+    skew = shot.get("skew_ms")
+
+    if skew is not None and not (
+        -MAP_BETA_CLOCK_SKEW_MAX_MS <= skew <= MAP_BETA_CLOCK_SKEW_MAX_MS
+    ):
+        return "расхождение часов браузера и Worker"
+
+    interval = marker - published_ms
+
+    if interval < -MAP_BETA_NEG_TOLERANCE_MS:
+        return "расхождение часов (метка раньше публикации)"
+
+    if interval > MAP_BETA_MAX_INTERVAL_MS:
+        return "некорректный интервал (больше 10 минут)"
+
+    return None
+
+
+def _mb_time_line(shot, published_ms=None):
+    """
+    Подпись по ТЗ 26.10: «Снимок получен через N сек | Радар: ON/OFF» либо
+    «Снимок получен | Время не определено: <причина> | Радар: ON/OFF».
+    N = метка страницы (X-Shot-Marker-At) минус время публикации источника, в секундах (всегда секунды).
+    Радар ON только при подтверждении Worker (X-Shot-Radar: on); нет заголовка = не подтверждён = OFF.
+    """
+    radar = "ON" if shot.get("radar") == "on" else "OFF"
+    reason = _mb_time_reason(shot, published_ms)
+
+    if reason is None:
+        seconds = max(0, round((shot["marker_ms"] - published_ms) / 1000))
+        return f"Снимок получен через {seconds} сек | Радар: {radar}"
+
+    return f"Снимок получен | Время не определено: {reason} | Радар: {radar}"
+
+
+def _mb_time_log(key, shot, published_ms):
+    """Одна строка в журнал: причина «время не определено», радар и диагностика (X-Shot-At, задержки). Не бросает исключений."""
+    try:
+        reason = _mb_time_reason(shot, published_ms)
+        marker = shot.get("marker_ms")
+        shot_at = shot.get("shot_at_ms")
+        diag = []
+
+        if marker is not None and shot_at is not None:
+            diag.append(f"X-Shot-At - метка = {shot_at - marker} мс")
+
+        if marker is not None and published_ms is not None:
+            diag.append(f"метка - публикация = {marker - published_ms} мс")
+
+        if shot.get("skew_ms") is not None:
+            diag.append(f"skew/доставка отчёта = {shot['skew_ms']} мс")
+
+        _mb_log(
+            key,
+            "время",
+            ("не определено: " + reason if reason else "определено")
+            + f"; радар={shot.get('radar') or 'нет заголовка'}"
+            + (f" ({shot.get('radar_reason')})" if shot.get("radar_reason") else "")
+            + ("; " + "; ".join(diag) if diag else ""),
+        )
+    except Exception:
+        pass
 
 
 def _mb_edit_caption_only(job, caption):
@@ -6346,11 +6445,12 @@ def _mb_mark_edit_done(job, shot, failure, note=""):
         )
         return
 
-    job["time_line"] = _mb_time_line(shot)
+    job["time_line"] = _mb_time_line(shot, job.get("published_ms"))
+    _mb_time_log(key, shot, job.get("published_ms"))
     _mb_log(
         key,
         "замена",
-        f"выполнена message_id={job['message_id']}; {_mb_time_line(shot)}" + note,
+        f"выполнена message_id={job['message_id']}; {job['time_line']}" + note,
     )
 
 
@@ -6373,7 +6473,7 @@ def _mb_edit(job, shot, failure=False):
         caption = (
             job["base_caption"]
             + "\n\n"
-            + _mb_time_line(shot)
+            + _mb_time_line(shot, job.get("published_ms"))
             + "\nКарта: "
             + MAP_BETA_MAP_URL
         )
@@ -6559,12 +6659,38 @@ def _mb_enqueue(event):
         _mb_manual_done(evicted, False, "тест вытеснен из очереди событий до публикации заглушки")
 
 
+def _mb_message_date_ms(message):
+    """Время сообщения Telegram (message.date, секунды, UTC) -> мс; нет или не число -> None. Для /test это «время публикации»."""
+    try:
+        value = int(message.get("date"))
+        return value * 1000 if value > 0 else None
+
+    except Exception:
+        return None
+
+
+def _mb_to_epoch_ms(value):
+    """datetime (с поясом; без пояса считается UTC) -> epoch мс; нет значения или не datetime -> None. Не бросает исключений."""
+    try:
+        if value is None:
+            return None
+
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+
+        return int(value.timestamp() * 1000)
+
+    except Exception:
+        return None
+
+
 def map_beta_submit(
     source_name,
     source_link,
     post_id,
     original_text,
     classification,
+    published_at=None,
 ):
     """
     Единственная точка входа. Вызывается после успешной send_alert().
@@ -6589,6 +6715,7 @@ def map_beta_submit(
                 "post_id": post_id,
                 "original_text": original_text,
                 "classification": classification,
+                "published_ms": _mb_to_epoch_ms(published_at),
             }
         )
 
@@ -6779,6 +6906,7 @@ def map_beta_test_command(message):
                 "post_id": run_id,
                 "original_text": "",
                 "classification": "TEST",
+                "published_ms": _mb_message_date_ms(message),
                 "alert_text": (
                     "🧪 ТЕСТ СКРИНШОТА КАРТЫ\n"
                     "Это тест, не реальная тревога.\n"
