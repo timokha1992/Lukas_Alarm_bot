@@ -1922,6 +1922,10 @@ def clear_failure_state(
 # Одна попытка отправки уведомления watchdog: connect 3 с, read 8 с.
 WATCHDOG_SEND_TIMEOUT = (3, 8)
 
+# watchdog_send_once вернул это значение: запрос ушёл, ответ не получен (read timeout). Telegram мог доставить сообщение,
+# поэтому повторять отправку нельзя (раньше повторы давали по 5 одинаковых уведомлений о сбое).
+WATCHDOG_SEND_UNKNOWN = -1
+
 # Сколько раз пытались доставить уведомление о сбое по типу (только
 # для диагностики в логе; в состояние/файл не пишется).
 watchdog_send_attempts = {}
@@ -2548,13 +2552,20 @@ def watchdog_send_once(text):
     (его ведут штатные проверки). Возвращает message_id или None.
     Токен в лог не попадает. Ошибка отправки - отдельная строка
     WATCHDOG TELEGRAM FAILED, не путается с ошибками источников.
+    Сообщение уходит без звука (disable_notification). Если ответ не
+    получен (read timeout), возвращается WATCHDOG_SEND_UNKNOWN: сообщение
+    могло быть доставлено, повторять его нельзя.
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     try:
         response = session.post(
             url,
-            data={"chat_id": CHAT_ID, "text": text},
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "disable_notification": "true",
+            },
             timeout=WATCHDOG_SEND_TIMEOUT,
         )
 
@@ -2595,6 +2606,15 @@ def watchdog_send_once(text):
             f"kind={kind} {type(e).__name__}: {e}",
             flush=True,
         )
+
+        if kind == "read_timeout":
+            print(
+                "WATCHDOG TELEGRAM: результат отправки неизвестен "
+                "(сообщение могло дойти), повтор не выполняется",
+                flush=True,
+            )
+            return WATCHDOG_SEND_UNKNOWN
+
         return None
 
 
