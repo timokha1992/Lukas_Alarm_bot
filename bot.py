@@ -1790,10 +1790,8 @@ def send_telegram_message(
     parse_mode=None,
     disable_link_preview=False,
     chat_id=None,
-    reply_markup=None,
 ):
     """
-    reply_markup - необязательная inline-клавиатура (dict), по умолчанию нет.
     Отправляет сообщение. Без chat_id - в рабочий чат CHAT_ID, как всегда.
     chat_id нужен только там, где ответ должен уйти в конкретный чат
     (сейчас: ответ /classify в тот чат, откуда пришёл запрос).
@@ -1810,9 +1808,6 @@ def send_telegram_message(
         data["link_preview_options"] = json.dumps({
             "is_disabled": True,
         })
-
-    if reply_markup:
-        data["reply_markup"] = json.dumps(reply_markup)
 
     result = telegram_request(
         "sendMessage",
@@ -3435,8 +3430,8 @@ def is_group_admin(user_id, chat_id=None):
 
 def handle_test_command(message):
     """
-    /test администратора: образец оповещения в боевом формате (под ним кнопка
-    карты, если снимки выключены) + проверка связи. Работает в рабочем чате
+    /test администратора: образец оповещения в боевом формате (внизу подпись
+    и ссылка на карту, если снимки выключены) + проверка связи. Работает в рабочем чате
     CHAT_ID и в картотеке ARCHIVE_CHAT_ID; ответ уходит в тот чат, откуда
     пришла команда. Реестр, архив и состояние не затрагивает.
     В картотеке при ВКЛЮЧЁННЫХ снимках /test, как раньше, обрабатывает
@@ -3496,21 +3491,20 @@ def handle_test_command(message):
         post_link=PSZSU_LINK,
         original_text="ТЕСТ: образец оповещения. Реальной тревоги нет.",
         classification="HIGH_SPEED_THREAT",
+        tail="" if snapshots_active() else ALERT_MAP_TAIL,
     )
 
     if snapshots_active():
         note = (
             "ℹ️ Снимки включены (MAP_BETA_ENABLED=1): в реальной тревоге "
-            "вместо кнопки будет снимок карты."
+            "вместо ссылки будет снимок карты."
         )
-        markup = None
 
     else:
         note = (
-            "ℹ️ Снимки выключены: в реальной тревоге под сообщением "
-            "будет кнопка карты."
+            "ℹ️ Снимки выключены: в реальной тревоге внизу будет "
+            "подпись и ссылка на карту."
         )
-        markup = ALERT_MAP_BUTTON
 
     send_telegram_message(
         "🔔 ТЕСТОВОЕ УВЕДОМЛЕНИЕ\n\n"
@@ -3522,7 +3516,6 @@ def handle_test_command(message):
         parse_mode="HTML",
         disable_link_preview=True,
         chat_id=chat_id,
-        reply_markup=markup,
     )
 
 
@@ -4721,6 +4714,7 @@ def build_alert_text(
     post_link,
     original_text,
     classification,
+    tail="",
 ):
     if classification == "IMPACT_CONFIRMED":
         title = MESSAGES["alert_title_impact_confirmed"]
@@ -4748,6 +4742,7 @@ def build_alert_text(
             post_link=safe_post_link,
             escaped_text="",
         )
+        + tail
     )
 
     budget = max(0, TELEGRAM_MAX_MESSAGE_LENGTH - overhead - 1)
@@ -4779,7 +4774,7 @@ def build_alert_text(
         title=title,
         post_link=safe_post_link,
         escaped_text=escaped_text,
-    )
+    ) + tail
 
 
 def send_alert(
@@ -4809,6 +4804,7 @@ def send_alert(
         post_link=post_link,
         original_text=original_text,
         classification=classification,
+        tail="" if snapshots_active() else ALERT_MAP_TAIL,
     )
 
     message_id = snapshot_alert_send(
@@ -4823,7 +4819,6 @@ def send_alert(
         alert_text,
         parse_mode="HTML",
         disable_link_preview=True,
-        reply_markup=None if snapshots_active() else ALERT_MAP_BUTTON,
     )
 
     # Только после успешной отправки считаем
@@ -5603,16 +5598,13 @@ if MAP_SNAPSHOT_ENABLED:
         )
 
 
-# Кнопка с картой под оповещением: ТОЛЬКО когда снимки выключены (MAP_BETA_ENABLED != "1" или модуль снимков не загружен).
-# Кнопка (inline url), а не ссылка в тексте: ссылку-текст с другой подписью Telegram открывает через запрос «Открыть ссылку?»,
-# кнопка открывается сразу. Адрес тот же, что в подписи снимка (map_snapshot.MAP_BETA_MAP_URL).
+# Карта под оповещением: ТОЛЬКО когда снимки выключены (MAP_BETA_ENABLED != "1" или модуль снимков не загружен).
+# Подпись + ГОЛАЯ ссылка отдельной строкой: голую ссылку Telegram открывает сразу, а ссылку-текст и кнопку - через
+# запрос «Открыть ссылку?». Адрес тот же, что в подписи снимка (map_snapshot.MAP_BETA_MAP_URL).
 ALERT_MAP_URL = "https://map.ukrainealarm.com/onlyMap"
-ALERT_MAP_BUTTON = {
-    "inline_keyboard": [[{
-        "text": "👁️ ОФІЦІЙНА КАРТА ПОВІТРЯНИХ ТРИВОГ УКРАЇНИ",
-        "url": ALERT_MAP_URL,
-    }]]
-}
+ALERT_MAP_TAIL = (
+    "\n\n<b>\U0001F441\ufe0f ОФІЦІЙНА КАРТА ПОВІТРЯНИХ ТРИВОГ УКРАЇНИ</b>\n" + ALERT_MAP_URL
+)
 
 
 def snapshots_active():
