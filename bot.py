@@ -4670,6 +4670,7 @@ def build_alert_text(
     post_link,
     original_text,
     classification,
+    tail="",
 ):
     if classification == "IMPACT_CONFIRMED":
         title = MESSAGES["alert_title_impact_confirmed"]
@@ -4697,6 +4698,7 @@ def build_alert_text(
             post_link=safe_post_link,
             escaped_text="",
         )
+        + tail
     )
 
     budget = max(0, TELEGRAM_MAX_MESSAGE_LENGTH - overhead - 1)
@@ -4728,7 +4730,7 @@ def build_alert_text(
         title=title,
         post_link=safe_post_link,
         escaped_text=escaped_text,
-    )
+    ) + tail
 
 
 def send_alert(
@@ -4758,6 +4760,7 @@ def send_alert(
         post_link=post_link,
         original_text=original_text,
         classification=classification,
+        tail="" if snapshots_active() else ALERT_MAP_LINK_TAIL,
     )
 
     message_id = snapshot_alert_send(
@@ -5549,6 +5552,19 @@ if MAP_SNAPSHOT_ENABLED:
             f"({type(e).__name__}: {e}). Остальные функции бота работают.",
             flush=True,
         )
+
+
+# Строка со ссылкой на карту: добавляется к оповещению ТОЛЬКО когда снимки выключены (MAP_BETA_ENABLED != "1"
+# или модуль снимков не загружен). Адрес тот же, что в подписи снимка (map_snapshot.MAP_BETA_MAP_URL).
+ALERT_MAP_URL = "https://map.ukrainealarm.com/onlyMap"
+ALERT_MAP_LINK_TAIL = (
+    "\n\n🗺️ <a href=\"" + html.escape(ALERT_MAP_URL, quote=True) + "\">Посмотреть на карте</a>"
+)
+
+
+def snapshots_active():
+    """True, если оповещения уходят со снимком карты (модуль загружен и MAP_BETA_ENABLED=1)."""
+    return map_snapshot is not None and bool(getattr(map_snapshot, "MAP_BETA_ENABLED", False))
 
 
 def snapshot_alert_send(**kwargs):
