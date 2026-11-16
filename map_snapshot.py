@@ -87,7 +87,10 @@ def configure(host):
 
 _mb_selftest_started = {"v": False}
 
-MAP_BETA_ENABLED = True  # единая точка отключения - MAP_SNAPSHOT_ENABLED в bot.py
+# Включатель снимков - переменная окружения Render MAP_BETA_ENABLED: "1" - снимки включены (как раньше),
+# любое другое значение или переменная не задана - снимков нет, оповещение уходит обычным текстом со ссылкой
+# «Посмотреть на карте». Возврат к снимкам: MAP_BETA_ENABLED=1. Жёсткое отключение модуля - MAP_SNAPSHOT_ENABLED в bot.py.
+MAP_BETA_ENABLED = os.getenv("MAP_BETA_ENABLED", "").strip() == "1"
 
 # Контрольный запуск ТОЛЬКО в картотеке без ожидания реальной тревоги:
 # при MAP_BETA_SELFTEST=<метка> один раз через ~30 с после старта публикуется
@@ -1754,15 +1757,8 @@ def map_obzor_command(message):
                 run_id = f"{secrets.token_hex(3)}-{_mb_obzor_seq['n']}"
 
         if busy:
-            _mb_tg(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "⏳ Снимок уже запрашивается, дождитесь результата.",
-                    "reply_to_message_id": message.get("message_id"),
-                    "allow_sending_without_reply": "true",
-                },
-            )
+            # Без сообщения в чат (владелец его не просил): повторная команда молча игнорируется, результат придёт один.
+            _mb_log("mapbeta:OBZOR", "obzor", f"повторная команда в чате {chat_id} проигнорирована: снимок уже запрашивается")
             return
 
         _mb_log(f"mapbeta:OBZOR:{run_id}", "obzor", f"запуск по команде администратора {user_id} в чате {chat_id}")
