@@ -3434,6 +3434,14 @@ def is_group_admin(user_id, chat_id=None):
 
 
 def handle_test_command(message):
+    """
+    /test администратора: образец оповещения в боевом формате (под ним кнопка
+    карты, если снимки выключены) + проверка связи. Работает в рабочем чате
+    CHAT_ID и в картотеке ARCHIVE_CHAT_ID; ответ уходит в тот чат, откуда
+    пришла команда. Реестр, архив и состояние не затрагивает.
+    В картотеке при ВКЛЮЧЁННЫХ снимках /test, как раньше, обрабатывает
+    снимочный конвейер (snapshot_test_command), образец не отправляется.
+    """
     chat = message.get(
         "chat",
         {},
@@ -3452,14 +3460,21 @@ def handle_test_command(message):
         "id"
     )
 
-    if chat_id != CHAT_ID:
+    in_work = chat_id == CHAT_ID
+    in_archive = ARCHIVE_CHAT_ID is not None and chat_id == ARCHIVE_CHAT_ID
+
+    if not (in_work or in_archive):
+        return
+
+    if in_archive and snapshots_active():
         return
 
     if not user_id:
         return
 
     if not is_group_admin(
-        user_id
+        user_id,
+        chat_id,
     ):
         print(
             "Команда /test отклонена: "
@@ -3475,8 +3490,39 @@ def handle_test_command(message):
         flush=True,
     )
 
+    sample = build_alert_text(
+        source_name=PSZSU_NAME,
+        source_link=PSZSU_LINK,
+        post_link=PSZSU_LINK,
+        original_text="ТЕСТ: образец оповещения. Реальной тревоги нет.",
+        classification="HIGH_SPEED_THREAT",
+    )
+
+    if snapshots_active():
+        note = (
+            "ℹ️ Снимки включены (MAP_BETA_ENABLED=1): в реальной тревоге "
+            "вместо кнопки будет снимок карты."
+        )
+        markup = None
+
+    else:
+        note = (
+            "ℹ️ Снимки выключены: в реальной тревоге под сообщением "
+            "будет кнопка карты."
+        )
+        markup = ALERT_MAP_BUTTON
+
     send_telegram_message(
-        MESSAGES["test_command_response"]
+        "🔔 ТЕСТОВОЕ УВЕДОМЛЕНИЕ\n\n"
+        "Бот получил команду /test. Связь с Telegram и этим чатом проверена.\n\n"
+        "Образец оповещения:\n\n"
+        + sample
+        + "\n\n"
+        + note,
+        parse_mode="HTML",
+        disable_link_preview=True,
+        chat_id=chat_id,
+        reply_markup=markup,
     )
 
 
@@ -5589,7 +5635,7 @@ def snapshot_alert_send(**kwargs):
 def snapshot_test_command(message):
     """/test в картотеке (ручная проверка снимка). Никогда не бросает исключений."""
     try:
-        if map_snapshot is not None:
+        if map_snapshot is not None and snapshots_active():
             map_snapshot.map_beta_test_command(message)
 
     except Exception as e:
